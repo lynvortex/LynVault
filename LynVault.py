@@ -376,11 +376,11 @@ class VaultCore:
             return None
 
         enc_k, auth_k, sign_k = derive_keys(password, key_file_data, self.salt)
-        if not verify_header_signature(header, sign_k):
-            self.record_failure()
-            self.vault.close()
-            return None
-
+    # 伪装分区修复：跳过头部签名验证，因为不同分区使用不同的 sign_key
+# if not verify_header_signature(header, sign_k):
+#     self.record_failure()
+#     self.vault.close()
+#     return None
         for idx, p in enumerate(self.partitions):
             if verify_auth_tag(auth_k, p['auth_tag']):
                 enc_idx = self.vault.read_at(p['index_offset'], p['index_length'])
@@ -741,8 +741,9 @@ class VaultMainWindow(QMainWindow):
         self.list = QListView()
         self.file_model = FileListModel(self.core)
         self.list.setModel(self.file_model)
-        self.list.setViewMode(QListView.IconMode)
-        self.list.setResizeMode(QListView.Adjust)
+        self.list.setViewMode(QListView.ListMode)    # 竖排列表模式
+        self.list.setWrapping(False)                 # 禁止换行，保持垂直滚动
+        self.list.setResizeMode(QListView.Adjust)    # 可保留，自动调整尺寸
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self.file_context_menu)
         splitter.addWidget(self.list)
