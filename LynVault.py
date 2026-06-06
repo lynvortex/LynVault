@@ -7,15 +7,17 @@ import mmap
 from pathlib import Path
 from secrets import token_bytes, compare_digest
 from typing import Optional, List, Dict, Any, Tuple
+from PySide6.QtWidgets import QStyle
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTreeView, QListView, QToolBar,
     QStatusBar, QFileDialog, QMessageBox, QSplitter, QWidget,
-    QVBoxLayout, QMenu, QInputDialog, QLineEdit,
+    QVBoxLayout, QMenu, QInputDialog, QLineEdit, QLabel,
 )
-from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex
+from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex, QTimer
 from PySide6.QtGui import (
     QAction, QStandardItemModel, QStandardItem, QDragEnterEvent, QDropEvent,
+    QPixmap, QImage, QTransform, QIcon,
 )
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -36,6 +38,7 @@ MAX_ERRORS = 5
 LOCKOUT_SECONDS = 30 * 60
 COOLDOWN_SECONDS = 3.0
 DEFAULT_PARTITION = "Main"
+
 SHRED_PASSES = 7
 PBKDF2_ITERATIONS = 1_000_000
 AUDIT_MAX_EVENTS = 10000
@@ -243,6 +246,76 @@ class VaultCore:
         self.audit = None
         self.last_attempt_time = 0.0
 
+    def rename_file(self, old_vpath: str, new_name: str) -> bool:
+        if not self.enc_key or not self.vault.handle:
+            return False
+        parent = old_vpath.rsplit('/', 1)[0] if '/' in old_vpath else '/'
+        if parent == '':
+            parent = '/'
+        new_vpath = (parent.rstrip('/') + '/' + new_name).replace('//', '/')
+        if not validate_vpath(new_vpath):
+            return False
+
+        idx = self.load_index()
+        if old_vpath not in idx['files']:
+            return False
+        if new_vpath in idx['files'] or new_vpath in idx['folders']:
+            return False
+
+        meta = idx['files'].pop(old_vpath)
+        meta['name'] = new_name
+        idx['files'][new_vpath] = meta
+
+        self.audit.add(f"重命名文件 '{old_vpath}' -> '{new_vpath}'")
+        self.save_index(idx)
+        return True
+
+    def rename_folder(self, old_vpath: str, new_name: str) -> bool:
+        if not self.enc_key or not self.vault.handle:
+            return False
+        if old_vpath == '/':
+            return False
+
+        parent = old_vpath.rsplit('/', 1)[0] if '/' in old_vpath else '/'
+        if parent == '':
+            parent = '/'
+        new_vpath = (parent.rstrip('/') + '/' + new_name).replace('//', '/')
+        if not validate_vpath(new_vpath):
+            return False
+
+        idx = self.load_index()
+        if old_vpath not in idx['folders']:
+            return False
+        if new_vpath in idx['folders'] or new_vpath in idx['files']:
+            return False
+
+        new_files = {}
+        new_folders = {}
+        old_prefix = old_vpath + '/'
+        new_prefix = new_vpath + '/'
+
+        for vpath, meta in idx['files'].items():
+            if vpath == old_vpath or vpath.startswith(old_prefix):
+                migrated_path = new_vpath if vpath == old_vpath else new_prefix + vpath[len(old_prefix):]
+                new_files[migrated_path] = meta
+            else:
+                new_files[vpath] = meta
+
+        for fpath in idx['folders']:
+            if fpath == old_vpath:
+                new_folders[new_vpath] = True
+            elif fpath.startswith(old_prefix):
+                new_folders[new_prefix + fpath[len(old_prefix):]] = True
+            else:
+                new_folders[fpath] = True
+
+        idx['files'] = new_files
+        idx['folders'] = new_folders
+
+        self.audit.add(f"重命名文件夹 '{old_vpath}' -> '{new_vpath}'")
+        self.save_index(idx)
+        return True
+
     def pack_header(self) -> bytes:
         buf = bytearray(HEADER_SIZE)
         struct.pack_into(FMT_HEADER, buf, 0,
@@ -376,11 +449,6 @@ class VaultCore:
             return None
 
         enc_k, auth_k, sign_k = derive_keys(password, key_file_data, self.salt)
-    # 伪装分区修复：跳过头部签名验证，因为不同分区使用不同的 sign_key
-# if not verify_header_signature(header, sign_k):
-#     self.record_failure()
-#     self.vault.close()
-#     return None
         for idx, p in enumerate(self.partitions):
             if verify_auth_tag(auth_k, p['auth_tag']):
                 enc_idx = self.vault.read_at(p['index_offset'], p['index_length'])
@@ -563,9 +631,169 @@ class VaultCore:
         self.audit.add(f"删除文件夹 '{vpath}'")
         self.save_index(idx)
 
+    def load_file_data(self, vpath: str) -> Optional[bytearray]:
+        idx = self.load_index()
+        if vpath not in idx['files']:
+            return None
+        meta = idx['files'][vpath]
+        enc = self.vault.read_at(meta['offset'], meta['length'])
+        plain = decrypt_gcm(self.enc_key, enc)
+        if plain is None:
+            return None
+        return bytearray(plain)
 
-# ---------- GUI 模型 ----------
+# ---------- 安全照片查看器 ----------
+class SecurePhotoViewer(QMainWindow):
+    def __init__(self, core: VaultCore, img_paths: List[str], start_idx: int = 0):
+        super().__init__()
+        self.core = core
+        self.img_paths = img_paths
+        self.current_idx = start_idx
+        self._rotation = 0
+        self._fit_to_window = True
+        self._current_pixmap = QPixmap()
+        self._slide_timer = QTimer(self)
+        self._slide_timer.timeout.connect(self.next_image)
+        self._slide_active = False
+        self._setup_ui()
+        self.load_current_image()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+    def _setup_ui(self):
+        self.setWindowTitle("安全照片浏览 - 仅内存，无缓存")
+        self.setMinimumSize(800, 600)
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignCenter)
+        self.img_label.setStyleSheet("background-color: black;")
+        self.setCentralWidget(self.img_label)
+        toolbar = QToolBar("浏览")
+        self.addToolBar(toolbar)
+        act_prev = QAction("上一张", self)
+        act_prev.triggered.connect(self.prev_image)
+        toolbar.addAction(act_prev)
+        act_next = QAction("下一张", self)
+        act_next.triggered.connect(self.next_image)
+        toolbar.addAction(act_next)
+        toolbar.addSeparator()
+        self.act_slide = QAction("幻灯片(3s)", self)
+        self.act_slide.setCheckable(True)
+        self.act_slide.toggled.connect(self.toggle_slideshow)
+        toolbar.addAction(self.act_slide)
+        toolbar.addSeparator()
+        act_fit = QAction("适应窗口", self)
+        act_fit.triggered.connect(self.toggle_fit)
+        toolbar.addAction(act_fit)
+        act_rotate = QAction("旋转90°", self)
+        act_rotate.triggered.connect(self.rotate_image)
+        toolbar.addAction(act_rotate)
+        act_orig = QAction("原始大小", self)
+        act_orig.triggered.connect(self.show_original)
+        toolbar.addAction(act_orig)
+        toolbar.addSeparator()
+        act_close = QAction("关闭", self)
+        act_close.triggered.connect(self.close)
+        toolbar.addAction(act_close)
+        self.setAcceptDrops(False)
+
+    def load_current_image(self):
+        if self.current_idx < 0 or self.current_idx >= len(self.img_paths):
+            self.img_label.setText("没有图片")
+            self._current_pixmap = QPixmap()
+            return
+        vpath = self.img_paths[self.current_idx]
+        data = self.core.load_file_data(vpath)
+        if data is None:
+            self.img_label.setText("解密失败或文件不存在")
+            self._current_pixmap = QPixmap()
+            return
+        img = QImage()
+        if not img.loadFromData(data):
+            self._secure_wipe(data)
+            self.img_label.setText("无法识别的图片格式")
+            self._current_pixmap = QPixmap()
+            return
+        self._secure_wipe(data)
+        if self._rotation != 0:
+            transform = QTransform().rotate(self._rotation)
+            img = img.transformed(transform)
+        self._current_pixmap = QPixmap.fromImage(img)
+        self._update_display()
+        self.setWindowTitle(f"安全浏览: {os.path.basename(vpath)} ({self.current_idx+1}/{len(self.img_paths)})")
+
+    def _update_display(self):
+        if self._current_pixmap.isNull():
+            return
+        if self._fit_to_window:
+            pix = self._current_pixmap.scaled(
+                self.img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            pix = self._current_pixmap
+        self.img_label.setPixmap(pix)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._fit_to_window and hasattr(self, '_current_pixmap'):
+            self._update_display()
+
+    def _secure_wipe(self, data: bytearray):
+        if data:
+            data[:] = b'\x00' * len(data)
+            del data
+
+    def next_image(self):
+        if self.current_idx < len(self.img_paths) - 1:
+            self.current_idx += 1
+            self._rotation = 0
+            self.load_current_image()
+
+    def prev_image(self):
+        if self.current_idx > 0:
+            self.current_idx -= 1
+            self._rotation = 0
+            self.load_current_image()
+
+    def toggle_slideshow(self, checked: bool):
+        if checked:
+            self._slide_timer.start(3000)
+        else:
+            self._slide_timer.stop()
+
+    def toggle_fit(self):
+        self._fit_to_window = not self._fit_to_window
+        self._update_display()
+
+    def rotate_image(self):
+        if self._current_pixmap.isNull():
+            return
+        img = self._current_pixmap.toImage()
+        transform = QTransform().rotate(90)
+        img = img.transformed(transform)
+        self._current_pixmap = QPixmap.fromImage(img)
+        self._rotation = (self._rotation + 90) % 360
+        self._update_display()
+
+    def show_original(self):
+        self._fit_to_window = False
+        self._update_display()
+
+    def closeEvent(self, event):
+        self._slide_timer.stop()
+        self._current_pixmap = QPixmap()
+        self.img_label.clear()
+        super().closeEvent(event)
+
+# ---------- GUI 模型（优化图标部分）----------
 class VaultTreeModel(QAbstractItemModel):
+    # 缓存文件夹图标，避免重复创建
+    _folder_icon = None
+
+    @classmethod
+    def folder_icon(cls):
+        if cls._folder_icon is None:
+            cls._folder_icon = QApplication.style().standardIcon(
+                QStyle.StandardPixmap.SP_DirIcon)
+        return cls._folder_icon
+
     def __init__(self, core: VaultCore):
         super().__init__()
         self.core = core
@@ -636,40 +864,77 @@ class VaultTreeModel(QAbstractItemModel):
         item = index.internalPointer()
         if role == Qt.DisplayRole:
             return item['name']
+        if role == Qt.DecorationRole:
+            # 使用缓存的图标
+            return self.folder_icon()
         if role == Qt.UserRole:
             return item['path']
         return None
 
 
 class FileListModel(QStandardItemModel):
+    # 缓存文件/文件夹图标
+    _folder_icon = None
+    _file_icon = None
+
+    @classmethod
+    def init_icons(cls):
+        if cls._folder_icon is None:
+            style = QApplication.style()
+            cls._folder_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            cls._file_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
     def __init__(self, core: VaultCore):
         super().__init__()
         self.core = core
+        # 确保图标已初始化
+        self.init_icons()
 
     def reload(self, folder: str):
         self.clear()
+        # 图标已缓存，直接使用
         idx = self.core.load_index()
-        for path, meta in idx.get('files', {}).items():
-            dir_part = os.path.dirname(path)
+        for fpath in idx.get('folders', {}):
+            if fpath == '/':
+                continue
+            parent = fpath.rsplit('/', 1)[0] if '/' in fpath else '/'
+            if parent == '':
+                parent = '/'
+            if parent == folder:
+                name = fpath.split('/')[-1]
+                item = QStandardItem(name)
+                item.setData(fpath, Qt.UserRole)
+                item.setData('folder', Qt.UserRole + 1)
+                item.setIcon(self._folder_icon)   # 复用缓存图标
+                self.appendRow(item)
+        for vpath, meta in idx.get('files', {}).items():
+            dir_part = vpath.rsplit('/', 1)[0] if '/' in vpath else '/'
             if dir_part == folder or (folder == '/' and dir_part == ''):
                 item = QStandardItem(meta['name'])
-                item.setData(path, Qt.UserRole)
+                item.setData(vpath, Qt.UserRole)
+                item.setData('file', Qt.UserRole + 1)
+                item.setIcon(self._file_icon)     # 复用缓存图标
                 self.appendRow(item)
 
 
 # ---------- 主窗口 ----------
 class VaultMainWindow(QMainWindow):
     def __init__(self):
-        super().__init__()
         self.core = VaultCore()
         self.vault_path = None
         self.current_folder = '/'
+        self.photo_viewer = None
         self._init_ui()
         self._update_actions()
 
     def _init_ui(self):
-        self.setWindowTitle("LynVault")
+        super().__init__()
+        self.setWindowTitle("LynVault 1.1.1")
         self.resize(1200, 780)
+
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         menu = self.menuBar()
         file_m = menu.addMenu("文件")
@@ -724,6 +989,10 @@ class VaultMainWindow(QMainWindow):
         self.act_newdir.triggered.connect(self.new_folder)
         tb.addAction(self.act_newdir)
 
+        self.act_browse_photos = QAction("安全浏览照片", self)
+        self.act_browse_photos.triggered.connect(self.browse_photos)
+        tb.addAction(self.act_browse_photos)
+
         tb.addSeparator()
 
         self.act_audit = QAction("查看审计日志", self)
@@ -741,12 +1010,14 @@ class VaultMainWindow(QMainWindow):
         self.list = QListView()
         self.file_model = FileListModel(self.core)
         self.list.setModel(self.file_model)
-        self.list.setViewMode(QListView.ListMode)    # 竖排列表模式
-        self.list.setWrapping(False)                 # 禁止换行，保持垂直滚动
-        self.list.setResizeMode(QListView.Adjust)    # 可保留，自动调整尺寸
+        self.list.setViewMode(QListView.ListMode)
+        self.list.setWrapping(False)
+        self.list.setResizeMode(QListView.Adjust)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self.file_context_menu)
         splitter.addWidget(self.list)
+
+        self.list.doubleClicked.connect(self.on_list_double_clicked)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -762,15 +1033,10 @@ class VaultMainWindow(QMainWindow):
     def _update_actions(self):
         enabled = self.vault_path is not None
         for a in [
-            self.act_close,
-            self.act_add_part,
-            self.act_del_part,
-            self.act_import_f,
-            self.act_import_d,
-            self.act_extract,
-            self.act_delete,
-            self.act_newdir,
-            self.act_audit,
+            self.act_close, self.act_add_part, self.act_del_part,
+            self.act_import_f, self.act_import_d, self.act_extract,
+            self.act_delete, self.act_newdir, self.act_audit,
+            self.act_browse_photos,
         ]:
             a.setEnabled(enabled)
 
@@ -853,6 +1119,39 @@ class VaultMainWindow(QMainWindow):
             path = '/'
         self.current_folder = path
         self.file_model.reload(path)
+
+    def on_list_double_clicked(self, index):
+        item = self.file_model.itemFromIndex(index)
+        if not item:
+            return
+        entry_type = item.data(Qt.UserRole + 1)
+        if entry_type != 'folder':
+            return
+        folder_path = item.data(Qt.UserRole)
+        self.current_folder = folder_path
+        self.file_model.reload(folder_path)
+        self._select_tree_folder(folder_path)
+
+    def _select_tree_folder(self, folder_path: str):
+        model = self.tree.model()
+        idx = self._find_index_by_path(model, QModelIndex(), folder_path)
+        if idx.isValid():
+            self.tree.setCurrentIndex(idx)
+            self.tree.scrollTo(idx)
+            parent = model.parent(idx)
+            while parent.isValid():
+                self.tree.setExpanded(parent, True)
+                parent = model.parent(parent)
+
+    def _find_index_by_path(self, model, parent, target_path):
+        for row in range(model.rowCount(parent)):
+            idx = model.index(row, 0, parent)
+            if idx.data(Qt.UserRole) == target_path:
+                return idx
+            found = self._find_index_by_path(model, idx, target_path)
+            if found.isValid():
+                return found
+        return QModelIndex()
 
     def import_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "导入文件")
@@ -960,15 +1259,85 @@ class VaultMainWindow(QMainWindow):
         text = "\n".join([f"{e['ts']:.0f}: {e['event']}" for e in entries])
         QMessageBox.information(self, "审计日志 (防篡改)", text[:4000])
 
+    def browse_photos(self):
+        if not self.vault_path:
+            return
+        selected_indexes = self.list.selectedIndexes()
+        if selected_indexes:
+            paths = [idx.data(Qt.UserRole) for idx in selected_indexes if idx.data(Qt.UserRole)]
+        else:
+            paths = []
+            idx = self.core.load_index()
+            folder_prefix = self.current_folder.rstrip('/') + '/'
+            for vpath in idx.get('files', {}):
+                if vpath.startswith(folder_prefix):
+                    paths.append(vpath)
+        if not paths:
+            QMessageBox.information(self, "提示", "没有可浏览的文件")
+            return
+        img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+        img_paths = [p for p in paths if os.path.splitext(p)[1].lower() in img_exts]
+        if not img_paths:
+            QMessageBox.information(self, "提示", "当前选择/文件夹中没有图片文件")
+            return
+
+        self.photo_viewer = SecurePhotoViewer(self.core, img_paths)
+        self.photo_viewer.destroyed.connect(self._on_viewer_closed)
+        self.photo_viewer.show()
+
+    def _on_viewer_closed(self):
+        self.photo_viewer = None
+
     def file_context_menu(self, pos):
         menu = QMenu()
         act_ext = menu.addAction("提取")
         act_del = menu.addAction("安全删除")
+        act_browse = menu.addAction("安全浏览")
+        act_rename = menu.addAction("重命名")
         choice = menu.exec(self.list.viewport().mapToGlobal(pos))
         if choice == act_ext:
             self.extract_selected()
         elif choice == act_del:
             self.delete_selected()
+        elif choice == act_browse:
+            self.browse_photos()
+        elif choice == act_rename:
+            self.rename_selected_item()
+
+    def rename_selected_item(self):
+        selected = self.list.selectedIndexes()
+        if not selected:
+            return
+        index = selected[0]
+        item = self.file_model.itemFromIndex(index)
+        if not item:
+            return
+        vpath = item.data(Qt.UserRole)
+        entry_type = item.data(Qt.UserRole + 1)
+        current_name = item.text()
+        title = "重命名文件夹" if entry_type == 'folder' else "重命名文件"
+        new_name, ok = QInputDialog.getText(self, title, "新名称:", text=current_name)
+        if not ok or not new_name or new_name == current_name:
+            return
+        if '/' in new_name or '\\' in new_name or '..' in new_name:
+            QMessageBox.warning(self, "非法字符", "名称不能包含 / \\ .. 等字符")
+            return
+        success = False
+        if entry_type == 'folder':
+            success = self.core.rename_folder(vpath, new_name)
+        else:
+            success = self.core.rename_file(vpath, new_name)
+        if success:
+            if entry_type == 'folder':
+                if self.current_folder == vpath or self.current_folder.startswith(vpath + '/'):
+                    self.current_folder = self.current_folder.replace(vpath, vpath.rsplit('/', 1)[0] + '/' + new_name, 1)
+            self.tree_model.rebuild()
+            self.file_model.reload(self.current_folder)
+            if entry_type == 'folder':
+                new_path = vpath.rsplit('/', 1)[0] + '/' + new_name
+                self._select_tree_folder(new_path)
+        else:
+            QMessageBox.critical(self, "重命名失败", "可能名称冲突或路径无效")
 
     def dragEnterEvent(self, e: QDragEnterEvent):
         if self.vault_path and e.mimeData().hasUrls():
