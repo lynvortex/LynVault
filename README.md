@@ -1,125 +1,131 @@
-### 概述
-**LynVault** 是一个支持**可否认加密**的多分区加密文件柜。  
-所有文件被加密存储在单个 `.vault` 容器中，通过**不同密码**可解锁不同的分区（真实分区与伪装分区），并可叠加**密钥文件**增强安全性。
+# LynVault
 
-加密算法采用 **PBKDF2 密钥派生 + AES-256-GCM 加密**，元数据由 HMAC-SHA512 保护。  
-保险柜内置防篡改审计日志、安全擦除以及暴力破解锁定（5 次错误后锁定 30 分钟）。
+**LynVault** 是一个基于 AES-256-GCM 的本地加密保险柜应用程序，提供强大的文件加密、伪装分区、安全销毁及碎片整理功能。支持图形化界面（基于 PySide6），操作直观，适用于保护个人隐私文件。
 
-### 功能特色
-- 🔐 高强度加密：PBKDF2 (100 万次迭代) + AES-256-GCM
-- 🎭 可否认性：最多 8 个分区，各自独立密码 / 密钥文件
-- 🛡️ 反取证：DoD 7 次覆写安全删除
-- 🔒 连续错误自动锁定
-- 📜 链式哈希审计日志（防篡改）
-- 🖥️ 跨平台图形界面（基于 PySide6）
+## 特性
+
+- 🔐 **强加密**：AES-256-GCM 认证加密 + PBKDF2 密钥派生（100万次迭代），保护数据机密性和完整性。
+- 🎭 **伪装分区**：可创建最多 8 个独立分区，每个分区使用不同密码，主分区可隐藏真实文件，迷惑攻击者。
+- 🗑️ **安全删除**：导入文件后可选择安全擦除原文件（DoD 标准 7 次覆盖），保险柜内删除直接覆盖密文区域，防止恢复。
+- 📄 **内置查看器**：支持图片（JPG/PNG/GIF/BMP/WEBP/TIFF）、文本、Markdown、Python 脚本以及加密/非加密 Office 文档（.docx/.xlsx）的安全预览，避免临时文件泄漏。
+- 🔍 **审计日志**：记录所有关键操作（文件导入/导出/删除、分区管理等），日志链使用 HMAC 防篡改。
+- 🧹 **碎片整理**：整理保险柜内部数据，消除已删除文件留下的空隙，压缩文件体积。
+- 🛡️ **暴力破解防护**：连续 5 次密码错误自动锁定 30 分钟，防止离线字典攻击。
+- 🔑 **双因素认证**：支持可选的密钥文件，与主密码结合增强安全性。
+- ⚡ **后台验证**：密码验证在后台线程执行，界面不会卡顿。
+
+## 安装
 
 ### 环境要求
-- Python 3.9 或更高版本
-- PySide6
-- cryptography
+- Python 3.8 或更高版本
+- 支持的操作系统：Windows / macOS / Linux
 
-安装依赖：
-```bash
-pip install -r requirements.txt
-```
+### 步骤
 
-### 使用方法
-运行程序：
-```bash
-python main.py
-```
+1. 克隆或下载本仓库：
+   ```bash
+   git clone https://github.com/lynvortex/LynVault.git
+   cd LynVault
+   ```
 
-**新建保险柜**  
-`文件 → 新建保险柜` → 选择保存位置，设置主密码（至少 12 位），可选密钥文件。
+2. 安装依赖（推荐使用虚拟环境）：
+   ```bash
+   pip install pyside6 cryptography python-docx openpyxl msoffcrypto-tool
+   ```
 
-**打开保险柜**  
-`文件 → 打开保险柜` → 选择 `.vault` 文件，输入对应密码（以及密钥文件）。  
-若输入**伪装分区密码**，则会打开对应的隐藏分区。
+3. 运行程序：
+   ```bash
+   python lynvault.py
+   ```
 
-**导入文件**  
-可直接拖拽文件/文件夹到窗口，或通过工具栏按钮导入。
+> 注意：若不需要 Office 文档预览功能，可以省略 `python-docx`、`openpyxl`、`msoffcrypto-tool` 依赖，程序会自动降级。
 
-**管理伪装分区**  
-`操作 → 添加伪装分区` / `删除伪装分区`
+## 使用方法
 
-**提取 / 删除**  
-右键文件，选择“提取”或“安全删除”。
+### 创建保险柜
+- 点击工具栏 **“新建保险柜”** 按钮，选择保存路径（扩展名为 `.vault`）。
+- 设置主密码（至少 12 位），可选一个密钥文件作为第二因子。
+- 保险柜创建后，将自动包含一个名为 `Main` 的主分区。
 
-### 打包为独立 EXE（Windows）
-```bash
-pyinstaller --onefile --windowed --icon=icon.ico --name LynVault main.py
-```
-若需要体积较小的启动器（依赖外置），可将 `--onefile` 替换为 `--onedir`。
+### 打开保险柜
+- 点击 **“打开保险柜”**，选择 `.vault` 文件，输入主密码（若设置了密钥文件需一同提供）。
+- 若认证成功，会列出主分区内的文件和文件夹。状态栏显示当前分区名称。
 
-### 安全须知
-- 保险柜**不存储密码**，仅保存认证标签的派生值。
-- 请使用**足够复杂的主密码**（12 位以上）并考虑配合密钥文件。
-- 审计日志采用链式哈希，任何篡改均会导致链断裂。
-- **无后门**，忘记密码将无法恢复数据。
+### 导入文件/文件夹
+- **拖拽文件**或文件夹到主窗口即可导入到当前目录。
+- 或使用 **“导入文件”** / **“导入文件夹”** 按钮。
+- 导入单个文件后，程序会询问是否安全粉碎原文件（7 次覆盖擦除）。
 
-### 开源许可
-本项目基于 MIT License 发布。  
-© 2025 LynVortex
+### 导出文件
+- 选中文件（支持多选），点击 **“提取选中”** 并选择目标文件夹，文件将解密后保存到本地。
 
-### Overview
-**LynVault** is a local, multi-layer encrypted file container with **plausible deniability**.
-It creates a single `.vault` file where you can securely store files.  
-The vault supports multiple **hidden partitions**: one real partition and several fake ones, each unlocked by a **different password** (optionally combined with a **key file**).
+### 安全删除
+- 选中保险柜内的文件或文件夹，点击 **“安全删除”**。文件对应的密文区域会被随机数据覆盖，无法恢复。
 
-All data is encrypted with **AES-256-GCM**, and every critical header is integrity-protected with HMAC-SHA512. The vault includes **audit logging**, **anti-tampering** and **brute-force lockout** (after 5 wrong attempts, locked for 30 minutes).
+### 新建/重命名文件夹
+- 点击 **“新建文件夹”** 并在弹出框中输入名称（禁止包含 `/`、`\`、`..`）。
+- 右键点击文件或文件夹，选择 **“重命名”** 可修改名称。
 
-### Features
-- 🔐 Strong encryption: PBKDF2 (1 000 000 iterations) + AES-256-GCM
-- 🎭 Plausible deniability: up to 8 partitions, each with its own password / key file
-- 🛡️ Anti‑forensic: secure deletion with DoD 7‑pass overwrite
-- 🔒 Auto‑lock after consecutive failed attempts
-- 📜 Chain‑hashed audit log (tamper‑evident)
-- 🖥️ Cross‑platform GUI (Windows, Linux, macOS) built with PySide6
+### 伪装分区管理
+- **添加**：点击 **“添加伪装分区”**，设置分区别名和密码（至少 12 位）。
+- **切换**：要切换到其他分区，需重新打开保险柜并输入对应分区的密码（主分区可使用主密码）。
+- **删除**：点击 **“删除伪装分区”** 选择要移除的分区（主分区不可删除）。删除后该分区的所有数据将丢失。
 
-### Requirements
-- Python 3.9+
-- PySide6
-- cryptography
+### 安全查看文件
+- 选中一个文件，点击 **“安全查看”**：
+  - 图片：弹出图片浏览器，支持幻灯片、旋转、缩放。
+  - 纯文本或源代码：以只读模式显示在文本框中，禁用复制、剪切、保存等操作。
+  - Office 文档（.docx/.xlsx）：提取文字内容后显示（若文件加密需提供打开密码）。
+  - 其他格式：提示不支持。
 
-Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+### 碎片整理
+- 点击 **“整理保险柜”**，程序会重新打包所有有效数据，移除已删除文件留下的空白区域，减小文件体积。操作期间请勿关闭程序。
 
-### Usage
-Run the application:
-```bash
-python main.py
-```
+### 审计日志
+- 点击 **“查看审计日志”** 可看到最近的操作记录（时间戳 + 事件描述），日志经过 HMAC 保护，无法伪造。
 
-**Create a vault**  
-`File → New Vault` → choose a location, set a master password (min. 12 chars) and optionally a key file.
+### 销毁保险柜
+- 点击红色 **“销毁保险箱”** 按钮，保险柜文件将被安全擦除（7 次覆盖）并删除，数据不可恢复。请谨慎操作。
 
-**Open a vault**  
-`File → Open Vault` → select the `.vault` file, enter the password (and key file if used).  
-If you enter a **fake password**, the corresponding hidden partition will open instead.
+## 注意事项
 
-**Add files**  
-Drag & drop files/folders into the window, or use the toolbar buttons.
+- **密码强度**：主密码及伪装分区密码建议长度 ≥ 12 位，包含大小写字母、数字、特殊符号。
+- **密钥文件**：若使用密钥文件，请务必妥善保管，丢失后将无法打开保险柜（无法找回）。
+- **备份**：定期备份 `.vault` 文件，防止硬盘损坏导致数据丢失。
+- **内存安全**：程序会在内存中零化敏感数据（密码、解密后的文件内容），但不能完全杜绝操作系统或硬件层面的内存采集。
+- **兼容性**：若保险柜文件版本更新，旧版程序可能无法打开新版文件。建议在升级前导出所有文件。
 
-**Manage hidden partitions**  
-`Actions → Add Decoy Partition` / `Remove Decoy Partition`
+## 命令行参数
 
-**Extract / Delete**  
-Right‑click a file and choose "Extract" or "Secure Delete".
+目前没有实现命令行接口，所有操作均通过图形界面完成。
 
-### Building a standalone EXE (Windows)
-```bash
-pyinstaller --onefile --windowed --icon=icon.ico --name LynVault main.py
-```
-For a smaller launcher (using external dependencies), replace `--onefile` with `--onedir`.
+## 依赖库说明
 
-### Security Notes
-- The vault does **not** store passwords – only a derived authentication tag is saved.
-- Use a **strong master password** (> 12 characters) and consider a key file.
-- The audit log is chain‑hashed; any tampering will break the chain.
-- There is **no backdoor** – lost passwords cannot be recovered.
+| 库 | 用途 | 是否必需 |
+|----|------|----------|
+| PySide6 | GUI 框架 | 是 |
+| cryptography | 加密核心（AES-GCM、PBKDF2、HKDF、HMAC） | 是 |
+| python-docx | 提取 .docx 文件文本 | 否（预览文档时需要） |
+| openpyxl | 提取 .xlsx 文件文本 | 否（预览文档时需要） |
+| msoffcrypto-tool | 解密受密码保护的 Office 文件 | 否（预览加密 Office 时需要） |
 
-### License
-This project is released under the MIT License.  
-© 2025 LynVortex
+## 常见问题
+
+**Q：我忘记了主密码，还能找回数据吗？**  
+A：不能。密码和密钥文件是唯一打开保险柜的方式，程序没有后门，请务必牢记密码。
+
+**Q：伪装分区真的能欺骗攻击者吗？**  
+A：可以。主分区和伪装分区使用不同的派生盐和认证标签，除非输入对应密码，否则无法区分哪些分区是真实的。你可以把少量虚假文件放在伪装分区，而真正的文件放在主分区或其他伪装分区中。
+
+**Q：碎片整理会损坏数据吗？**  
+A：不会。整理过程会复制所有有效数据到临时文件，验证无误后替换原文件，保证数据完整性。
+
+**Q：能否在命令行中无界面使用？**  
+A：当前版本仅提供图形界面。若需要命令行工具，可参考源码中的 `VaultCore` 类自行集成。
+
+**Q：为什么程序启动时要求设置内存锁定？**  
+A：程序尝试调用 `resource.setrlimit` 提高内存锁定限制，防止敏感数据被交换到磁盘。如果系统不允许，不影响正常使用。
+
+---
+
+**安全声明**：虽然 LynVault 采用了业界公认的加密算法和安全实践，但没有任何软件能保证 100% 的安全。请合理评估风险，并遵循良好的安全习惯（如使用强密码、定期更新操作系统等）。
