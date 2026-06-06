@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# LynVault 1.3.3
+# LynVault 1.3.4
 # 依赖: pip install pyside6 cryptography python-docx openpyxl msoffcrypto-tool
 
 import sys
@@ -7,6 +7,7 @@ import os
 import json
 import struct
 import time
+import shutil
 from pathlib import Path
 from secrets import token_bytes, compare_digest
 from typing import Optional, List, Dict, Any, Tuple
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt, QAbstractItemModel, QModelIndex, QTimer, Signal,
     QSize, QRect, QPoint, QMimeDatabase, QFileInfo,
+    QThread, QRunnable, QThreadPool, QObject
 )
 from PySide6.QtGui import (
     QAction, QStandardItemModel, QStandardItem, QDragEnterEvent, QDropEvent,
@@ -46,7 +48,6 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
-# 已移除 python-pptx
 try:
     import msoffcrypto
     HAS_MSOFFCRYPTO = True
@@ -58,7 +59,7 @@ MAGIC = b'PYVAULT4'
 VERSION = 4
 HEADER_SIZE = 1024
 MAX_PARTITIONS = 8
-PARTITION_ENTRY_SIZE = 80
+PARTITION_ENTRY_SIZE = 96 
 MAX_ERRORS = 5
 LOCKOUT_SECONDS = 30 * 60
 COOLDOWN_SECONDS = 3.0
@@ -73,8 +74,8 @@ SIGNED_LENGTH = 887
 SIGNATURE_OFFSET = 960
 SIGNATURE_SIZE = 64
 
-FMT_HEADER = '<8sB32s32s32s'
-FMT_PART   = '<16s32sQQ16s'
+FMT_HEADER = '<8sBQ24s32s32s'
+FMT_PART   = '<16s32s32sQQ'
 FMT_LOCK   = '<Bd'
 FMT_LOCK_BLOCK = '<Bd32s'
 
@@ -87,26 +88,36 @@ try:
 except:
     pass
 
+def _secure_wipe(data: bytearray):
+    if isinstance(data, bytearray) and len(data) > 0:
+        for i in range(len(data)):
+            data[i] = 0
+
 # ---------- 密码学工具 ----------
 def derive_keys(password: str, key_file_data: Optional[bytes], salt: bytes) -> Tuple[bytes, bytes, bytes]:
-    combined = password.encode('utf-8')
+    combined = bytearray(password.encode('utf-8'))
     if key_file_data:
-        combined += key_file_data
+        combined.extend(key_file_data)
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(), length=32, salt=salt,
         iterations=PBKDF2_ITERATIONS, backend=BACKEND
     )
-    master = kdf.derive(combined)
+    master = kdf.derive(bytes(combined))
+    _secure_wipe(combined)
+    
     hkdf = HKDF(
         algorithm=hashes.SHA512(), length=96, salt=None,
         info=b'pyvault4-keys', backend=BACKEND
     )
     derived = hkdf.derive(master)
+    _secure_wipe(bytearray(master))
+    
     return derived[:32], derived[32:64], derived[64:96]
 
-def encrypt_gcm(key: bytes, plaintext: bytes) -> bytes:
+def encrypt_gcm(key: bytes, plaintext: bytes, nonce: bytes = None) -> bytes:
     aesgcm = AESGCM(key)
-    nonce = token_bytes(12)
+    if nonce is None:
+        nonce = token_bytes(12)
     ct = aesgcm.encrypt(nonce, plaintext, None)
     return nonce + ct
 
@@ -273,6 +284,17 @@ class VaultCore:
         self.key_file_data = None
         self.audit = None
         self.last_attempt_time = 0.0
+        self.nonce_counter = 0
+
+    def _generate_nonce(self) -> bytes:
+        self.nonce_counter += 1
+        counter_bytes = struct.pack('>Q', self.nonce_counter)
+        random_bytes = token_bytes(4)
+        return counter_bytes + random_bytes
+
+    def _encrypt_gcm(self, plaintext: bytes) -> bytes:
+        nonce = self._generate_nonce()
+        return encrypt_gcm(self.enc_key, plaintext, nonce)
 
     def rename_file(self, old_vpath: str, new_name: str) -> bool:
         if not self.enc_key or not self.vault.handle:
@@ -337,17 +359,17 @@ class VaultCore:
     def pack_header(self) -> bytes:
         buf = bytearray(HEADER_SIZE)
         struct.pack_into(FMT_HEADER, buf, 0,
-                         MAGIC, VERSION, b'\0'*32, self.lock_key, self.salt)
+                         MAGIC, VERSION, self.nonce_counter, b'\0'*24, self.lock_key, self.salt)
         num = min(len(self.partitions), MAX_PARTITIONS)
         struct.pack_into('<B', buf, 105, num)
         off = 106
         for p in self.partitions[:num]:
             alias = p['alias'][:16].encode().ljust(16, b'\0')
+            p_salt = p.get('salt', self.salt)[:32].ljust(32, b'\0')
             tag = p['auth_tag'][:32].ljust(32, b'\0')
             struct.pack_into(FMT_PART, buf, off,
-                             alias, tag,
-                             p['index_offset'], p['index_length'],
-                             b'\0'*16)
+                             alias, p_salt, tag,
+                             p['index_offset'], p['index_length'])
             off += PARTITION_ENTRY_SIZE
         struct.pack_into(FMT_LOCK, buf, LOCK_OFFSET,
                          self.lock_count & 0xFF, self.lock_until)
@@ -358,19 +380,21 @@ class VaultCore:
     def unpack_header(self, data: bytes) -> bool:
         if len(data) < HEADER_SIZE:
             return False
-        magic, version, _, lock_key, salt = struct.unpack_from(FMT_HEADER, data, 0)
+        magic, version, nonce_ctr, _, lock_key, salt = struct.unpack_from(FMT_HEADER, data, 0)
         if magic != MAGIC or version != VERSION:
             return False
         self.lock_key = lock_key
         self.salt = salt
+        self.nonce_counter = nonce_ctr
         num = struct.unpack_from('<B', data, 105)[0]
         self.partitions.clear()
         off = 106
         for _ in range(min(num, MAX_PARTITIONS)):
-            alias_raw, tag_raw, idx_off, idx_len, _ = struct.unpack_from(FMT_PART, data, off)
+            alias_raw, p_salt, tag_raw, idx_off, idx_len = struct.unpack_from(FMT_PART, data, off)
             alias = alias_raw.decode('utf-8').rstrip('\0')
             self.partitions.append({
                 'alias': alias,
+                'salt': p_salt,
                 'auth_tag': tag_raw,
                 'index_offset': idx_off,
                 'index_length': idx_len
@@ -424,14 +448,20 @@ class VaultCore:
         self.salt = token_bytes(32)
         self.lock_key = token_bytes(32)
         self.key_file_data = key_file_data
+        self.nonce_counter = 0
+        
         enc_k, auth_k, sign_k = derive_keys(password, key_file_data, self.salt)
         tag = create_auth_tag(auth_k)
         empty_idx = json.dumps({'files': {}, 'folders': {}, 'audit': []}).encode()
-        enc_idx = encrypt_gcm(enc_k, empty_idx)
+        
+        self.enc_key = enc_k 
+        enc_idx = self._encrypt_gcm(empty_idx)
+        
         idx_off = self.vault.append(enc_idx)
         idx_len = len(enc_idx)
         self.partitions = [{
             'alias': DEFAULT_PARTITION,
+            'salt': self.salt,
             'auth_tag': tag,
             'index_offset': idx_off,
             'index_length': idx_len
@@ -443,6 +473,11 @@ class VaultCore:
         header_signed = header_raw[:SIGNATURE_OFFSET] + sig
         self.vault.write_header(header_signed)
         self.vault.close()
+        
+        _secure_wipe(bytearray(enc_k))
+        _secure_wipe(bytearray(auth_k))
+        _secure_wipe(bytearray(sign_k))
+        self.enc_key = None
 
     def open_and_authenticate(self, path: str, password: str,
                               key_file_data: Optional[bytes] = None) -> Optional[int]:
@@ -459,12 +494,18 @@ class VaultCore:
         if not self.check_lock():
             self.vault.close()
             return None
-        enc_k, auth_k, sign_k = derive_keys(password, key_file_data, self.salt)
+            
         for idx, p in enumerate(self.partitions):
+            p_salt = p.get('salt', self.salt)
+            enc_k, auth_k, sign_k = derive_keys(password, key_file_data, p_salt)
+            
             if verify_auth_tag(auth_k, p['auth_tag']):
                 enc_idx = self.vault.read_at(p['index_offset'], p['index_length'])
                 idx_plain = decrypt_gcm(enc_k, enc_idx)
                 if idx_plain is None:
+                    _secure_wipe(bytearray(enc_k))
+                    _secure_wipe(bytearray(auth_k))
+                    _secure_wipe(bytearray(sign_k))
                     continue
                 self.active_idx = idx
                 self.enc_key = enc_k
@@ -479,6 +520,11 @@ class VaultCore:
                 self._write_lock()
                 self._update_header_sig()
                 return idx
+            else:
+                _secure_wipe(bytearray(enc_k))
+                _secure_wipe(bytearray(auth_k))
+                _secure_wipe(bytearray(sign_k))
+                
         self.record_failure()
         self.vault.close()
         return None
@@ -487,21 +533,32 @@ class VaultCore:
                       key_file_data: Optional[bytes]) -> bool:
         if not self.enc_key or not self.vault.handle:
             return False
-        fake_enc, fake_auth, _ = derive_keys(fake_pwd, key_file_data, self.salt)
+            
+        part_salt = token_bytes(32)
+        fake_enc, fake_auth, _ = derive_keys(fake_pwd, key_file_data, part_salt)
         tag = create_auth_tag(fake_auth)
         empty_idx = json.dumps({'files': {}, 'folders': {}, 'audit': []}).encode()
-        enc_idx = encrypt_gcm(fake_enc, empty_idx)
+        
+        orig_enc_key = self.enc_key
+        self.enc_key = fake_enc
+        enc_idx = self._encrypt_gcm(empty_idx)
+        self.enc_key = orig_enc_key
+        
         off = self.vault.append(enc_idx)
         if len(self.partitions) >= MAX_PARTITIONS:
             return False
         self.partitions.append({
             'alias': alias,
+            'salt': part_salt,
             'auth_tag': tag,
             'index_offset': off,
             'index_length': len(enc_idx)
         })
         self._update_header_sig()
         self.audit.add(f"添加伪装分区 '{alias}'")
+        
+        _secure_wipe(bytearray(fake_enc))
+        _secure_wipe(bytearray(fake_auth))
         return True
 
     def remove_partition(self, alias_or_idx) -> bool:
@@ -540,7 +597,7 @@ class VaultCore:
             return
         index_dict['audit'] = self.audit.to_json()
         plain = json.dumps(index_dict).encode()
-        enc = encrypt_gcm(self.enc_key, plain)
+        enc = self._encrypt_gcm(plain)
         p = self.partitions[self.active_idx]
         old_off = p['index_offset']
         old_len = p['index_length']
@@ -555,7 +612,7 @@ class VaultCore:
             return False
         with open(src_path, 'rb') as f:
             content = f.read()
-        enc = encrypt_gcm(self.enc_key, content)
+        enc = self._encrypt_gcm(content)
         off = self.vault.append(enc)
         idx = self.load_index()
         dirs = vpath.split('/')
@@ -599,11 +656,26 @@ class VaultCore:
         plain = decrypt_gcm(self.enc_key, enc)
         if plain is None:
             return False
-        dest = os.path.join(dest_folder, meta['name'])
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, 'wb') as f:
+            
+        safe_name = os.path.basename(meta['name'])
+        safe_name = "".join(c for c in safe_name if c.isalnum() or c in ('.', '_', '-')).strip('.')
+        if not safe_name:
+            safe_name = "extracted_file"
+            
+        dest_folder_abs = os.path.abspath(dest_folder)
+        dest_path = os.path.abspath(os.path.join(dest_folder_abs, safe_name))
+        
+        if not dest_path.startswith(dest_folder_abs + os.sep) and dest_path != dest_folder_abs:
+            self.audit.add(f"拦截路径遍历攻击: '{meta['name']}'")
+            _secure_wipe(bytearray(plain))
+            return False
+            
+        os.makedirs(dest_folder_abs, exist_ok=True)
+        with open(dest_path, 'wb') as f:
             f.write(plain)
+            
         self.audit.add(f"提取文件 '{vpath}'")
+        _secure_wipe(bytearray(plain))
         return True
 
     def delete_file(self, vpath: str):
@@ -650,12 +722,58 @@ class VaultCore:
             return None
         return bytearray(plain)
 
-# ---------- Office 文本提取（已修正 msoffcrypto API） ----------
+    def defragment_vault(self, progress_callback=None) -> bool:
+        if not self.enc_key or not self.vault.handle:
+            return False
+            
+        temp_path = self.vault.path + ".tmp"
+        idx = self.load_index()
+        
+        try:
+            with open(temp_path, 'wb') as tmp_f:
+                tmp_f.write(b'\0' * HEADER_SIZE)
+                
+                files_meta = idx.get('files', {})
+                total_files = len(files_meta)
+                for i, (vpath, meta) in enumerate(files_meta.items()):
+                    enc_data = self.vault.read_at(meta['offset'], meta['length'])
+                    new_off = tmp_f.tell()
+                    tmp_f.write(enc_data)
+                    meta['offset'] = new_off
+                    if progress_callback:
+                        progress_callback(int((i + 1) / (total_files + 1) * 50))
+                        
+                self.save_index(idx)
+                enc_idx = self._encrypt_gcm(json.dumps(idx).encode())
+                idx_off = tmp_f.tell()
+                tmp_f.write(enc_idx)
+                
+                p = self.partitions[self.active_idx]
+                p['index_offset'] = idx_off
+                p['index_length'] = len(enc_idx)
+                
+                header_raw = self.pack_header()
+                sig = compute_header_signature(header_raw[:SIGNED_LENGTH], self.sign_key)
+                header_signed = header_raw[:SIGNATURE_OFFSET] + sig
+                tmp_f.seek(0)
+                tmp_f.write(header_signed)
+                
+            self.vault.close()
+            shutil.move(temp_path, self.vault.path)
+            self.vault.open('rb+')
+            self.audit.add("执行保险柜碎片整理")
+            self.save_index(idx)
+            return True
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
+
+# ---------- Office 文本提取 ----------
 def extract_office_text(data: bytes, ext: str, password: str = None) -> Optional[str]:
     from io import BytesIO
     buf = BytesIO(data)
 
-    # 使用新版 msoffcrypto API：OfficeFile 对象
     if password is not None and HAS_MSOFFCRYPTO:
         try:
             office_file = msoffcrypto.OfficeFile(buf)
@@ -789,11 +907,11 @@ class SecurePhotoViewer(QMainWindow):
             return
         img = QImage()
         if not img.loadFromData(data):
-            self._secure_wipe(data)
+            _secure_wipe(data)
             self.img_label.setText("无法识别的图片格式")
             self._current_pixmap = QPixmap()
             return
-        self._secure_wipe(data)
+        _secure_wipe(data)
         if self._rotation != 0:
             transform = QTransform().rotate(self._rotation)
             img = img.transformed(transform)
@@ -814,11 +932,6 @@ class SecurePhotoViewer(QMainWindow):
         super().resizeEvent(event)
         if self._fit_to_window:
             self._update_display()
-
-    def _secure_wipe(self, data: bytearray):
-        if data:
-            data[:] = b'\x00' * len(data)
-            del data
 
     def next_image(self):
         if self.current_idx < len(self.img_paths) - 1:
@@ -1026,6 +1139,30 @@ class FileListModel(QStandardItemModel):
                 item.setIcon(self.get_icon_for_file(name))
                 self.appendRow(item)
 
+# ---------- 后台验证工作类 (方法二核心) ----------
+class VaultOpenSignals(QObject):
+    finished = Signal(int)
+    error = Signal(str)
+
+class VaultOpenWorker(QRunnable):
+    def __init__(self, core, path, pwd, key_data):
+        super().__init__()
+        self.core = core
+        self.path = path
+        self.pwd = pwd
+        self.key_data = key_data
+        self.signals = VaultOpenSignals()
+
+    def run(self):
+        try:
+            idx = self.core.open_and_authenticate(self.path, self.pwd, self.key_data)
+            if idx is None:
+                self.signals.error.emit("密码/密钥文件错误，或保险柜已锁定")
+            else:
+                self.signals.finished.emit(idx)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
 # ---------- 主窗口 ----------
 class VaultMainWindow(QMainWindow):
     def __init__(self):
@@ -1035,12 +1172,13 @@ class VaultMainWindow(QMainWindow):
         self.photo_viewer = None
         self.doc_viewer = None
         self.destroy_btn = None
+        self.worker = None
         self._init_ui()
         self._update_actions()
 
     def _init_ui(self):
         super().__init__()
-        self.setWindowTitle("LynVault 1.3.3")
+        self.setWindowTitle("LynVault 1.3.4")
         screen_geometry = QApplication.primaryScreen().availableGeometry()
         screen_width = screen_geometry.width()
         screen_height = screen_geometry.height()
@@ -1054,7 +1192,6 @@ class VaultMainWindow(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        # ---------- QActions ----------
         self.act_create = QAction("新建保险柜...", self)
         self.act_create.triggered.connect(self.create_vault)
         self.act_open = QAction("打开保险柜...", self)
@@ -1079,8 +1216,9 @@ class VaultMainWindow(QMainWindow):
         self.act_view_document.triggered.connect(self.safe_view_file)
         self.act_audit = QAction("查看审计日志", self)
         self.act_audit.triggered.connect(self.show_audit)
+        self.act_defrag = QAction("整理保险柜", self)
+        self.act_defrag.triggered.connect(self.defragment_vault)
 
-        # ---------- 工具栏 ----------
         toolbar_widget = QWidget()
         toolbar_layout = FlowLayout(toolbar_widget)
 
@@ -1093,7 +1231,7 @@ class VaultMainWindow(QMainWindow):
             (self.act_extract, False), (self.act_delete, False),
             (self.act_newdir, False), (self.act_view_document, False),
             (None, True),
-            (self.act_audit, False),
+            (self.act_audit, False), (self.act_defrag, False),
         ]
 
         self.tool_buttons = []
@@ -1108,18 +1246,15 @@ class VaultMainWindow(QMainWindow):
                 toolbar_layout.addWidget(btn)
                 self.tool_buttons.append(btn)
 
-        # 红色销毁按钮
         self.destroy_btn = QPushButton("销毁保险箱")
         self.destroy_btn.setStyleSheet("color: red; font-weight: bold;")
         self.destroy_btn.clicked.connect(self.destroy_vault)
         toolbar_layout.addWidget(self.destroy_btn)
 
-        # ---------- 中央区域 ----------
         central = QWidget()
         main_layout = QVBoxLayout(central)
         main_layout.addWidget(toolbar_widget)
 
-        # 导航栏
         self.nav_widget = QWidget()
         nav_layout = QHBoxLayout(self.nav_widget)
         nav_layout.setContentsMargins(0, 0, 0, 0)
@@ -1134,7 +1269,6 @@ class VaultMainWindow(QMainWindow):
         self.nav_widget.setVisible(False)
         main_layout.addWidget(self.nav_widget)
 
-        # 文件列表
         self.list = QListView()
         self.file_model = FileListModel(self.core)
         self.list.setModel(self.file_model)
@@ -1158,7 +1292,7 @@ class VaultMainWindow(QMainWindow):
             self.act_close, self.act_add_part, self.act_del_part,
             self.act_import_f, self.act_import_d, self.act_extract,
             self.act_delete, self.act_newdir, self.act_audit,
-            self.act_view_document
+            self.act_view_document, self.act_defrag
         ]:
             a.setEnabled(enabled)
         if self.destroy_btn:
@@ -1168,7 +1302,6 @@ class VaultMainWindow(QMainWindow):
         if self.nav_widget:
             self.nav_widget.setVisible(enabled)
 
-    # ---------- 功能方法 ----------
     def _get_key_file(self) -> Optional[bytes]:
         dlg = QMessageBox(self)
         dlg.setWindowTitle("密钥文件")
@@ -1207,15 +1340,30 @@ class VaultMainWindow(QMainWindow):
         if not ok:
             return
         key_data = self._get_key_file()
-        idx = self.core.open_and_authenticate(path, pwd, key_data)
-        if idx is None:
-            QMessageBox.critical(self, "认证失败", "密码/密钥文件错误，或保险柜已锁定")
-            return
+        
+        # 显示加载提示，禁用按钮防止重复点击
+        self.status.showMessage("正在验证密码并解锁保险柜，请稍候...")
+        self.setEnabled(False) 
+        QApplication.processEvents()
+
+        # 使用线程池在后台执行耗时操作
+        self.worker = VaultOpenWorker(self.core, path, pwd, key_data)
+        self.worker.signals.finished.connect(lambda idx: self._on_vault_opened(path, idx))
+        self.worker.signals.error.connect(self._on_vault_open_failed)
+        QThreadPool.globalInstance().start(self.worker)
+
+    def _on_vault_opened(self, path, idx):
+        self.setEnabled(True)
         self.vault_path = path
         self.navigate_to('/')
         part_name = self.core.partitions[idx]['alias']
         self.status.showMessage(f"已解锁分区: {part_name}  | 审计日志已激活")
         self._update_actions()
+
+    def _on_vault_open_failed(self, err_msg):
+        self.setEnabled(True)
+        self.status.showMessage("打开失败")
+        QMessageBox.critical(self, "认证失败", err_msg)
 
     def close_vault(self):
         if self.core.audit:
@@ -1224,6 +1372,14 @@ class VaultMainWindow(QMainWindow):
             self.core.save_index(idx)
         if self.core.vault.handle:
             self.core.vault.close()
+            
+        if self.core.enc_key:
+            _secure_wipe(bytearray(self.core.enc_key))
+        if self.core.auth_key:
+            _secure_wipe(bytearray(self.core.auth_key))
+        if self.core.sign_key:
+            _secure_wipe(bytearray(self.core.sign_key))
+            
         self.core = VaultCore()
         self.vault_path = None
         self.current_folder = '/'
@@ -1269,6 +1425,38 @@ class VaultMainWindow(QMainWindow):
         self._update_actions()
         self.status.showMessage("保险箱已销毁")
         QMessageBox.information(self, "完成", "保险箱文件已安全销毁。")
+
+    def defragment_vault(self):
+        if not self.vault_path:
+            return
+        reply = QMessageBox.question(
+            self, "整理保险柜", 
+            "将重新打包所有有效数据，消除碎片并压缩文件体积。\n此过程可能需要一些时间，期间请勿关闭程序。\n\n继续？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+            
+        progress = QProgressDialog("正在整理保险柜...", None, 0, 100, self)
+        progress.setWindowTitle("碎片整理")
+        progress.setCancelButton(None)
+        progress.show()
+        
+        def update_progress(val):
+            progress.setValue(val)
+            QApplication.processEvents()
+            
+        try:
+            success = self.core.defragment_vault(update_progress)
+            if success:
+                progress.setValue(100)
+                QMessageBox.information(self, "完成", "保险柜整理完成，空间已优化。")
+            else:
+                QMessageBox.critical(self, "失败", "整理过程中发生错误。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+        finally:
+            progress.close()
 
     def navigate_to(self, folder_path: str):
         self.current_folder = folder_path
@@ -1432,7 +1620,6 @@ class VaultMainWindow(QMainWindow):
         text = "\n".join([f"{e['ts']:.0f}: {e['event']}" for e in entries])
         QMessageBox.information(self, "审计日志 (防篡改)", text[:4000])
 
-    # ---------- 安全查看（已修正 msoffcrypto） ----------
     def safe_view_file(self):
         if not self.vault_path:
             return
@@ -1455,7 +1642,6 @@ class VaultMainWindow(QMainWindow):
         file_name = meta['name']
         ext = Path(file_name).suffix.lower()
 
-        # 图片查看
         img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
         if ext in img_exts:
             selected_paths = []
@@ -1478,7 +1664,6 @@ class VaultMainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "无法解密文件")
             return
 
-        # 纯文本
         text_exts = {'.txt', '.md', '.py', '.log', '.json', '.csv', '.xml', '.ini', '.cfg', '.yaml', '.yml'}
         if ext in text_exts:
             try:
@@ -1490,7 +1675,6 @@ class VaultMainWindow(QMainWindow):
                 QMessageBox.warning(self, "错误", "该文件不是有效的文本格式")
                 return
 
-        # Office 文档 (docx, xlsx)
         office_exts = {'.docx', '.xlsx'}
         if ext in office_exts:
             password = None
