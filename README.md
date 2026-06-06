@@ -185,7 +185,7 @@ cargo tauri build
 - Rust 工具链 (rustup)
 - Tauri 系统依赖：[tauri.app/start/#prerequisites](https://tauri.app/start/#prerequisites)
 - Windows：WebView2 Runtime（Win 10 1803+ 通常已预装）
-- 构建产物：`src-tauri/target/release/LynVault 2.0.0.exe`
+- 构建产物：`src-tauri/target/release/LynVault 2.0.1.exe`
 
 ## License
 
