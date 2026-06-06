@@ -1,4 +1,10 @@
 //! 密码学原语封装
+
+/// 头部签名相关常量（与 vault.rs 保持一致）
+const SIGNED_LENGTH: usize = 968;
+const SIGNATURE_OFFSET: usize = 960;
+const SIGNATURE_SIZE: usize = 64;
+
 use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::Aead;
 use aes_gcm::KeyInit as AesKeyInit;
@@ -96,7 +102,9 @@ pub fn create_auth_tag(auth_key: &[u8]) -> [u8; 32] {
 pub fn verify_auth_tag(auth_key: &[u8], tag: &[u8]) -> bool {
     if tag.len() < 32 { return false; }
     let expected = create_auth_tag(auth_key);
-    expected == tag[..32]
+    // 恒定时间比较，防止计时攻击
+    use subtle::ConstantTimeEq;
+    expected.ct_eq(&tag[..32]).into()
 }
 
 /// 计算头部签名（HMAC-SHA512 over first 887 bytes of header）
@@ -111,8 +119,9 @@ pub fn verify_header_signature(header: &[u8], sign_key: &[u8]) -> bool {
     if header.len() < 1024 {
         return false;
     }
-    let payload = &header[..887];
-    let stored_sig = &header[960..1024];
+    let payload = &header[..SIGNED_LENGTH];
+    let stored_sig = &header[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE];
     let computed = compute_header_signature(payload, sign_key);
-    computed == stored_sig[..]
+    use subtle::ConstantTimeEq;
+    computed.ct_eq(stored_sig).into()
 }

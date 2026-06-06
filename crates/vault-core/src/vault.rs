@@ -23,7 +23,7 @@ const MAX_PARTITIONS: usize = 8;
 const PARTITION_ENTRY_SIZE: usize = 96;
 
 const LOCK_OFFSET: usize = 887;
-const SIGNED_LENGTH: usize = 887;
+const SIGNED_LENGTH: usize = 968;
 const SIGNATURE_OFFSET: usize = 960;
 const SIGNATURE_SIZE: usize = 64;
 
@@ -76,7 +76,6 @@ fn save_index_to_file(
 /// 写入完整头部（含签名）
 fn write_header_to_file(
     file: &mut File,
-    nonce_counter: u64,
     lock_state: &LockState,
     salt: &[u8; 32],
     partitions: &[PartitionInfo],
@@ -86,7 +85,7 @@ fn write_header_to_file(
 
     header[..8].copy_from_slice(MAGIC);
     header[8] = VERSION;
-    header[9..17].copy_from_slice(&nonce_counter.to_le_bytes());
+    // bytes 9..17 reserved (nonce_counter removed, always zero)
     header[41..73].copy_from_slice(&lock_state.lock_key);
     header[73..105].copy_from_slice(salt);
 
@@ -139,10 +138,8 @@ fn read_decrypt_file_data(
 fn sanitize_filename(name: &str) -> String {
     let safe: String = name
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        .collect::<String>()
-        .trim_matches('.')
-        .to_string();
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>();
     if safe.is_empty() { "extracted_file".to_string() } else { safe }
 }
 
@@ -159,7 +156,6 @@ pub struct Vault {
 
     pub(crate) salt: [u8; 32],
     pub(crate) lock_state: LockState,
-    pub(crate) nonce_counter: u64,
 
     pub(crate) partitions: Vec<PartitionInfo>,
     pub(crate) active_partition: Option<usize>,
@@ -178,7 +174,6 @@ impl Default for Vault {
             sign_key: None,
             salt: [0u8; 32],
             lock_state: LockState::new([0u8; 32]),
-            nonce_counter: 0,
             partitions: Vec::new(),
             active_partition: None,
             audit: None,
@@ -239,7 +234,7 @@ impl Vault {
         };
 
         let lock_state = LockState::new(lock_key);
-        write_header_to_file(&mut file, 1, &lock_state, &salt, &[partition], &keys.sign_key)?;
+        write_header_to_file(&mut file, &lock_state, &salt, &[partition], &keys.sign_key)?;
 
         keys.zeroize();
         Ok(())
@@ -264,7 +259,7 @@ impl Vault {
         let mut header = [0u8; HEADER_SIZE];
         file.read_exact(&mut header)?;
 
-        let (magic, version, nonce_ctr, _, lock_key, salt) = Self::parse_header(&header)?;
+        let (magic, version, lock_key, salt) = Self::parse_header(&header)?;
         if &magic != MAGIC || version != VERSION {
             return Err(VaultError::BadMagic);
         }
@@ -316,7 +311,6 @@ impl Vault {
                 lock_state.reset();
                 self.lock_state = lock_state;
                 self.salt = salt;
-                self.nonce_counter = nonce_ctr;
                 self.partitions = partitions;
                 self.active_partition = Some(idx);
 
@@ -403,24 +397,23 @@ impl Vault {
         let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
         write_header_to_file(
-            file, self.nonce_counter, &self.lock_state,
+            file, &self.lock_state,
             &self.salt, &self.partitions, sign_key,
         )
     }
 
     fn parse_header(header: &[u8; HEADER_SIZE])
-        -> Result<([u8; 8], u8, u64, [u8; 24], [u8; 32], [u8; 32]), VaultError>
+        -> Result<([u8; 8], u8, [u8; 32], [u8; 32]), VaultError>
     {
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&header[..8]);
         let version = header[8];
-        let nonce_ctr = u64::from_le_bytes(header[9..17].try_into().unwrap());
-        let reserved: [u8; 24] = header[17..41].try_into().unwrap();
+        // bytes 9..17 reserved (was nonce_counter)
         let mut lock_key = [0u8; 32];
         lock_key.copy_from_slice(&header[41..73]);
         let mut salt = [0u8; 32];
         salt.copy_from_slice(&header[73..105]);
-        Ok((magic, version, nonce_ctr, reserved, lock_key, salt))
+        Ok((magic, version, lock_key, salt))
     }
 
     // ═══════════════ 分区管理 ═══════════════
@@ -556,14 +549,13 @@ impl Vault {
         let safe_name = sanitize_filename(&file_name);
         let dest_path = dest_folder.join(&safe_name);
 
-        // 路径遍历检查
-        let dest_abs = fs::canonicalize(dest_folder).unwrap_or_else(|_| dest_folder.to_path_buf());
-        let final_abs = if dest_path.exists() {
-            fs::canonicalize(&dest_path).unwrap_or(dest_path.clone())
-        } else {
-            dest_path.clone()
-        };
-        if !final_abs.starts_with(&dest_abs) {
+        // 路径遍历检查：先 canonicalize 目标目录，再检查最终路径
+        let dest_abs = fs::canonicalize(dest_folder)
+            .map_err(|_| VaultError::Other("目标目录不存在".into()))?;
+        // 统一用 '/' 比较，消除平台差异
+        let dest_str = dest_abs.to_string_lossy().replace('\\', "/");
+        let final_str = dest_path.to_string_lossy().replace('\\', "/");
+        if !final_str.starts_with(&dest_str) {
             if let Some(ref mut audit) = self.audit {
                 audit.add(&format!("拦截路径遍历攻击: '{}'", file_name));
             }
@@ -661,75 +653,108 @@ impl Vault {
         let enc_key = *self.enc_key.as_ref().unwrap();
         let sign_key = *self.sign_key.as_ref().unwrap();
         let vault_path = self.path.as_ref().ok_or(VaultError::NotOpen)?.clone();
-        let temp_path = vault_path.with_extension("vault.tmp");
+
+        // 随机临时文件名，防止符号链接攻击
+        let mut rand_suffix = [0u8; 16];
+        OsRng.fill_bytes(&mut rand_suffix);
+        let temp_name = format!("{}.tmp.{}", vault_path.display(), hex::encode(rand_suffix));
+        let temp_path = PathBuf::from(&temp_name);
+        let backup_path = vault_path.with_extension("vault.bak");
 
         let mut index = self.load_index()?;
 
-        let mut tmp_file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(&temp_path)?;
-        tmp_file.write_all(&[0u8; HEADER_SIZE])?;
+        // 备份原文件
+        fs::copy(&vault_path, &backup_path)?;
 
-        // 迁移所有文件数据
-        let files_snapshot: Vec<(String, u64, u64)> = index.files.iter()
-            .map(|(k, m)| (k.clone(), m.offset, m.length))
-            .collect();
-        let total = files_snapshot.len();
+        let result = (|| -> Result<(), VaultError> {
+            let mut tmp_file = OpenOptions::new()
+                .read(true).write(true).create(true).truncate(true)
+                .open(&temp_path)?;
+            tmp_file.write_all(&[0u8; HEADER_SIZE])?;
 
-        for (i, (vpath, old_off, old_len)) in files_snapshot.iter().enumerate() {
-            let enc_data = {
-                let file = self.file.as_mut().unwrap();
-                file.seek(SeekFrom::Start(*old_off))?;
-                let mut buf = vec![0u8; *old_len as usize];
-                file.read_exact(&mut buf)?;
-                buf
-            };
+            // 迁移所有文件数据
+            let files_snapshot: Vec<(String, u64, u64)> = index.files.iter()
+                .map(|(k, m)| (k.clone(), m.offset, m.length))
+                .collect();
+            let total = files_snapshot.len();
 
-            let new_offset = tmp_file.seek(SeekFrom::End(0))?;
-            tmp_file.write_all(&enc_data)?;
-            index.files.get_mut(vpath).unwrap().offset = new_offset;
+            for (i, (vpath, old_off, old_len)) in files_snapshot.iter().enumerate() {
+                let enc_data = {
+                    let file = self.file.as_mut().unwrap();
+                    file.seek(SeekFrom::Start(*old_off))?;
+                    let mut buf = vec![0u8; *old_len as usize];
+                    file.read_exact(&mut buf)?;
+                    buf
+                };
 
-            if let Some(ref cb) = progress {
-                cb((i + 1) * 50 / total.max(1));
+                let new_offset = tmp_file.seek(SeekFrom::End(0))?;
+                tmp_file.write_all(&enc_data)?;
+                index.files.get_mut(vpath).unwrap().offset = new_offset;
+
+                if let Some(ref cb) = progress {
+                    cb((i + 1) * 50 / total.max(1));
+                }
+            }
+
+            // 写入加密索引
+            let idx_json = serde_json::to_vec(&index)?;
+            let enc_idx = encrypt_gcm(&enc_key, &idx_json, None);
+            let idx_offset = tmp_file.seek(SeekFrom::End(0))?;
+            tmp_file.write_all(&enc_idx)?;
+            tmp_file.flush()?;
+
+            let active = self.active_partition.unwrap();
+            self.partitions[active].index_offset = idx_offset;
+            self.partitions[active].index_length = enc_idx.len() as u64;
+
+            // 写入头部
+            let lock_state = &self.lock_state;
+            let salt = &self.salt;
+            let partitions = &self.partitions;
+            write_header_to_file(&mut tmp_file, lock_state, salt, partitions, &sign_key)?;
+            tmp_file.flush()?;
+            tmp_file.sync_all()?; // fsync 确保数据落盘
+            drop(tmp_file);
+
+            // 原子替换：rename 临时文件到原路径
+            fs::rename(&temp_path, &vault_path)?;
+
+            // fsync 目录确保 rename 落盘
+            if let Some(parent) = vault_path.parent() {
+                let _ = File::open(parent).and_then(|d| d.sync_all());
+            }
+
+            // 清理备份
+            let _ = fs::remove_file(&backup_path);
+
+            secure_wipe_vec(idx_json);
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let file = OpenOptions::new().read(true).write(true).open(&vault_path)?;
+                self.file = Some(file);
+                if let Some(ref mut audit) = self.audit {
+                    audit.add("执行保险柜碎片整理");
+                }
+                self.save_index(&index)?;
+                if let Some(ref cb) = progress {
+                    cb(100);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // 失败时恢复备份
+                let _ = fs::remove_file(&temp_path);
+                if backup_path.exists() {
+                    let _ = fs::rename(&backup_path, &vault_path);
+                    let file = OpenOptions::new().read(true).write(true).open(&vault_path).ok();
+                    self.file = file;
+                }
+                Err(e)
             }
         }
-
-        // 写入加密索引
-        let idx_json = serde_json::to_vec(&index)?;
-        let enc_idx = encrypt_gcm(&enc_key, &idx_json, None);
-        let idx_offset = tmp_file.seek(SeekFrom::End(0))?;
-        tmp_file.write_all(&enc_idx)?;
-        tmp_file.flush()?;
-
-        let active = self.active_partition.unwrap();
-        self.partitions[active].index_offset = idx_offset;
-        self.partitions[active].index_length = enc_idx.len() as u64;
-
-        // 写入头部
-        let lock_state = &self.lock_state;
-        let salt = &self.salt;
-        let partitions = &self.partitions;
-        let nonce_counter = self.nonce_counter;
-        write_header_to_file(&mut tmp_file, nonce_counter, lock_state, salt, partitions, &sign_key)?;
-        tmp_file.flush()?;
-        drop(tmp_file);
-
-        // 替换原文件
-        fs::rename(&temp_path, &vault_path)?;
-
-        let file = OpenOptions::new().read(true).write(true).open(&vault_path)?;
-        self.file = Some(file);
-
-        if let Some(ref mut audit) = self.audit {
-            audit.add("执行保险柜碎片整理");
-        }
-        self.save_index(&index)?;
-
-        if let Some(ref cb) = progress {
-            cb(100);
-        }
-        secure_wipe_vec(idx_json);
-        Ok(())
     }
 
     // ═══════════════ 查询 ═══════════════

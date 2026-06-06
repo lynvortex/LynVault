@@ -28,7 +28,7 @@ fn catch<R, F: FnOnce() -> Result<R, String>>(label: &str, f: F) -> Result<R, St
                 format!("{:?}", e)
             };
             eprintln!("[LynVault] PANIC in {}: {}", label, msg);
-            Err(format!("内部错误 ({}): {}", label, msg))
+            Err(format!("操作失败 ({})", label))
         }
     }
 }

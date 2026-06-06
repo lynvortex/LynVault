@@ -200,7 +200,10 @@ function showInput(title, label, defaultValue, callback, isPassword) {
 }
 
 function showError(msg) {
-    showDialog('错误', `<pre style="color:#ff6666">${msg}</pre>`, [{ text: '确定', cls: 'btn-ok' }]);
+    const pre = document.createElement('pre');
+    pre.style.color = '#ff6666';
+    pre.textContent = msg;
+    showDialog('错误', pre.outerHTML, [{ text: '确定', cls: 'btn-ok' }]);
 }
 
 // ───────────────── 右键菜单 ─────────────────
@@ -443,7 +446,9 @@ async function viewFile(vpath, fileName) {
     try {
         if (officeExts.includes(ext)) {
             const text = await invoke('preview_office_file', { vpath });
-            showDialog('📄 ' + fileName, `<pre>${text}</pre>`, [{ text: '关闭', cls: 'btn-ok' }], true);
+            const pre = document.createElement('pre');
+            pre.textContent = text;
+            showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);
             return;
         }
 
@@ -473,7 +478,9 @@ async function viewFile(vpath, fileName) {
         if (textExts.includes(ext)) {
             const decoder = new TextDecoder('utf-8');
             const text = decoder.decode(new Uint8Array(data));
-            showDialog('📄 ' + fileName, `<pre>${text}</pre>`, [{ text: '关闭', cls: 'btn-ok' }], true);
+            const pre = document.createElement('pre');
+            pre.textContent = text;
+            showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);
             return;
         }
 
