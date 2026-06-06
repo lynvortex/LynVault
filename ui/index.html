@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LynVault</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="toolbar">
+        <button id="btn-create">新建保险柜</button>
+        <button id="btn-open">打开保险柜</button>
+        <button id="btn-close" disabled>关闭保险柜</button>
+        <span class="sep"></span>
+        <button id="btn-add-part" disabled>添加伪装分区</button>
+        <button id="btn-del-part" disabled>删除伪装分区</button>
+        <span class="sep"></span>
+        <button id="btn-import-file" disabled>导入文件</button>
+        <button id="btn-import-folder" disabled>导入文件夹</button>
+        <button id="btn-extract" disabled>提取选中</button>
+        <button id="btn-delete" disabled>安全删除</button>
+        <button id="btn-new-folder" disabled>新建文件夹</button>
+        <button id="btn-view" disabled>安全查看</button>
+        <span class="sep"></span>
+        <button id="btn-audit" disabled>查看审计日志</button>
+        <button id="btn-defrag" disabled>整理保险柜</button>
+        <button id="btn-destroy" class="danger" disabled>销毁保险箱</button>
+    </div>
+
+    <div id="nav" class="hidden">
+        <button id="btn-up" title="向上">↑</button>
+        <input type="text" id="path-input" value="/">
+    </div>
+
+    <div id="file-list"></div>
+
+    <div id="status-bar">©绘萤者 开源地址：https://github.com/lynvortex/LynVault</div>
+
+    <!-- 模态框 -->
+    <div id="overlay" class="hidden"></div>
+    <div id="dialog" class="hidden">
+        <div class="dialog-resize dialog-resize-n" data-dir="n"></div>
+        <div class="dialog-resize dialog-resize-s" data-dir="s"></div>
+        <div class="dialog-resize dialog-resize-w" data-dir="w"></div>
+        <div class="dialog-resize dialog-resize-e" data-dir="e"></div>
+        <div class="dialog-resize dialog-resize-nw" data-dir="nw"></div>
+        <div class="dialog-resize dialog-resize-ne" data-dir="ne"></div>
+        <div class="dialog-resize dialog-resize-sw" data-dir="sw"></div>
+        <div class="dialog-resize dialog-resize-se" data-dir="se"></div>
+        <div id="dialog-title"></div>
+        <div id="dialog-body"></div>
+        <div id="dialog-buttons"></div>
+    </div>
+
+    <!-- 右键菜单 -->
+    <div id="ctx-menu" class="hidden">
+        <div data-act="open">打开</div>
+        <div data-act="view">安全查看</div>
+        <div data-act="extract">提取</div>
+        <div class="ctx-sep"></div>
+        <div data-act="rename">重命名</div>
+        <div data-act="delete" class="danger">安全删除</div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
