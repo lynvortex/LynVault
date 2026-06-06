@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# LynVault 1.3.3
+# 依赖: pip install pyside6 cryptography python-docx openpyxl msoffcrypto-tool
+
 import sys
 import os
 import json
@@ -12,15 +16,15 @@ from PySide6.QtWidgets import (
     QStatusBar, QFileDialog, QMessageBox, QWidget,
     QVBoxLayout, QHBoxLayout, QMenu, QInputDialog, QLineEdit, QLabel,
     QPushButton, QWidgetAction, QProgressDialog, QStyle,
-    QLayout, QToolButton,
+    QLayout, QToolButton, QPlainTextEdit, QFileIconProvider,
 )
 from PySide6.QtCore import (
     Qt, QAbstractItemModel, QModelIndex, QTimer, Signal,
-    QSize, QRect, QPoint,
+    QSize, QRect, QPoint, QMimeDatabase, QFileInfo,
 )
 from PySide6.QtGui import (
     QAction, QStandardItemModel, QStandardItem, QDragEnterEvent, QDropEvent,
-    QPixmap, QImage, QTransform, QIcon,
+    QPixmap, QImage, QTransform, QIcon, QFont, QKeySequence, QShortcut,
 )
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -30,6 +34,24 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hmac import HMAC as CryptoHMAC
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidTag
+
+# ---------- 可选库检测 ----------
+try:
+    import docx
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+# 已移除 python-pptx
+try:
+    import msoffcrypto
+    HAS_MSOFFCRYPTO = True
+except ImportError:
+    HAS_MSOFFCRYPTO = False
 
 # ---------- 参数 ----------
 MAGIC = b'PYVAULT4'
@@ -128,7 +150,7 @@ def verify_lock_hmac(lock_key: bytes, lock_count: int, lock_until: float, stored
     expected = compute_lock_hmac(lock_key, lock_count, lock_until)
     return compare_digest(expected, stored_hmac)
 
-# ---------- 安全擦除 (支持进度回调) ----------
+# ---------- 安全擦除 ----------
 def dod_erase(file_path: str, progress_callback=None):
     if not os.path.isfile(file_path):
         return
@@ -628,6 +650,80 @@ class VaultCore:
             return None
         return bytearray(plain)
 
+# ---------- Office 文本提取（已修正 msoffcrypto API） ----------
+def extract_office_text(data: bytes, ext: str, password: str = None) -> Optional[str]:
+    from io import BytesIO
+    buf = BytesIO(data)
+
+    # 使用新版 msoffcrypto API：OfficeFile 对象
+    if password is not None and HAS_MSOFFCRYPTO:
+        try:
+            office_file = msoffcrypto.OfficeFile(buf)
+            if office_file.is_encrypted():
+                buf.seek(0)
+                decrypted = BytesIO()
+                office_file.load_key(password=password)
+                office_file.decrypt(decrypted)
+                decrypted.seek(0)
+                buf = decrypted
+            else:
+                buf.seek(0)
+        except Exception:
+            return None
+
+    try:
+        if ext == '.docx' and HAS_DOCX:
+            doc = docx.Document(buf)
+            return '\n'.join([para.text for para in doc.paragraphs])
+        elif ext == '.xlsx' and HAS_OPENPYXL:
+            wb = openpyxl.load_workbook(buf, read_only=True)
+            texts = []
+            for ws in wb:
+                for row in ws.iter_rows(values_only=True):
+                    line = '\t'.join([str(c) if c is not None else '' for c in row])
+                    texts.append(line)
+            return '\n'.join(texts)
+    except Exception:
+        return None
+    return None
+
+# ---------- 安全文档查看器 ----------
+class SecureDocumentViewer(QMainWindow):
+    def __init__(self, content: str, file_name: str):
+        super().__init__()
+        self.file_name = file_name
+        self._content = content
+        self._setup_ui()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+    def _setup_ui(self):
+        self.setWindowTitle(f"安全查看: {self.file_name}")
+        self.setMinimumSize(800, 600)
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setUndoRedoEnabled(False)
+        self.text_edit.setContextMenuPolicy(Qt.NoContextMenu)
+        self.text_edit.setAcceptDrops(False)
+        self.text_edit.setTabChangesFocus(True)
+        QShortcut(QKeySequence.Copy, self.text_edit, context=Qt.WidgetShortcut).setEnabled(False)
+        QShortcut(QKeySequence.Cut, self.text_edit, context=Qt.WidgetShortcut).setEnabled(False)
+        QShortcut(QKeySequence.Save, self.text_edit, context=Qt.WidgetShortcut).setEnabled(False)
+        QShortcut(QKeySequence.SelectAll, self.text_edit, context=Qt.WidgetShortcut).setEnabled(False)
+        font = QFont("Consolas, 'Courier New', monospace", 11)
+        self.text_edit.setFont(font)
+        self.text_edit.setPlainText(self._content)
+        self.setCentralWidget(self.text_edit)
+        toolbar = QToolBar("操作")
+        self.addToolBar(toolbar)
+        act_close = QAction("关闭", self)
+        act_close.triggered.connect(self.close)
+        toolbar.addAction(act_close)
+
+    def closeEvent(self, event):
+        self.text_edit.clear()
+        self._content = ""
+        super().closeEvent(event)
+
 # ---------- 安全照片查看器 ----------
 class SecurePhotoViewer(QMainWindow):
     def __init__(self, core: VaultCore, img_paths: List[str], start_idx: int = 0):
@@ -640,13 +736,12 @@ class SecurePhotoViewer(QMainWindow):
         self._current_pixmap = QPixmap()
         self._slide_timer = QTimer(self)
         self._slide_timer.timeout.connect(self.next_image)
-        self._slide_active = False
         self._setup_ui()
         self.load_current_image()
         self.setAttribute(Qt.WA_DeleteOnClose)
 
     def _setup_ui(self):
-        self.setWindowTitle("安全照片浏览 - 仅内存，无缓存")
+        self.setWindowTitle("安全照片浏览")
         self.setMinimumSize(800, 600)
         self.img_label = QLabel()
         self.img_label.setAlignment(Qt.AlignCenter)
@@ -710,15 +805,14 @@ class SecurePhotoViewer(QMainWindow):
         if self._current_pixmap.isNull():
             return
         if self._fit_to_window:
-            pix = self._current_pixmap.scaled(
-                self.img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pix = self._current_pixmap.scaled(self.img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         else:
             pix = self._current_pixmap
         self.img_label.setPixmap(pix)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._fit_to_window and hasattr(self, '_current_pixmap'):
+        if self._fit_to_window:
             self._update_display()
 
     def _secure_wipe(self, data: bytearray):
@@ -808,7 +902,7 @@ class FlowLayout(QLayout):
         return None
 
     def expandingDirections(self):
-        return Qt.Orientations(Qt.Orientation(0))
+        return Qt.Orientations(0)
 
     def hasHeightForWidth(self):
         return True
@@ -837,10 +931,8 @@ class FlowLayout(QLayout):
         x = effectiveRect.x()
         y = effectiveRect.y()
         lineHeight = 0
-
         for item in self.itemList:
             if not item.isEmpty():
-                wid = item.widget()
                 spaceX = self.horizontalSpacing()
                 if spaceX == -1:
                     spaceX = 0
@@ -863,6 +955,7 @@ class FlowLayout(QLayout):
 class FileListModel(QStandardItemModel):
     _folder_icon = None
     _file_icon = None
+    _icon_cache = {}
 
     @classmethod
     def init_icons(cls):
@@ -875,6 +968,33 @@ class FileListModel(QStandardItemModel):
         super().__init__()
         self.core = core
         self.init_icons()
+        self.mime_db = QMimeDatabase()
+
+    def get_icon_for_file(self, file_name: str) -> QIcon:
+        ext = Path(file_name).suffix.lower()
+        if ext in self._icon_cache:
+            return self._icon_cache[ext]
+        icon = None
+        try:
+            mime = self.mime_db.mimeTypeForFile(file_name, QMimeDatabase.MatchExtension)
+            icon_name = mime.iconName()
+            if icon_name:
+                icon = QIcon.fromTheme(icon_name)
+                if icon.isNull():
+                    icon = None
+        except:
+            pass
+        if icon is None:
+            try:
+                provider = QFileIconProvider()
+                info = QFileInfo(f"dummy{ext}")
+                icon = provider.icon(info)
+                if icon.isNull():
+                    icon = self._file_icon
+            except:
+                icon = self._file_icon
+        self._icon_cache[ext] = icon
+        return icon
 
     def reload(self, folder: str):
         self.clear()
@@ -903,25 +1023,24 @@ class FileListModel(QStandardItemModel):
                 item = QStandardItem(name)
                 item.setData(vpath, Qt.UserRole)
                 item.setData('file', Qt.UserRole + 1)
-                item.setIcon(self._file_icon)
+                item.setIcon(self.get_icon_for_file(name))
                 self.appendRow(item)
 
-# ---------- 主窗口（无菜单栏，工具栏换行，正方形居中）----------
+# ---------- 主窗口 ----------
 class VaultMainWindow(QMainWindow):
     def __init__(self):
         self.core = VaultCore()
         self.vault_path = None
         self.current_folder = '/'
         self.photo_viewer = None
+        self.doc_viewer = None
         self.destroy_btn = None
         self._init_ui()
         self._update_actions()
 
     def _init_ui(self):
         super().__init__()
-        self.setWindowTitle("LynVault 1.2.2")
-        
-        # 根据屏幕大小自动计算正方形边长并居中
+        self.setWindowTitle("LynVault 1.3.3")
         screen_geometry = QApplication.primaryScreen().availableGeometry()
         screen_width = screen_geometry.width()
         screen_height = screen_geometry.height()
@@ -935,63 +1054,44 @@ class VaultMainWindow(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        # ---------- 先创建所有 QAction ----------
+        # ---------- QActions ----------
         self.act_create = QAction("新建保险柜...", self)
         self.act_create.triggered.connect(self.create_vault)
-
         self.act_open = QAction("打开保险柜...", self)
         self.act_open.triggered.connect(self.open_vault)
-
         self.act_close = QAction("关闭保险柜", self)
         self.act_close.triggered.connect(self.close_vault)
-
         self.act_add_part = QAction("添加伪装分区", self)
         self.act_add_part.triggered.connect(self.add_partition)
-
         self.act_del_part = QAction("删除伪装分区", self)
         self.act_del_part.triggered.connect(self.remove_partition)
-
         self.act_import_f = QAction("导入文件", self)
         self.act_import_f.triggered.connect(self.import_files)
-
         self.act_import_d = QAction("导入文件夹", self)
         self.act_import_d.triggered.connect(self.import_folder)
-
         self.act_extract = QAction("提取选中", self)
         self.act_extract.triggered.connect(self.extract_selected)
-
         self.act_delete = QAction("安全删除", self)
         self.act_delete.triggered.connect(self.delete_selected)
-
         self.act_newdir = QAction("新建文件夹", self)
         self.act_newdir.triggered.connect(self.new_folder)
-
-        self.act_browse_photos = QAction("安全浏览照片", self)
-        self.act_browse_photos.triggered.connect(self.browse_photos)
-
+        self.act_view_document = QAction("安全查看", self)
+        self.act_view_document.triggered.connect(self.safe_view_file)
         self.act_audit = QAction("查看审计日志", self)
         self.act_audit.triggered.connect(self.show_audit)
 
-        # ---------- 菜单栏已删除，不再创建 ----------
-
-        # ---------- 可换行的工具栏区域 ----------
+        # ---------- 工具栏 ----------
         toolbar_widget = QWidget()
         toolbar_layout = FlowLayout(toolbar_widget)
 
         actions_info = [
-            (self.act_create, False),
-            (self.act_open, False),
-            (self.act_close, False),
+            (self.act_create, False), (self.act_open, False), (self.act_close, False),
             (None, True),
-            (self.act_add_part, False),
-            (self.act_del_part, False),
+            (self.act_add_part, False), (self.act_del_part, False),
             (None, True),
-            (self.act_import_f, False),
-            (self.act_import_d, False),
-            (self.act_extract, False),
-            (self.act_delete, False),
-            (self.act_newdir, False),
-            (self.act_browse_photos, False),
+            (self.act_import_f, False), (self.act_import_d, False),
+            (self.act_extract, False), (self.act_delete, False),
+            (self.act_newdir, False), (self.act_view_document, False),
             (None, True),
             (self.act_audit, False),
         ]
@@ -1019,7 +1119,7 @@ class VaultMainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.addWidget(toolbar_widget)
 
-        # 导航栏（初始隐藏）
+        # 导航栏
         self.nav_widget = QWidget()
         nav_layout = QHBoxLayout(self.nav_widget)
         nav_layout.setContentsMargins(0, 0, 0, 0)
@@ -1034,7 +1134,7 @@ class VaultMainWindow(QMainWindow):
         self.nav_widget.setVisible(False)
         main_layout.addWidget(self.nav_widget)
 
-        # 文件列表视图
+        # 文件列表
         self.list = QListView()
         self.file_model = FileListModel(self.core)
         self.list.setModel(self.file_model)
@@ -1047,10 +1147,9 @@ class VaultMainWindow(QMainWindow):
         main_layout.addWidget(self.list)
 
         self.setCentralWidget(central)
-
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("开源地址：https://github.com/lynvortex/LynVault")
+        self.status.showMessage("©绘萤者 开源地址：https://github.com/lynvortex/LynVault")
         self.setAcceptDrops(True)
 
     def _update_actions(self):
@@ -1059,7 +1158,7 @@ class VaultMainWindow(QMainWindow):
             self.act_close, self.act_add_part, self.act_del_part,
             self.act_import_f, self.act_import_d, self.act_extract,
             self.act_delete, self.act_newdir, self.act_audit,
-            self.act_browse_photos,
+            self.act_view_document
         ]:
             a.setEnabled(enabled)
         if self.destroy_btn:
@@ -1069,6 +1168,7 @@ class VaultMainWindow(QMainWindow):
         if self.nav_widget:
             self.nav_widget.setVisible(enabled)
 
+    # ---------- 功能方法 ----------
     def _get_key_file(self) -> Optional[bytes]:
         dlg = QMessageBox(self)
         dlg.setWindowTitle("密钥文件")
@@ -1076,21 +1176,17 @@ class VaultMainWindow(QMainWindow):
         dlg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         dlg.setDefaultButton(QMessageBox.No)
         if dlg.exec() == QMessageBox.Yes:
-            path, _ = QFileDialog.getOpenFileName(self, "选择密钥文件", "",
-                                                   "所有文件 (*)")
+            path, _ = QFileDialog.getOpenFileName(self, "选择密钥文件", "", "所有文件 (*)")
             if path:
                 with open(path, 'rb') as f:
                     return f.read()
         return None
 
     def create_vault(self):
-        path, _ = QFileDialog.getSaveFileName(self, "新建保险柜", "",
-                                               "Vault Files (*.vault)")
+        path, _ = QFileDialog.getSaveFileName(self, "新建保险柜", "", "Vault Files (*.vault)")
         if not path:
             return
-        pwd, ok = QInputDialog.getText(self, "设置主密码",
-                                        "主密码（至少12位）:",
-                                        QLineEdit.Password)
+        pwd, ok = QInputDialog.getText(self, "设置主密码", "主密码（至少12位）:", QLineEdit.Password)
         if not ok or not pwd:
             return
         if len(pwd) < 12:
@@ -1104,19 +1200,16 @@ class VaultMainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", str(e))
 
     def open_vault(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开保险柜", "",
-                                               "Vault Files (*.vault)")
+        path, _ = QFileDialog.getOpenFileName(self, "打开保险柜", "", "Vault Files (*.vault)")
         if not path:
             return
-        pwd, ok = QInputDialog.getText(self, "输入密码", "密码:",
-                                        QLineEdit.Password)
+        pwd, ok = QInputDialog.getText(self, "输入密码", "密码:", QLineEdit.Password)
         if not ok:
             return
         key_data = self._get_key_file()
         idx = self.core.open_and_authenticate(path, pwd, key_data)
         if idx is None:
-            QMessageBox.critical(self, "认证失败",
-                                 "密码/密钥文件错误，或保险柜已锁定")
+            QMessageBox.critical(self, "认证失败", "密码/密钥文件错误，或保险柜已锁定")
             return
         self.vault_path = path
         self.navigate_to('/')
@@ -1298,9 +1391,7 @@ class VaultMainWindow(QMainWindow):
         alias, ok = QInputDialog.getText(self, "别名", "伪装分区名称:")
         if not ok:
             return
-        fpwd, ok = QInputDialog.getText(self, "伪装密码",
-                                         "设置伪装分区密码（至少12位）:",
-                                         QLineEdit.Password)
+        fpwd, ok = QInputDialog.getText(self, "伪装密码", "设置伪装分区密码（至少12位）:", QLineEdit.Password)
         if not ok:
             return
         if len(fpwd) < 12:
@@ -1320,12 +1411,10 @@ class VaultMainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "没有可删除的伪装分区")
             return
         items = [p['alias'] for p in parts]
-        item, ok = QInputDialog.getItem(self, "删除分区", "选择分区:",
-                                         items, 0, False)
+        item, ok = QInputDialog.getItem(self, "删除分区", "选择分区:", items, 0, False)
         if not ok:
             return
-        if QMessageBox.question(self, "确认",
-                                f"确定删除分区 '{item}' 吗？") != QMessageBox.Yes:
+        if QMessageBox.question(self, "确认", f"确定删除分区 '{item}' 吗？") != QMessageBox.Yes:
             return
         if self.core.remove_partition(item):
             QMessageBox.information(self, "成功", f"分区 '{item}' 已删除")
@@ -1343,47 +1432,117 @@ class VaultMainWindow(QMainWindow):
         text = "\n".join([f"{e['ts']:.0f}: {e['event']}" for e in entries])
         QMessageBox.information(self, "审计日志 (防篡改)", text[:4000])
 
-    def browse_photos(self):
+    # ---------- 安全查看（已修正 msoffcrypto） ----------
+    def safe_view_file(self):
         if not self.vault_path:
             return
-        selected_indexes = self.list.selectedIndexes()
-        if selected_indexes:
-            paths = [idx.data(Qt.UserRole) for idx in selected_indexes if idx.data(Qt.UserRole)]
-        else:
-            paths = []
-            idx = self.core.load_index()
-            folder_prefix = self.current_folder.rstrip('/') + '/'
-            for vpath in idx.get('files', {}):
-                if vpath.startswith(folder_prefix):
-                    paths.append(vpath)
-        if not paths:
-            QMessageBox.information(self, "提示", "没有可浏览的文件")
+        selected = self.list.selectedIndexes()
+        if not selected:
+            QMessageBox.information(self, "提示", "请先选中一个文件")
             return
-        img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
-        img_paths = [p for p in paths if os.path.splitext(p)[1].lower() in img_exts]
-        if not img_paths:
-            QMessageBox.information(self, "提示", "当前选择/文件夹中没有图片文件")
+        index = selected[0]
+        vpath = index.data(Qt.UserRole)
+        entry_type = index.data(Qt.UserRole + 1)
+        if entry_type != 'file':
+            QMessageBox.information(self, "提示", "只能查看文件")
             return
-        self.photo_viewer = SecurePhotoViewer(self.core, img_paths)
-        self.photo_viewer.destroyed.connect(self._on_viewer_closed)
-        self.photo_viewer.show()
 
-    def _on_viewer_closed(self):
+        idx = self.core.load_index()
+        meta = idx['files'].get(vpath)
+        if not meta:
+            QMessageBox.warning(self, "错误", "文件信息不存在")
+            return
+        file_name = meta['name']
+        ext = Path(file_name).suffix.lower()
+
+        # 图片查看
+        img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+        if ext in img_exts:
+            selected_paths = []
+            for i in self.list.selectedIndexes():
+                if i.data(Qt.UserRole + 1) != 'file':
+                    continue
+                p = i.data(Qt.UserRole)
+                m = idx['files'].get(p)
+                if m and Path(m['name']).suffix.lower() in img_exts:
+                    selected_paths.append(p)
+            if not selected_paths:
+                selected_paths = [vpath]
+            self.photo_viewer = SecurePhotoViewer(self.core, selected_paths, 0)
+            self.photo_viewer.destroyed.connect(self._on_photo_viewer_closed)
+            self.photo_viewer.show()
+            return
+
+        data = self.core.load_file_data(vpath)
+        if data is None:
+            QMessageBox.warning(self, "错误", "无法解密文件")
+            return
+
+        # 纯文本
+        text_exts = {'.txt', '.md', '.py', '.log', '.json', '.csv', '.xml', '.ini', '.cfg', '.yaml', '.yml'}
+        if ext in text_exts:
+            try:
+                text = data.decode('utf-8')
+                self.doc_viewer = SecureDocumentViewer(text, file_name)
+                self.doc_viewer.show()
+                return
+            except UnicodeDecodeError:
+                QMessageBox.warning(self, "错误", "该文件不是有效的文本格式")
+                return
+
+        # Office 文档 (docx, xlsx)
+        office_exts = {'.docx', '.xlsx'}
+        if ext in office_exts:
+            password = None
+            if HAS_MSOFFCRYPTO:
+                from io import BytesIO
+                try:
+                    buf = BytesIO(data)
+                    office_file = msoffcrypto.OfficeFile(buf)
+                    if office_file.is_encrypted():
+                        pwd, ok = QInputDialog.getText(self, "密码", "文件已加密，请输入打开密码:", QLineEdit.Password)
+                        if not ok:
+                            return
+                        password = pwd
+                except Exception:
+                    password = None
+            text = extract_office_text(data, ext, password)
+            if text is not None:
+                self.doc_viewer = SecureDocumentViewer(text, file_name)
+                self.doc_viewer.show()
+                return
+            else:
+                missing = []
+                if ext == '.docx' and not HAS_DOCX:
+                    missing.append("python-docx")
+                elif ext == '.xlsx' and not HAS_OPENPYXL:
+                    missing.append("openpyxl")
+                if not HAS_MSOFFCRYPTO:
+                    missing.append("msoffcrypto-tool")
+                if missing:
+                    QMessageBox.warning(self, "缺少库", f"请安装: {' '.join(missing)}")
+                else:
+                    QMessageBox.warning(self, "错误", "无法提取文本，可能是密码错误或文件损坏")
+                return
+
+        QMessageBox.information(self, "提示", "不支持的文件类型，无法预览")
+
+    def _on_photo_viewer_closed(self):
         self.photo_viewer = None
 
     def file_context_menu(self, pos):
         menu = QMenu()
         act_ext = menu.addAction("提取")
         act_del = menu.addAction("安全删除")
-        act_browse = menu.addAction("安全浏览")
+        act_view = menu.addAction("安全查看")
         act_rename = menu.addAction("重命名")
         choice = menu.exec(self.list.viewport().mapToGlobal(pos))
         if choice == act_ext:
             self.extract_selected()
         elif choice == act_del:
             self.delete_selected()
-        elif choice == act_browse:
-            self.browse_photos()
+        elif choice == act_view:
+            self.safe_view_file()
         elif choice == act_rename:
             self.rename_selected_item()
 
