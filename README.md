@@ -1,4 +1,4 @@
-# LynVault 2.0.0
+# LynVault 2.0.1
 
 抗取证加密保险柜 — 基于 Tauri + Rust 的桌面端加密文件管理系统。
 
