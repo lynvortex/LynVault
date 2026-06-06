@@ -3,18 +3,21 @@ import os
 import json
 import struct
 import time
-import mmap
 from pathlib import Path
 from secrets import token_bytes, compare_digest
 from typing import Optional, List, Dict, Any, Tuple
-from PySide6.QtWidgets import QStyle
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QTreeView, QListView, QToolBar,
-    QStatusBar, QFileDialog, QMessageBox, QSplitter, QWidget,
-    QVBoxLayout, QMenu, QInputDialog, QLineEdit, QLabel,
+    QApplication, QMainWindow, QListView, QToolBar,
+    QStatusBar, QFileDialog, QMessageBox, QWidget,
+    QVBoxLayout, QHBoxLayout, QMenu, QInputDialog, QLineEdit, QLabel,
+    QPushButton, QWidgetAction, QProgressDialog, QStyle,
+    QLayout, QToolButton,
 )
-from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex, QTimer
+from PySide6.QtCore import (
+    Qt, QAbstractItemModel, QModelIndex, QTimer, Signal,
+    QSize, QRect, QPoint,
+)
 from PySide6.QtGui import (
     QAction, QStandardItemModel, QStandardItem, QDragEnterEvent, QDropEvent,
     QPixmap, QImage, QTransform, QIcon,
@@ -125,13 +128,14 @@ def verify_lock_hmac(lock_key: bytes, lock_count: int, lock_until: float, stored
     expected = compute_lock_hmac(lock_key, lock_count, lock_until)
     return compare_digest(expected, stored_hmac)
 
-# ---------- 安全擦除 ----------
-def dod_erase(file_path: str):
+# ---------- 安全擦除 (支持进度回调) ----------
+def dod_erase(file_path: str, progress_callback=None):
     if not os.path.isfile(file_path):
         return
     length = os.path.getsize(file_path)
     patterns = [b'\x00', b'\xFF']
-    for _ in range(SHRED_PASSES):
+    total_passes = SHRED_PASSES
+    for i in range(total_passes):
         with open(file_path, 'wb') as f:
             for _ in range(length // 1024 + 1):
                 f.write(patterns[0] * 1024)
@@ -140,6 +144,8 @@ def dod_erase(file_path: str):
                 f.write(patterns[1] * 1024)
         with open(file_path, 'wb') as f:
             f.write(token_bytes(length))
+        if progress_callback:
+            progress_callback(int((i + 1) / total_passes * 100))
     os.remove(file_path)
 
 def validate_vpath(vpath: str) -> bool:
@@ -255,17 +261,14 @@ class VaultCore:
         new_vpath = (parent.rstrip('/') + '/' + new_name).replace('//', '/')
         if not validate_vpath(new_vpath):
             return False
-
         idx = self.load_index()
         if old_vpath not in idx['files']:
             return False
         if new_vpath in idx['files'] or new_vpath in idx['folders']:
             return False
-
         meta = idx['files'].pop(old_vpath)
         meta['name'] = new_name
         idx['files'][new_vpath] = meta
-
         self.audit.add(f"重命名文件 '{old_vpath}' -> '{new_vpath}'")
         self.save_index(idx)
         return True
@@ -275,32 +278,27 @@ class VaultCore:
             return False
         if old_vpath == '/':
             return False
-
         parent = old_vpath.rsplit('/', 1)[0] if '/' in old_vpath else '/'
         if parent == '':
             parent = '/'
         new_vpath = (parent.rstrip('/') + '/' + new_name).replace('//', '/')
         if not validate_vpath(new_vpath):
             return False
-
         idx = self.load_index()
         if old_vpath not in idx['folders']:
             return False
         if new_vpath in idx['folders'] or new_vpath in idx['files']:
             return False
-
         new_files = {}
         new_folders = {}
         old_prefix = old_vpath + '/'
         new_prefix = new_vpath + '/'
-
         for vpath, meta in idx['files'].items():
             if vpath == old_vpath or vpath.startswith(old_prefix):
                 migrated_path = new_vpath if vpath == old_vpath else new_prefix + vpath[len(old_prefix):]
                 new_files[migrated_path] = meta
             else:
                 new_files[vpath] = meta
-
         for fpath in idx['folders']:
             if fpath == old_vpath:
                 new_folders[new_vpath] = True
@@ -308,10 +306,8 @@ class VaultCore:
                 new_folders[new_prefix + fpath[len(old_prefix):]] = True
             else:
                 new_folders[fpath] = True
-
         idx['files'] = new_files
         idx['folders'] = new_folders
-
         self.audit.add(f"重命名文件夹 '{old_vpath}' -> '{new_vpath}'")
         self.save_index(idx)
         return True
@@ -403,19 +399,15 @@ class VaultCore:
         self.vault = VaultFile(path)
         self.vault.open('wb+')
         self.vault.write_header(b'\0' * HEADER_SIZE)
-
         self.salt = token_bytes(32)
         self.lock_key = token_bytes(32)
         self.key_file_data = key_file_data
-
         enc_k, auth_k, sign_k = derive_keys(password, key_file_data, self.salt)
         tag = create_auth_tag(auth_k)
-
         empty_idx = json.dumps({'files': {}, 'folders': {}, 'audit': []}).encode()
         enc_idx = encrypt_gcm(enc_k, empty_idx)
         idx_off = self.vault.append(enc_idx)
         idx_len = len(enc_idx)
-
         self.partitions = [{
             'alias': DEFAULT_PARTITION,
             'auth_tag': tag,
@@ -424,7 +416,6 @@ class VaultCore:
         }]
         self.lock_count = 0
         self.lock_until = 0.0
-
         header_raw = self.pack_header()
         sig = compute_header_signature(header_raw[:SIGNED_LENGTH], sign_k)
         header_signed = header_raw[:SIGNATURE_OFFSET] + sig
@@ -437,7 +428,6 @@ class VaultCore:
         if now - self.last_attempt_time < COOLDOWN_SECONDS:
             return None
         self.last_attempt_time = now
-
         self.vault = VaultFile(path)
         self.vault.open('rb+')
         header = self.vault.read_header()
@@ -447,7 +437,6 @@ class VaultCore:
         if not self.check_lock():
             self.vault.close()
             return None
-
         enc_k, auth_k, sign_k = derive_keys(password, key_file_data, self.salt)
         for idx, p in enumerate(self.partitions):
             if verify_auth_tag(auth_k, p['auth_tag']):
@@ -460,17 +449,14 @@ class VaultCore:
                 self.auth_key = auth_k
                 self.sign_key = sign_k
                 self.key_file_data = key_file_data
-
                 idx_data = json.loads(idx_plain)
                 self.audit = AuditLog.from_json(idx_data.get('audit', []), auth_k)
                 self.audit.add("保险柜已解锁")
-
                 self.lock_count = 0
                 self.lock_until = 0.0
                 self._write_lock()
                 self._update_header_sig()
                 return idx
-
         self.record_failure()
         self.vault.close()
         return None
@@ -782,98 +768,99 @@ class SecurePhotoViewer(QMainWindow):
         self.img_label.clear()
         super().closeEvent(event)
 
-# ---------- GUI 模型（优化图标部分）----------
-class VaultTreeModel(QAbstractItemModel):
-    # 缓存文件夹图标，避免重复创建
-    _folder_icon = None
+# ---------- 自动换行布局 ----------
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=-1, hSpacing=-1, vSpacing=-1):
+        super().__init__(parent)
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(hSpacing if hSpacing >= 0 else -1)
+        self.itemList = []
 
-    @classmethod
-    def folder_icon(cls):
-        if cls._folder_icon is None:
-            cls._folder_icon = QApplication.style().standardIcon(
-                QStyle.StandardPixmap.SP_DirIcon)
-        return cls._folder_icon
+    def addItem(self, item):
+        self.itemList.append(item)
 
-    def __init__(self, core: VaultCore):
-        super().__init__()
-        self.core = core
-        self.root = {'name': '', 'children': [], 'path': '/'}
-        self.rebuild()
+    def horizontalSpacing(self):
+        if self.spacing() >= 0:
+            return self.spacing()
+        return self.smartSpacing(QStyle.PM_LayoutHorizontalSpacing)
 
-    def rebuild(self):
-        self.beginResetModel()
-        self.root['children'].clear()
-        idx = self.core.load_index()
-        folders = sorted(idx.get('folders', {}).keys())
-        for f in folders:
-            if f == '/':
-                continue
-            parts = f.split('/')
-            cur = self.root
-            for i, p in enumerate(parts):
-                if not p:
-                    continue
-                full = '/'.join(parts[:i+1])
-                child = next((c for c in cur['children'] if c['name'] == p), None)
-                if not child:
-                    child = {'name': p, 'children': [], 'path': full}
-                    cur['children'].append(child)
-                cur = child
-        self.endResetModel()
+    def verticalSpacing(self):
+        if self.spacing() >= 0:
+            return self.spacing()
+        return self.smartSpacing(QStyle.PM_LayoutVerticalSpacing)
 
-    def _find_parent(self, current, target):
-        for c in current['children']:
-            if c is target:
-                return current
-            res = self._find_parent(c, target)
-            if res:
-                return res
+    def smartSpacing(self, pm):
+        if parent := self.parent():
+            return parent.style().pixelMetric(pm, None, parent)
+        return -1
+
+    def count(self):
+        return len(self.itemList)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self.itemList):
+            return self.itemList[index]
         return None
 
-    def index(self, row, col, parent=QModelIndex()):
-        if row < 0:
-            return QModelIndex()
-        pitem = self.root if not parent.isValid() else parent.internalPointer()
-        if row < len(pitem['children']):
-            return self.createIndex(row, col, pitem['children'][row])
-        return QModelIndex()
-
-    def parent(self, index):
-        if not index.isValid():
-            return QModelIndex()
-        child_item = index.internalPointer()
-        parent_obj = self._find_parent(self.root, child_item)
-        if parent_obj is None or parent_obj is self.root:
-            return QModelIndex()
-        grandparent = self._find_parent(self.root, parent_obj) or self.root
-        row = grandparent['children'].index(parent_obj)
-        return self.createIndex(row, 0, parent_obj)
-
-    def rowCount(self, parent=QModelIndex()):
-        if not parent.isValid():
-            return len(self.root['children'])
-        item = parent.internalPointer()
-        return len(item['children'])
-
-    def columnCount(self, parent=QModelIndex()):
-        return 1
-
-    def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
-            return None
-        item = index.internalPointer()
-        if role == Qt.DisplayRole:
-            return item['name']
-        if role == Qt.DecorationRole:
-            # 使用缓存的图标
-            return self.folder_icon()
-        if role == Qt.UserRole:
-            return item['path']
+    def takeAt(self, index):
+        if 0 <= index < len(self.itemList):
+            return self.itemList.pop(index)
         return None
 
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
 
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self.doLayout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self.doLayout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self.itemList:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def doLayout(self, rect, testOnly):
+        left, top, right, bottom = self.getContentsMargins()
+        effectiveRect = rect.adjusted(+left, +top, -right, -bottom)
+        x = effectiveRect.x()
+        y = effectiveRect.y()
+        lineHeight = 0
+
+        for item in self.itemList:
+            if not item.isEmpty():
+                wid = item.widget()
+                spaceX = self.horizontalSpacing()
+                if spaceX == -1:
+                    spaceX = 0
+                spaceY = self.verticalSpacing()
+                if spaceY == -1:
+                    spaceY = 0
+                nextX = x + item.sizeHint().width() + spaceX
+                if nextX > effectiveRect.right() and lineHeight > 0:
+                    x = effectiveRect.x()
+                    y = y + lineHeight + spaceY
+                    nextX = x + item.sizeHint().width() + spaceX
+                    lineHeight = 0
+                if not testOnly:
+                    item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+                x = nextX
+                lineHeight = max(lineHeight, item.sizeHint().height())
+        return y + lineHeight - rect.y() + bottom - top
+
+# ---------- 文件列表模型 ----------
 class FileListModel(QStandardItemModel):
-    # 缓存文件/文件夹图标
     _folder_icon = None
     _file_icon = None
 
@@ -882,131 +869,172 @@ class FileListModel(QStandardItemModel):
         if cls._folder_icon is None:
             style = QApplication.style()
             cls._folder_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-            cls._file_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+            cls._file_icon   = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
 
     def __init__(self, core: VaultCore):
         super().__init__()
         self.core = core
-        # 确保图标已初始化
         self.init_icons()
 
     def reload(self, folder: str):
         self.clear()
-        # 图标已缓存，直接使用
         idx = self.core.load_index()
         for fpath in idx.get('folders', {}):
-            if fpath == '/':
+            if fpath == '/' or fpath == '':
                 continue
             parent = fpath.rsplit('/', 1)[0] if '/' in fpath else '/'
             if parent == '':
                 parent = '/'
             if parent == folder:
                 name = fpath.split('/')[-1]
+                if not name:
+                    continue
                 item = QStandardItem(name)
                 item.setData(fpath, Qt.UserRole)
                 item.setData('folder', Qt.UserRole + 1)
-                item.setIcon(self._folder_icon)   # 复用缓存图标
+                item.setIcon(self._folder_icon)
                 self.appendRow(item)
         for vpath, meta in idx.get('files', {}).items():
             dir_part = vpath.rsplit('/', 1)[0] if '/' in vpath else '/'
             if dir_part == folder or (folder == '/' and dir_part == ''):
-                item = QStandardItem(meta['name'])
+                name = meta.get('name', '')
+                if not name:
+                    continue
+                item = QStandardItem(name)
                 item.setData(vpath, Qt.UserRole)
                 item.setData('file', Qt.UserRole + 1)
-                item.setIcon(self._file_icon)     # 复用缓存图标
+                item.setIcon(self._file_icon)
                 self.appendRow(item)
 
-
-# ---------- 主窗口 ----------
+# ---------- 主窗口（无菜单栏，工具栏换行，正方形居中）----------
 class VaultMainWindow(QMainWindow):
     def __init__(self):
         self.core = VaultCore()
         self.vault_path = None
         self.current_folder = '/'
         self.photo_viewer = None
+        self.destroy_btn = None
         self._init_ui()
         self._update_actions()
 
     def _init_ui(self):
         super().__init__()
-        self.setWindowTitle("LynVault 1.1.1")
-        self.resize(1200, 780)
+        self.setWindowTitle("LynVault 1.2.2")
+        
+        # 根据屏幕大小自动计算正方形边长并居中
+        screen_geometry = QApplication.primaryScreen().availableGeometry()
+        screen_width = screen_geometry.width()
+        screen_height = screen_geometry.height()
+        size = int(min(screen_width, screen_height) * 0.75)
+        self.resize(size, size)
+        x = (screen_width - size) // 2 + screen_geometry.x()
+        y = (screen_height - size) // 2 + screen_geometry.y()
+        self.move(x, y)
 
         icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        menu = self.menuBar()
-        file_m = menu.addMenu("文件")
+        # ---------- 先创建所有 QAction ----------
         self.act_create = QAction("新建保险柜...", self)
         self.act_create.triggered.connect(self.create_vault)
-        file_m.addAction(self.act_create)
+
         self.act_open = QAction("打开保险柜...", self)
         self.act_open.triggered.connect(self.open_vault)
-        file_m.addAction(self.act_open)
-        file_m.addSeparator()
+
         self.act_close = QAction("关闭保险柜", self)
         self.act_close.triggered.connect(self.close_vault)
-        file_m.addAction(self.act_close)
-        file_m.addSeparator()
-        file_m.addAction("退出", self.close)
-
-        tb = QToolBar("操作")
-        self.addToolBar(tb)
-
-        tb.addAction(self.act_create)
-        tb.addAction(self.act_open)
-        tb.addAction(self.act_close)
-        tb.addSeparator()
 
         self.act_add_part = QAction("添加伪装分区", self)
         self.act_add_part.triggered.connect(self.add_partition)
-        tb.addAction(self.act_add_part)
 
         self.act_del_part = QAction("删除伪装分区", self)
         self.act_del_part.triggered.connect(self.remove_partition)
-        tb.addAction(self.act_del_part)
-
-        tb.addSeparator()
 
         self.act_import_f = QAction("导入文件", self)
         self.act_import_f.triggered.connect(self.import_files)
-        tb.addAction(self.act_import_f)
 
         self.act_import_d = QAction("导入文件夹", self)
         self.act_import_d.triggered.connect(self.import_folder)
-        tb.addAction(self.act_import_d)
 
         self.act_extract = QAction("提取选中", self)
         self.act_extract.triggered.connect(self.extract_selected)
-        tb.addAction(self.act_extract)
 
         self.act_delete = QAction("安全删除", self)
         self.act_delete.triggered.connect(self.delete_selected)
-        tb.addAction(self.act_delete)
 
         self.act_newdir = QAction("新建文件夹", self)
         self.act_newdir.triggered.connect(self.new_folder)
-        tb.addAction(self.act_newdir)
 
         self.act_browse_photos = QAction("安全浏览照片", self)
         self.act_browse_photos.triggered.connect(self.browse_photos)
-        tb.addAction(self.act_browse_photos)
-
-        tb.addSeparator()
 
         self.act_audit = QAction("查看审计日志", self)
         self.act_audit.triggered.connect(self.show_audit)
-        tb.addAction(self.act_audit)
 
-        splitter = QSplitter(Qt.Horizontal)
+        # ---------- 菜单栏已删除，不再创建 ----------
 
-        self.tree = QTreeView()
-        self.tree_model = VaultTreeModel(self.core)
-        self.tree.setModel(self.tree_model)
-        self.tree.clicked.connect(self.on_tree_clicked)
-        splitter.addWidget(self.tree)
+        # ---------- 可换行的工具栏区域 ----------
+        toolbar_widget = QWidget()
+        toolbar_layout = FlowLayout(toolbar_widget)
 
+        actions_info = [
+            (self.act_create, False),
+            (self.act_open, False),
+            (self.act_close, False),
+            (None, True),
+            (self.act_add_part, False),
+            (self.act_del_part, False),
+            (None, True),
+            (self.act_import_f, False),
+            (self.act_import_d, False),
+            (self.act_extract, False),
+            (self.act_delete, False),
+            (self.act_newdir, False),
+            (self.act_browse_photos, False),
+            (None, True),
+            (self.act_audit, False),
+        ]
+
+        self.tool_buttons = []
+        for action, is_sep in actions_info:
+            if is_sep:
+                sep_label = QLabel("  ")
+                toolbar_layout.addWidget(sep_label)
+            elif action:
+                btn = QToolButton()
+                btn.setDefaultAction(action)
+                btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+                toolbar_layout.addWidget(btn)
+                self.tool_buttons.append(btn)
+
+        # 红色销毁按钮
+        self.destroy_btn = QPushButton("销毁保险箱")
+        self.destroy_btn.setStyleSheet("color: red; font-weight: bold;")
+        self.destroy_btn.clicked.connect(self.destroy_vault)
+        toolbar_layout.addWidget(self.destroy_btn)
+
+        # ---------- 中央区域 ----------
+        central = QWidget()
+        main_layout = QVBoxLayout(central)
+        main_layout.addWidget(toolbar_widget)
+
+        # 导航栏（初始隐藏）
+        self.nav_widget = QWidget()
+        nav_layout = QHBoxLayout(self.nav_widget)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        self.up_btn = QPushButton()
+        self.up_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
+        self.up_btn.setToolTip("向上")
+        self.up_btn.clicked.connect(self.go_up)
+        nav_layout.addWidget(self.up_btn)
+        self.path_edit = QLineEdit("/")
+        self.path_edit.returnPressed.connect(self.on_path_enter)
+        nav_layout.addWidget(self.path_edit, 1)
+        self.nav_widget.setVisible(False)
+        main_layout.addWidget(self.nav_widget)
+
+        # 文件列表视图
         self.list = QListView()
         self.file_model = FileListModel(self.core)
         self.list.setModel(self.file_model)
@@ -1015,19 +1043,14 @@ class VaultMainWindow(QMainWindow):
         self.list.setResizeMode(QListView.Adjust)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self.file_context_menu)
-        splitter.addWidget(self.list)
-
         self.list.doubleClicked.connect(self.on_list_double_clicked)
+        main_layout.addWidget(self.list)
 
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addWidget(splitter)
         self.setCentralWidget(central)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("开源地址：https://github.com/lynvortex/LynVault")
-
         self.setAcceptDrops(True)
 
     def _update_actions(self):
@@ -1039,6 +1062,12 @@ class VaultMainWindow(QMainWindow):
             self.act_browse_photos,
         ]:
             a.setEnabled(enabled)
+        if self.destroy_btn:
+            self.destroy_btn.setEnabled(enabled)
+        if self.up_btn:
+            self.up_btn.setEnabled(enabled)
+        if self.nav_widget:
+            self.nav_widget.setVisible(enabled)
 
     def _get_key_file(self) -> Optional[bytes]:
         dlg = QMessageBox(self)
@@ -1090,9 +1119,7 @@ class VaultMainWindow(QMainWindow):
                                  "密码/密钥文件错误，或保险柜已锁定")
             return
         self.vault_path = path
-        self.current_folder = '/'
-        self.tree_model.rebuild()
-        self.file_model.reload('/')
+        self.navigate_to('/')
         part_name = self.core.partitions[idx]['alias']
         self.status.showMessage(f"已解锁分区: {part_name}  | 审计日志已激活")
         self._update_actions()
@@ -1106,19 +1133,78 @@ class VaultMainWindow(QMainWindow):
             self.core.vault.close()
         self.core = VaultCore()
         self.vault_path = None
-        self.tree_model = VaultTreeModel(self.core)
+        self.current_folder = '/'
         self.file_model = FileListModel(self.core)
-        self.tree.setModel(self.tree_model)
         self.list.setModel(self.file_model)
         self._update_actions()
         self.status.showMessage("保险柜已关闭")
 
-    def on_tree_clicked(self, index):
-        path = index.data(Qt.UserRole)
-        if path is None:
-            path = '/'
-        self.current_folder = path
-        self.file_model.reload(path)
+    def destroy_vault(self):
+        if not self.vault_path:
+            return
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("销毁保险箱")
+        msg.setText("⚠️ 该操作不可逆，保险箱文件将被永久销毁！\n\n确定要继续吗？")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        msg.setStyleSheet("QLabel{color: red; font-weight: bold;}")
+        if msg.exec() != QMessageBox.Yes:
+            return
+        if self.core.vault.handle:
+            self.core.vault.close()
+        self.core = VaultCore()
+        vault_path = self.vault_path
+        self.vault_path = None
+        progress = QProgressDialog("正在安全销毁保险箱...", None, 0, 100, self)
+        progress.setWindowTitle("销毁中")
+        progress.setCancelButton(None)
+        progress.show()
+        def update_progress(val):
+            progress.setValue(val)
+            QApplication.processEvents()
+        try:
+            dod_erase(vault_path, update_progress)
+        except Exception as e:
+            QMessageBox.critical(self, "销毁失败", f"无法销毁文件：{str(e)}")
+            progress.close()
+            return
+        progress.setValue(100)
+        self.current_folder = '/'
+        self.file_model = FileListModel(self.core)
+        self.list.setModel(self.file_model)
+        self._update_actions()
+        self.status.showMessage("保险箱已销毁")
+        QMessageBox.information(self, "完成", "保险箱文件已安全销毁。")
+
+    def navigate_to(self, folder_path: str):
+        self.current_folder = folder_path
+        self.path_edit.setText(folder_path)
+        self.file_model.reload(folder_path)
+        self.up_btn.setEnabled(folder_path != '/')
+
+    def go_up(self):
+        if self.current_folder == '/':
+            return
+        parent = self.current_folder.rsplit('/', 1)[0]
+        if parent == '':
+            parent = '/'
+        self.navigate_to(parent)
+
+    def on_path_enter(self):
+        path = self.path_edit.text().strip()
+        if not path.startswith('/'):
+            path = '/' + path
+        if not validate_vpath(path):
+            QMessageBox.warning(self, "路径无效", "输入的路径包含非法字符")
+            self.path_edit.setText(self.current_folder)
+            return
+        idx = self.core.load_index()
+        if path != '/' and path not in idx.get('folders', {}):
+            QMessageBox.warning(self, "路径不存在", f"文件夹 '{path}' 不存在")
+            self.path_edit.setText(self.current_folder)
+            return
+        self.navigate_to(path)
 
     def on_list_double_clicked(self, index):
         item = self.file_model.itemFromIndex(index)
@@ -1128,36 +1214,32 @@ class VaultMainWindow(QMainWindow):
         if entry_type != 'folder':
             return
         folder_path = item.data(Qt.UserRole)
-        self.current_folder = folder_path
-        self.file_model.reload(folder_path)
-        self._select_tree_folder(folder_path)
-
-    def _select_tree_folder(self, folder_path: str):
-        model = self.tree.model()
-        idx = self._find_index_by_path(model, QModelIndex(), folder_path)
-        if idx.isValid():
-            self.tree.setCurrentIndex(idx)
-            self.tree.scrollTo(idx)
-            parent = model.parent(idx)
-            while parent.isValid():
-                self.tree.setExpanded(parent, True)
-                parent = model.parent(parent)
-
-    def _find_index_by_path(self, model, parent, target_path):
-        for row in range(model.rowCount(parent)):
-            idx = model.index(row, 0, parent)
-            if idx.data(Qt.UserRole) == target_path:
-                return idx
-            found = self._find_index_by_path(model, idx, target_path)
-            if found.isValid():
-                return found
-        return QModelIndex()
+        self.navigate_to(folder_path)
 
     def import_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "导入文件")
         for f in files:
             vp = self.current_folder.rstrip('/') + '/' + os.path.basename(f)
-            self.core.import_file(f, vp)
+            success = self.core.import_file(f, vp)
+            if success:
+                reply = QMessageBox.question(
+                    self, "粉碎原文件",
+                    f"文件 '{os.path.basename(f)}' 已导入。\n是否安全粉碎原文件（7次擦除）？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    progress = QProgressDialog(f"正在粉碎 {os.path.basename(f)}...", None, 0, 100, self)
+                    progress.setWindowTitle("粉碎文件")
+                    progress.setCancelButton(None)
+                    progress.show()
+                    def update_progress(val):
+                        progress.setValue(val)
+                        QApplication.processEvents()
+                    try:
+                        dod_erase(f, update_progress)
+                    except Exception as e:
+                        QMessageBox.warning(self, "粉碎失败", f"无法粉碎 {f}: {str(e)}")
+                    progress.close()
         self.file_model.reload(self.current_folder)
 
     def import_folder(self):
@@ -1166,7 +1248,6 @@ class VaultMainWindow(QMainWindow):
             return
         self.core.import_folder(folder, self.current_folder.rstrip('/'))
         self.file_model.reload(self.current_folder)
-        self.tree_model.rebuild()
 
     def extract_selected(self):
         idxs = self.list.selectedIndexes()
@@ -1198,14 +1279,17 @@ class VaultMainWindow(QMainWindow):
 
     def new_folder(self):
         name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称（禁止 ..）:")
-        if not ok or not name:
+        if not ok or not name or not name.strip():
+            return
+        name = name.strip()
+        if '/' in name or '\\' in name or '..' in name:
+            QMessageBox.warning(self, "非法字符", "名称不能包含 / \\ .. 等字符")
             return
         vp = self.current_folder.rstrip('/') + '/' + name
         if not validate_vpath(vp):
             QMessageBox.warning(self, "非法路径", "路径包含不安全字符")
             return
         self.core.new_folder(vp)
-        self.tree_model.rebuild()
         self.file_model.reload(self.current_folder)
 
     def add_partition(self):
@@ -1280,7 +1364,6 @@ class VaultMainWindow(QMainWindow):
         if not img_paths:
             QMessageBox.information(self, "提示", "当前选择/文件夹中没有图片文件")
             return
-
         self.photo_viewer = SecurePhotoViewer(self.core, img_paths)
         self.photo_viewer.destroyed.connect(self._on_viewer_closed)
         self.photo_viewer.show()
@@ -1317,8 +1400,9 @@ class VaultMainWindow(QMainWindow):
         current_name = item.text()
         title = "重命名文件夹" if entry_type == 'folder' else "重命名文件"
         new_name, ok = QInputDialog.getText(self, title, "新名称:", text=current_name)
-        if not ok or not new_name or new_name == current_name:
+        if not ok or not new_name or new_name.strip() == '':
             return
+        new_name = new_name.strip()
         if '/' in new_name or '\\' in new_name or '..' in new_name:
             QMessageBox.warning(self, "非法字符", "名称不能包含 / \\ .. 等字符")
             return
@@ -1330,12 +1414,10 @@ class VaultMainWindow(QMainWindow):
         if success:
             if entry_type == 'folder':
                 if self.current_folder == vpath or self.current_folder.startswith(vpath + '/'):
-                    self.current_folder = self.current_folder.replace(vpath, vpath.rsplit('/', 1)[0] + '/' + new_name, 1)
-            self.tree_model.rebuild()
+                    new_parent = vpath.rsplit('/', 1)[0] + '/' + new_name
+                    self.current_folder = self.current_folder.replace(vpath, new_parent, 1)
             self.file_model.reload(self.current_folder)
-            if entry_type == 'folder':
-                new_path = vpath.rsplit('/', 1)[0] + '/' + new_name
-                self._select_tree_folder(new_path)
+            self.navigate_to(self.current_folder)
         else:
             QMessageBox.critical(self, "重命名失败", "可能名称冲突或路径无效")
 
@@ -1348,11 +1430,29 @@ class VaultMainWindow(QMainWindow):
             p = url.toLocalFile()
             if os.path.isfile(p):
                 vp = self.current_folder.rstrip('/') + '/' + os.path.basename(p)
-                self.core.import_file(p, vp)
+                success = self.core.import_file(p, vp)
+                if success:
+                    reply = QMessageBox.question(
+                        self, "粉碎原文件",
+                        f"文件 '{os.path.basename(p)}' 已导入。\n是否安全粉碎原文件（7次擦除）？",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                    )
+                    if reply == QMessageBox.Yes:
+                        progress = QProgressDialog(f"正在粉碎 {os.path.basename(p)}...", None, 0, 100, self)
+                        progress.setWindowTitle("粉碎文件")
+                        progress.setCancelButton(None)
+                        progress.show()
+                        def update_progress(val):
+                            progress.setValue(val)
+                            QApplication.processEvents()
+                        try:
+                            dod_erase(p, update_progress)
+                        except Exception as ex:
+                            QMessageBox.warning(self, "粉碎失败", f"无法粉碎 {p}: {str(ex)}")
+                        progress.close()
             elif os.path.isdir(p):
                 self.core.import_folder(p, self.current_folder.rstrip('/'))
         self.file_model.reload(self.current_folder)
-        self.tree_model.rebuild()
 
 
 if __name__ == "__main__":
