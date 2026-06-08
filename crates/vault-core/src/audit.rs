@@ -62,17 +62,31 @@ impl AuditLog {
         self.entries.clone()
     }
 
-    /// 从持久化条目恢复审计日志（重新计算链的完整性）
+    /// 从持久化条目恢复审计日志（逐条验证链的完整性，篡改的条目将被丢弃）
     pub fn from_entries(entries: Vec<AuditEntry>, auth_key: [u8; 32]) -> Self {
         let mut log = Self::new(auth_key);
-        log.entries = entries;
-        if let Some(last) = log.entries.last() {
+        let mut chain = [0u8; 32];
+        for entry in &entries {
             let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&log.auth_key).unwrap();
-            mac.update(&[0u8; 32]);
-            mac.update(&last.ts.to_le_bytes());
-            mac.update(last.event.as_bytes());
-            log.chain = mac.finalize().into_bytes().into();
+            mac.update(&chain);
+            mac.update(&entry.ts.to_le_bytes());
+            mac.update(entry.event.as_bytes());
+            let expected = mac.finalize().into_bytes();
+            let entry_hmac = hex::decode(&entry.hmac).unwrap_or_default();
+            if entry_hmac.len() == 32 {
+                let mut entry_bytes = [0u8; 32];
+                entry_bytes.copy_from_slice(&entry_hmac);
+                if expected.as_slice() == entry_bytes {
+                    chain = entry_bytes;
+                    log.entries.push(entry.clone());
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
+        log.chain = chain;
         log
     }
 }

@@ -3,22 +3,25 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::crypto::derive_lock_key;
+
 pub const MAX_ERRORS: u8 = 5;
 pub const LOCKOUT_SECONDS: f64 = 30.0 * 60.0;
 
 #[derive(Debug, Clone)]
 pub struct LockState {
     pub lock_count: u8,
-    pub lock_until: f64, // epoch seconds as float64（兼容 Python '<Bd' 格式）
+    pub lock_until: f64,
     pub lock_key: [u8; 32],
 }
 
 impl LockState {
-    pub fn new(lock_key: [u8; 32]) -> Self {
+    /// 从保险柜 salt 派生 lock_key，**不存储在文件头部**
+    pub fn new(salt: &[u8; 32]) -> Self {
         Self {
             lock_count: 0,
             lock_until: 0.0,
-            lock_key,
+            lock_key: derive_lock_key(salt),
         }
     }
 
@@ -60,9 +63,10 @@ impl LockState {
         mac.finalize().into_bytes().into()
     }
 
-    /// 验证外部存储的锁定 HMAC 是否一致
+    /// 验证外部存储的锁定 HMAC 是否一致（恒定时间比较）
     pub fn verify_hmac(&self, stored: &[u8; 32]) -> bool {
+        use subtle::ConstantTimeEq;
         let expected = self.compute_hmac();
-        expected == *stored
+        expected.ct_eq(stored).into()
     }
 }

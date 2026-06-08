@@ -1,17 +1,34 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::State;
 use vault_core::Vault;
 
-/// 全局状态：保险柜实例
+/// 全局状态：保险柜实例 + 认证频率限制
 pub struct AppState {
     vault: Mutex<Option<Vault>>,
+    last_auth_attempt: Mutex<Option<Instant>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self { vault: Mutex::new(None) }
+        Self {
+            vault: Mutex::new(None),
+            last_auth_attempt: Mutex::new(None),
+        }
+    }
+
+    /// 检查认证冷却（防止暴力破解绕过 per-instance 限制）
+    fn check_auth_cooldown(&self) -> Result<(), String> {
+        let mut guard = self.last_auth_attempt.lock().map_err(|_| "内部错误".to_string())?;
+        if let Some(last) = *guard {
+            if last.elapsed() < Duration::from_secs(3) {
+                return Err("请稍后再试（冷却中）".into());
+            }
+        }
+        *guard = Some(Instant::now());
+        Ok(())
     }
 }
 
@@ -43,14 +60,17 @@ pub fn create_vault(
     key_file_path: Option<String>,
 ) -> Result<String, String> {
     catch("create_vault", || {
+        state.check_auth_cooldown()?;
         let key_data = load_key_file(&key_file_path)?;
         Vault::create(Path::new(&path), &password, key_data.as_deref())
             .map_err(|e| e.to_string())?;
 
-        // 创建后自动打开
         let mut vault = Vault::default();
         vault.open_and_authenticate(Path::new(&path), &password, key_data.as_deref())
             .map_err(|e| e.to_string())?;
+        if let Some(kd) = key_data {
+            vault_core::wipe::secure_wipe_vec(kd);
+        }
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         *guard = Some(vault);
         Ok("保险柜创建成功".into())
@@ -65,10 +85,14 @@ pub fn open_vault(
     key_file_path: Option<String>,
 ) -> Result<usize, String> {
     catch("open_vault", || {
+        state.check_auth_cooldown()?;
         let key_data = load_key_file(&key_file_path)?;
         let mut vault = Vault::default();
         let idx = vault.open_and_authenticate(Path::new(&path), &password, key_data.as_deref())
             .map_err(|e| e.to_string())?;
+        if let Some(kd) = key_data {
+            vault_core::wipe::secure_wipe_vec(kd);
+        }
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         *guard = Some(vault);
         Ok(idx)
@@ -169,8 +193,26 @@ pub fn extract_files(state: State<AppState>, vpaths: Vec<String>, dest_folder: S
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let dest = Path::new(&dest_folder);
-        let mut count = 0;
+
+        let index = vault.load_index().map_err(|e| e.to_string())?;
+
+        // 展开 vpaths：文件直接加入，文件夹递归展开为其下所有文件
+        let mut file_vpaths = Vec::new();
         for vp in &vpaths {
+            if index.files.contains_key(vp) {
+                file_vpaths.push(vp.clone());
+            } else if index.folders.contains_key(vp) {
+                let prefix = format!("{}/", vp.trim_end_matches('/'));
+                for fv in index.files.keys() {
+                    if fv.starts_with(&prefix) || fv == vp {
+                        file_vpaths.push(fv.clone());
+                    }
+                }
+            }
+        }
+
+        let mut count = 0;
+        for vp in &file_vpaths {
             vault.extract_file(vp, dest).map_err(|e| e.to_string())?;
             count += 1;
         }
@@ -234,10 +276,21 @@ pub fn rename_item(state: State<AppState>, old_vpath: String, new_name: String, 
 #[tauri::command]
 pub fn add_partition(state: State<AppState>, alias: String, password: String, key_file_path: Option<String>) -> Result<(), String> {
     catch("add_partition", || {
+        // 分区别名校验：只允许安全字符，防止 XSS
+        if !alias.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ') {
+            return Err("分区别名只能包含字母、数字、下划线、短横线和空格".into());
+        }
+        if alias.trim().is_empty() || alias.len() > 16 {
+            return Err("分区别名长度需在 1-16 字符之间".into());
+        }
         let key_data = load_key_file(&key_file_path)?;
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        vault.add_partition(&alias, &password, key_data.as_deref()).map_err(|e| e.to_string())
+        let result = vault.add_partition(&alias, &password, key_data.as_deref()).map_err(|e| e.to_string());
+        if let Some(kd) = key_data {
+            vault_core::wipe::secure_wipe_vec(kd);
+        }
+        result
     })
 }
 
@@ -326,6 +379,14 @@ pub fn secure_delete_source_files(
     paths: Vec<String>,
 ) -> Result<String, String> {
     catch("secure_delete_source_files", || {
+        // 拒绝符号链接
+        for p in &paths {
+            let meta = std::fs::symlink_metadata(p)
+                .map_err(|e| format!("无法访问 '{}': {}", p, e))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!("拒绝删除符号链接: '{}'", p));
+            }
+        }
         let path_refs: Vec<&Path> = paths.iter().map(|p| Path::new(p.as_str())).collect();
         vault_core::wipe::dod_erase_files(&path_refs, None)
             .map_err(|e| e.to_string())?;
@@ -339,10 +400,14 @@ pub fn secure_delete_source_folder(
 ) -> Result<String, String> {
     catch("secure_delete_source_folder", || {
         let root = Path::new(&folder);
+        let root_meta = std::fs::symlink_metadata(root)
+            .map_err(|_| "无法访问文件夹".to_string())?;
+        if root_meta.file_type().is_symlink() {
+            return Err("拒绝删除符号链接".into());
+        }
         if !root.is_dir() {
             return Err("不是有效的文件夹".into());
         }
-        // 递归收集所有文件
         let files = collect_files_recursive(root).map_err(|e| e.to_string())?;
         if files.is_empty() {
             let _ = std::fs::remove_dir_all(root);
@@ -351,7 +416,6 @@ pub fn secure_delete_source_folder(
         let path_refs: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
         vault_core::wipe::dod_erase_files(&path_refs, None)
             .map_err(|e| e.to_string())?;
-        // 删除空目录结构
         let _ = std::fs::remove_dir_all(root);
         Ok(format!("已安全删除 {} 个源文件（DoD 7-pass）", files.len()))
     })
@@ -362,6 +426,10 @@ fn collect_files_recursive(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
         if path.is_dir() {
             result.extend(collect_files_recursive(&path)?);
         } else {
@@ -401,7 +469,10 @@ pub fn preview_office_file(state: State<AppState>, vpath: String) -> Result<Stri
 
 fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
     match path {
-        Some(p) => Ok(Some(std::fs::read(p).map_err(|e| e.to_string())?)),
+        Some(p) => {
+            let data = std::fs::read(p).map_err(|e| e.to_string())?;
+            Ok(Some(data))
+        }
         None => Ok(None),
     }
 }

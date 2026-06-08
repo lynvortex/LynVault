@@ -23,11 +23,12 @@ const MAX_PARTITIONS: usize = 8;
 const PARTITION_ENTRY_SIZE: usize = 96;
 
 const LOCK_OFFSET: usize = 887;
-const SIGNED_LENGTH: usize = 968;
+// 签名范围仅到 lock_offset 之前；锁定区（887-927）由自身 HMAC 保护，
+// 每次认证失败都会修改锁定区，若包含在签名中会导致后续认证因签名不匹配而失败
+const SIGNED_LENGTH: usize = 887;
 const SIGNATURE_OFFSET: usize = 960;
 const SIGNATURE_SIZE: usize = 64;
 
-const PBKDF2_ITERATIONS: u32 = 1_000_000;
 const DEFAULT_PARTITION: &str = "Main";
 
 // ─────────── 自由函数：避免 &mut self 借用冲突 ───────────
@@ -42,7 +43,7 @@ fn load_index_from_file(
     file.seek(SeekFrom::Start(offset))?;
     let mut enc = vec![0u8; length as usize];
     file.read_exact(&mut enc)?;
-    let plain = decrypt_gcm(enc_key, &enc).ok_or(VaultError::DecryptFailed)?;
+    let plain = decrypt_gcm(enc_key, &enc, b"index").ok_or(VaultError::DecryptFailed)?;
     let index: Index = serde_json::from_slice(&plain)?;
     secure_wipe_vec(plain);
     Ok(index)
@@ -57,16 +58,19 @@ fn save_index_to_file(
     old_length: u64,
 ) -> Result<(u64, u64), VaultError> {
     let plain = serde_json::to_vec(index)?;
-    let encrypted = encrypt_gcm(enc_key, &plain, None);
+    let encrypted = encrypt_gcm(enc_key, &plain, b"index", None)?;
 
-    // 覆写旧索引区段为随机数据
+    // 修复：先写新索引到末尾，再覆写旧索引。
+    // 若进程在两者之间崩溃，旧索引依然有效（头部尚未更新）。
+    let new_offset = file.seek(SeekFrom::End(0))?;
+    file.write_all(&encrypted)?;
+    file.flush()?;
+
+    // 再覆写旧索引区段为随机数据
     let mut rand_data = vec![0u8; old_length as usize];
     OsRng.fill_bytes(&mut rand_data);
     file.seek(SeekFrom::Start(old_offset))?;
     file.write_all(&rand_data)?;
-
-    let new_offset = file.seek(SeekFrom::End(0))?;
-    file.write_all(&encrypted)?;
     file.flush()?;
 
     secure_wipe_vec(plain);
@@ -85,25 +89,35 @@ fn write_header_to_file(
 
     header[..8].copy_from_slice(MAGIC);
     header[8] = VERSION;
-    // bytes 9..17 reserved (nonce_counter removed, always zero)
-    header[41..73].copy_from_slice(&lock_state.lock_key);
+    // bytes 9..40 reserved
+    // bytes 41..73: was lock_key (plaintext) — now zeroed (lock_key is derived from salt)
     header[73..105].copy_from_slice(salt);
+    // num_partitions always MAX_PARTITIONS to hide real count
+    header[105] = MAX_PARTITIONS as u8;
 
-    header[105] = partitions.len() as u8;
     let mut off = 106;
-    for p in partitions {
-        let alias_bytes = p.alias.as_bytes();
-        let copy_len = alias_bytes.len().min(16);
-        header[off..off + copy_len].copy_from_slice(&alias_bytes[..copy_len]);
-        off += 16;
-        header[off..off + 32].copy_from_slice(&p.salt);
-        off += 32;
-        header[off..off + 32].copy_from_slice(&p.auth_tag);
-        off += 32;
-        header[off..off + 8].copy_from_slice(&p.index_offset.to_le_bytes());
-        off += 8;
-        header[off..off + 8].copy_from_slice(&p.index_length.to_le_bytes());
-        off += 8;
+    for i in 0..MAX_PARTITIONS {
+        if let Some(p) = partitions.get(i) {
+            let alias_bytes = p.alias.as_bytes();
+            let copy_len = alias_bytes.len().min(16);
+            header[off..off + copy_len].copy_from_slice(&alias_bytes[..copy_len]);
+            off += 16;
+            header[off..off + 32].copy_from_slice(&p.salt);
+            off += 32;
+            header[off..off + 32].copy_from_slice(&p.auth_tag);
+            off += 32;
+            header[off..off + 8].copy_from_slice(&p.index_offset.to_le_bytes());
+            off += 8;
+            header[off..off + 8].copy_from_slice(&p.index_length.to_le_bytes());
+            off += 8;
+        } else {
+            // 未使用的条目：alias 首字节 0 标记无效，其余填充随机数据
+            off += 16; // alias (first byte 0)
+            let mut rand_buf = vec![0u8; 32 + 32 + 8 + 8];
+            OsRng.fill_bytes(&mut rand_buf);
+            header[off..off + 80].copy_from_slice(&rand_buf);
+            off += 80;
+        }
     }
 
     header[LOCK_OFFSET] = lock_state.lock_count;
@@ -122,23 +136,25 @@ fn write_header_to_file(
 }
 
 /// 从保险柜文件读取并解密原始数据
+/// `aad` 必须与加密时使用的值一致（通常为文件虚拟路径）
 fn read_decrypt_file_data(
     file: &mut File,
     enc_key: &[u8; 32],
     offset: u64,
     length: u64,
+    aad: &[u8],
 ) -> Result<Vec<u8>, VaultError> {
     file.seek(SeekFrom::Start(offset))?;
     let mut enc_data = vec![0u8; length as usize];
     file.read_exact(&mut enc_data)?;
-    decrypt_gcm(enc_key, &enc_data).ok_or(VaultError::DecryptFailed)
+    decrypt_gcm(enc_key, &enc_data, aad).ok_or(VaultError::DecryptFailed)
 }
 
 /// 安全文件名清理
 fn sanitize_filename(name: &str) -> String {
     let safe: String = name
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.' || *c == ' ' || *c == '(' || *c == ')')
         .collect::<String>();
     if safe.is_empty() { "extracted_file".to_string() } else { safe }
 }
@@ -173,7 +189,7 @@ impl Default for Vault {
             auth_key: None,
             sign_key: None,
             salt: [0u8; 32],
-            lock_state: LockState::new([0u8; 32]),
+            lock_state: LockState::new(&[0u8; 32]),
             partitions: Vec::new(),
             active_partition: None,
             audit: None,
@@ -210,15 +226,13 @@ impl Vault {
 
         let mut salt = [0u8; 32];
         OsRng.fill_bytes(&mut salt);
-        let mut lock_key = [0u8; 32];
-        OsRng.fill_bytes(&mut lock_key);
 
         let mut keys = derive_keys(password, key_file_data, &salt)?;
         let auth_tag = create_auth_tag(&keys.auth_key);
 
         let empty_index = Index::new();
         let index_json = serde_json::to_vec(&empty_index)?;
-        let enc_index = encrypt_gcm(&keys.enc_key, &index_json, None);
+        let enc_index = encrypt_gcm(&keys.enc_key, &index_json, b"index", None)?;
 
         let index_offset = file.seek(SeekFrom::End(0))?;
         let index_length = enc_index.len() as u64;
@@ -233,7 +247,8 @@ impl Vault {
             index_length,
         };
 
-        let lock_state = LockState::new(lock_key);
+        // lock_key 不再随机生成，由 salt 派生；lock_key 不存储在头部
+        let lock_state = LockState::new(&salt);
         write_header_to_file(&mut file, &lock_state, &salt, &[partition], &keys.sign_key)?;
 
         keys.zeroize();
@@ -259,13 +274,15 @@ impl Vault {
         let mut header = [0u8; HEADER_SIZE];
         file.read_exact(&mut header)?;
 
-        let (magic, version, lock_key, salt) = Self::parse_header(&header)?;
+        let (magic, version, salt) = Self::parse_header(&header)?;
         if &magic != MAGIC || version != VERSION {
             return Err(VaultError::BadMagic);
         }
 
         let lock_count = header[LOCK_OFFSET];
         let lock_until = f64::from_le_bytes(header[LOCK_OFFSET+1..LOCK_OFFSET+9].try_into().unwrap());
+        // lock_key 不再从头部读取；从 vault salt 派生
+        let lock_key = derive_lock_key(&salt);
         let mut lock_state = LockState { lock_count, lock_until, lock_key };
 
         let stored_hmac: [u8; 32] = header[LOCK_OFFSET+9..LOCK_OFFSET+9+32].try_into().unwrap();
@@ -276,12 +293,16 @@ impl Vault {
             return Err(VaultError::Locked);
         }
 
-        // 解析分区表
-        let num_partitions = header[105] as usize;
+        // 解析分区表：始终扫描 MAX_PARTITIONS 个条目，跳过别名首字节为 0 的无效条目
         let mut partitions = Vec::new();
         let mut off = 106;
-        for _ in 0..num_partitions.min(MAX_PARTITIONS) {
+        for _ in 0..MAX_PARTITIONS {
             if off + PARTITION_ENTRY_SIZE > HEADER_SIZE { break; }
+            let alias_first = header[off];
+            if alias_first == 0 {
+                off += PARTITION_ENTRY_SIZE;
+                continue;
+            }
             let alias_len = header[off..off+16].iter().position(|&b| b == 0).unwrap_or(16);
             let alias = String::from_utf8_lossy(&header[off..off+alias_len]).to_string();
             let mut p_salt = [0u8; 32];
@@ -298,13 +319,24 @@ impl Vault {
         for (idx, p) in partitions.iter().enumerate() {
             let mut keys = derive_keys(password, key_file_data, &p.salt)?;
             if verify_auth_tag(&keys.auth_key, &p.auth_tag) {
+                // 验证头部签名（防止篡改）
+                if !verify_header_signature(&header, &keys.sign_key) {
+                    keys.zeroize();
+                    return Err(VaultError::Other("保险柜头部已被篡改".into()));
+                }
+                // 验证索引偏移不超出文件范围
+                let file_size = file.metadata()?.len();
+                if p.index_offset + p.index_length > file_size {
+                    keys.zeroize();
+                    return Err(VaultError::Other("索引超出文件范围".into()));
+                }
                 let enc_index = {
                     file.seek(SeekFrom::Start(p.index_offset))?;
                     let mut buf = vec![0u8; p.index_length as usize];
                     file.read_exact(&mut buf)?;
                     buf
                 };
-                let index_json = decrypt_gcm(&keys.enc_key, &enc_index)
+                let index_json = decrypt_gcm(&keys.enc_key, &enc_index, b"index")
                     .ok_or(VaultError::DecryptFailed)?;
                 let index: Index = serde_json::from_slice(&index_json)?;
 
@@ -403,17 +435,14 @@ impl Vault {
     }
 
     fn parse_header(header: &[u8; HEADER_SIZE])
-        -> Result<([u8; 8], u8, [u8; 32], [u8; 32]), VaultError>
+        -> Result<([u8; 8], u8, [u8; 32]), VaultError>
     {
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&header[..8]);
         let version = header[8];
-        // bytes 9..17 reserved (was nonce_counter)
-        let mut lock_key = [0u8; 32];
-        lock_key.copy_from_slice(&header[41..73]);
         let mut salt = [0u8; 32];
         salt.copy_from_slice(&header[73..105]);
-        Ok((magic, version, lock_key, salt))
+        Ok((magic, version, salt))
     }
 
     // ═══════════════ 分区管理 ═══════════════
@@ -429,7 +458,7 @@ impl Vault {
 
         let empty_index = Index::new();
         let plain = serde_json::to_vec(&empty_index)?;
-        let enc = encrypt_gcm(&keys.enc_key, &plain, None);
+        let enc = encrypt_gcm(&keys.enc_key, &plain, b"index", None)?;
 
         let file = self.file.as_mut().unwrap();
         let offset = file.seek(SeekFrom::End(0))?;
@@ -471,6 +500,12 @@ impl Vault {
         file.flush()?;
 
         self.partitions.remove(pos);
+        // 调整活跃分区索引：如果删除的位置在当前活跃分区之前，活跃索引需要减 1
+        if let Some(active) = self.active_partition {
+            if pos < active {
+                self.active_partition = Some(active - 1);
+            }
+        }
         if let Some(ref mut audit) = self.audit {
             audit.add(&format!("删除分区 '{}'", alias));
         }
@@ -490,7 +525,7 @@ impl Vault {
             .unwrap_or_default().to_string_lossy().to_string();
 
         let enc_key = self.enc_key.as_ref().unwrap();
-        let encrypted = encrypt_gcm(enc_key, &data, None);
+        let encrypted = encrypt_gcm(enc_key, &data, vpath.as_bytes(), None)?;
 
         let file = self.file.as_mut().unwrap();
         let offset = file.seek(SeekFrom::End(0))?;
@@ -529,41 +564,60 @@ impl Vault {
     // ═══════════════ 文件提取 ═══════════════
 
     pub fn extract_file(&mut self, vpath: &str, dest_folder: &Path) -> Result<(), VaultError> {
-        // 先获取文件元数据
-        let file_name = {
+        let (rel_dir, file_name) = {
             let index = self.load_index()?;
             let meta = index.files.get(vpath)
                 .ok_or(VaultError::Other("文件不存在".into()))?;
-            meta.name.clone()
+
+            let vpath_trimmed = vpath.trim_matches('/');
+            let rel_dir = match vpath_trimmed.rfind('/') {
+                Some(pos) => &vpath_trimmed[..pos],
+                None => "",
+            };
+            (rel_dir.to_string(), meta.name.clone())
         };
 
-        // 读取并解密
         let data = {
             let index = self.load_index()?;
             let meta = index.files.get(vpath).unwrap();
             let file = self.file.as_mut().unwrap();
             let enc_key = self.enc_key.as_ref().unwrap();
-            read_decrypt_file_data(file, enc_key, meta.offset, meta.length)?
+            read_decrypt_file_data(file, enc_key, meta.offset, meta.length, vpath.as_bytes())?
         };
 
         let safe_name = sanitize_filename(&file_name);
-        let dest_path = dest_folder.join(&safe_name);
 
-        // 路径遍历检查：先 canonicalize 目标目录，再检查最终路径
+        let rel_path: PathBuf = rel_dir
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .map(sanitize_filename)
+            .collect();
+
+        // 确保目标根目录存在，再获取规范路径
+        fs::create_dir_all(dest_folder)?;
         let dest_abs = fs::canonicalize(dest_folder)
-            .map_err(|_| VaultError::Other("目标目录不存在".into()))?;
-        // 统一用 '/' 比较，消除平台差异
+            .map_err(|_| VaultError::Other("目标目录无法访问".into()))?;
+
+        let output_dir = if rel_path.components().count() > 0 {
+            dest_abs.join(&rel_path)
+        } else {
+            dest_abs.clone()
+        };
+        fs::create_dir_all(&output_dir)?;
+
+        let dest_path = output_dir.join(&safe_name);
+
+        // 路径遍历防护：验证最终路径在目标目录下
         let dest_str = dest_abs.to_string_lossy().replace('\\', "/");
         let final_str = dest_path.to_string_lossy().replace('\\', "/");
         if !final_str.starts_with(&dest_str) {
             if let Some(ref mut audit) = self.audit {
-                audit.add(&format!("拦截路径遍历攻击: '{}'", file_name));
+                audit.add(&format!("拦截路径遍历攻击: '{}'", vpath));
             }
             secure_wipe_vec(data);
             return Err(VaultError::Other("路径遍历攻击已拦截".into()));
         }
 
-        fs::create_dir_all(dest_folder)?;
         fs::write(&dest_path, &data)?;
 
         if let Some(ref mut audit) = self.audit {
@@ -644,7 +698,7 @@ impl Vault {
         };
         let file = self.file.as_mut().unwrap();
         let enc_key = self.enc_key.as_ref().unwrap();
-        read_decrypt_file_data(file, enc_key, offset, length)
+        read_decrypt_file_data(file, enc_key, offset, length, vpath.as_bytes())
     }
 
     // ═══════════════ 碎片整理 ═══════════════
@@ -698,7 +752,7 @@ impl Vault {
 
             // 写入加密索引
             let idx_json = serde_json::to_vec(&index)?;
-            let enc_idx = encrypt_gcm(&enc_key, &idx_json, None);
+            let enc_idx = encrypt_gcm(&enc_key, &idx_json, b"index", None)?;
             let idx_offset = tmp_file.seek(SeekFrom::End(0))?;
             tmp_file.write_all(&enc_idx)?;
             tmp_file.flush()?;
@@ -786,7 +840,9 @@ impl Vault {
             audit.add("保险柜已关闭");
         }
         if self.enc_key.is_some() && self.file.is_some() {
-            let _ = self.load_index().and_then(|idx| self.save_index(&idx));
+            if let Err(e) = self.load_index().and_then(|idx| self.save_index(&idx)) {
+                log::error!("关闭保险柜时保存索引失败: {}", e);
+            }
         }
         self.file = None;
         self.path = None;

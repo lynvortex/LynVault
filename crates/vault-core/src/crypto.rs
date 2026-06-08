@@ -1,21 +1,33 @@
 //! 密码学原语封装
 
 /// 头部签名相关常量（与 vault.rs 保持一致）
-const SIGNED_LENGTH: usize = 968;
+const SIGNED_LENGTH: usize = 887;
 const SIGNATURE_OFFSET: usize = 960;
 const SIGNATURE_SIZE: usize = 64;
 
 use aes_gcm::{Aes256Gcm, Nonce};
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::KeyInit as AesKeyInit;
+use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::VaultError;
+
+/// 从保险柜 salt 派生锁定 HMAC 密钥（不存储在头部）
+pub fn derive_lock_key(salt: &[u8; 32]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(salt);
+    hasher.update(b"pyvault-lock-key-v2");
+    let result = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
+}
 
 /// 输出密钥类型
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -25,7 +37,12 @@ pub struct KeyMaterial {
     pub sign_key: [u8; 32],
 }
 
-/// 从主密码 + 可选密钥文件 + 盐 派生出三个密钥
+/// Argon2id 参数：64 MB 内存，3 轮迭代
+const ARGON2_M_COST: u32 = 65536; // 64 MB
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+
+/// 从主密码 + 可选密钥文件 + 盐 派生出三个密钥（Argon2id → HKDF-SHA512）
 pub fn derive_keys(
     password: &str,
     key_file_data: Option<&[u8]>,
@@ -37,8 +54,13 @@ pub fn derive_keys(
         combined.extend_from_slice(kf);
     }
 
-    let mut master = vec![0u8; 32];
-    pbkdf2_hmac::<Sha256>(&combined, salt, 1_000_000, &mut master);
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut master = [0u8; 32];
+    argon2.hash_password_into(&combined, salt, &mut master)
+        .map_err(|e| VaultError::Other(format!("Argon2id 派生失败: {}", e)))?;
 
     let hkdf = Hkdf::<Sha512>::new(None, &master);
     let mut derived = vec![0u8; 96];
@@ -63,7 +85,8 @@ pub fn derive_keys(
 }
 
 /// AES-256-GCM 加密，返回 nonce(12) || ciphertext
-pub fn encrypt_gcm(key: &[u8; 32], plaintext: &[u8], nonce: Option<&[u8]>) -> Vec<u8> {
+/// `aad`：关联认证数据（绑定的上下文），解密时必须传入相同值
+pub fn encrypt_gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8], nonce: Option<&[u8]>) -> Result<Vec<u8>, VaultError> {
     let cipher = Aes256Gcm::new_from_slice(key).expect("invalid AES key");
     let nonce = match nonce {
         Some(n) => Nonce::from_slice(n).to_owned(),
@@ -73,22 +96,25 @@ pub fn encrypt_gcm(key: &[u8; 32], plaintext: &[u8], nonce: Option<&[u8]>) -> Ve
             Nonce::from(n)
         }
     };
-    let ciphertext = cipher.encrypt(&nonce, plaintext).expect("encryption failure");
+    let payload = Payload { msg: plaintext, aad };
+    let ciphertext = cipher.encrypt(&nonce, payload).map_err(|_| VaultError::EncryptFailed)?;
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&ciphertext);
-    result
+    Ok(result)
 }
 
 /// AES-256-GCM 解密，输入 nonce(12) || ciphertext，失败返回 None
-pub fn decrypt_gcm(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
+/// `aad` 必须与加密时传入的值一致
+pub fn decrypt_gcm(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 12 {
         return None;
     }
     let (nonce, ct) = data.split_at(12);
     let cipher = Aes256Gcm::new_from_slice(key).expect("invalid AES key");
     let nonce = Nonce::from_slice(nonce);
-    cipher.decrypt(nonce, ct).ok()
+    let payload = Payload { msg: ct, aad };
+    cipher.decrypt(nonce, payload).ok()
 }
 
 /// 生成认证标签（HMAC-SHA256 of b"AUTH_OK"）

@@ -23,6 +23,9 @@ pub enum VaultError {
     #[error("Invalid ciphertext or corrupted data")]
     DecryptFailed,
 
+    #[error("Encryption failed")]
+    EncryptFailed,
+
     #[error("Maximum partition count reached")]
     TooManyPartitions,
 

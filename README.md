@@ -1,4 +1,4 @@
-# LynVault 2.0.1
+# LynVault 2.1.1
 
 抗取证加密保险柜 — 基于 Tauri + Rust 的桌面端加密文件管理系统。
 
@@ -11,10 +11,11 @@
 ### 1. 加密保险柜
 
 - **加密算法**：AES-256-GCM（认证加密，防篡改 + 防窃听）
-- **密钥派生**：PBKDF2-HMAC-SHA256（100 万次迭代）→ HKDF-SHA512 扩展，派生三把独立密钥：
+- **密钥派生**：Argon2id (m_cost=65536, t_cost=3, p_cost=1) → HKDF-SHA512 扩展，派生三把独立密钥：
   - `enc_key` — 加解密文件数据
   - `auth_key` — 认证标签验证（防暴力破解）
   - `sign_key` — 头部签名（HMAC-SHA512，防头部篡改）
+- **上下文绑定（AAD）**：每个密文块绑定其虚拟路径（vpath），防止密文移动攻击
 - **认证方式**：
   - 纯密码模式
   - 密码 + 密钥文件双重认证（密钥文件可存储在 USB 等物理介质）
@@ -97,7 +98,7 @@
 ## 项目结构
 
 ```
-LynVault 2.0.0/
+LynVault 2.1.1/
 ├── Cargo.toml                 # Workspace 根配置
 ├── Cargo.lock
 ├── src-tauri/                 # Tauri 桌面应用
@@ -114,7 +115,7 @@ LynVault 2.0.0/
 │       └── src/
 │           ├── lib.rs         # 模块导出
 │           ├── vault.rs       # 保险柜生命周期管理
-│           ├── crypto.rs      # AES-256-GCM / PBKDF2 / HKDF / HMAC
+│           ├── crypto.rs      # AES-256-GCM / Argon2id / HKDF / HMAC
 │           ├── index.rs       # 加密文件索引
 │           ├── lock.rs        # 并发锁 + 签名验证
 │           ├── audit.rs       # 操作审计日志
@@ -162,10 +163,45 @@ LynVault 2.0.0/
 | 前端 | HTML + CSS + JavaScript (vanilla) |
 | 框架 | Tauri 1.x |
 | 后端 | Rust 2021 Edition |
-| 加密 | aes-gcm (AES-256-GCM) / pbkdf2 (1M iterations) / hkdf / hmac / sha2 |
+| 加密 | aes-gcm (AES-256-GCM) / argon2 (Argon2id, 64MB/3 iter) / hkdf / hmac / sha2 |
 | 内存安全 | zeroize (ZeroizeOnDrop) |
 | Office 解析 | calamine (Excel) / quick-xml (DOCX/PPTX) / zip |
 | 打包 | Tauri bundler (Windows .exe / .msi) |
+
+## 安全架构
+
+LynVault 采用纵深防御设计，兼顾**机密性**、**完整性**和**抗取证能力**：
+
+### 密钥层次
+
+```
+主密码 + 密钥文件（可选）
+        │
+        ▼
+  Argon2id (64 MB / 3 iter)        ← 内存硬函数，抵抗 GPU/ASIC 暴力破解
+        │
+        ▼
+    32 字节 master key
+        │
+        ▼
+  HKDF-SHA512 扩展
+        │
+        ├─► enc_key (32B) — AES-256-GCM 加解密，绑定 AAD
+        ├─► auth_key (32B) — GCM 认证标签验证
+        └─► sign_key (32B) — HMAC-SHA512 头部签名
+```
+
+### 攻击面防御
+
+| 威胁 | 防御措施 |
+|---|---|
+| 暴力破解密码 | Argon2id 内存硬性 + derived key 认证标签验证 + Tauri 端全局冷却 |
+| 密文篡改 | AES-256-GCM 认证加密 + HMAC-SHA512 头部签名 |
+| 密文移动攻击 | AAD 将每个密文块绑定到虚拟路径，无法在不同 vpath 间移动 |
+| 分区交换攻击 | 每个分区独立密钥，AAD 常量 `b"index"` 锁定索引数据 |
+| 明文残留 | 导入后可选 DoD 7-pass 安全擦除源文件 |
+| 内存泄露 | `zeroize` 自动清零密钥材料 |
+| 路径遍历 | `canonicalize` 验证提取目标路径，拒绝跳出基目录的符号链接 |
 
 ## 编译
 
@@ -185,8 +221,4 @@ cargo tauri build
 - Rust 工具链 (rustup)
 - Tauri 系统依赖：[tauri.app/start/#prerequisites](https://tauri.app/start/#prerequisites)
 - Windows：WebView2 Runtime（Win 10 1803+ 通常已预装）
-- 构建产物：`src-tauri/target/release/LynVault 2.0.1.exe`
-
-## License
-
-MIT
+- 构建产物：`src-tauri/target/release/LynVault 2.1.1.exe`

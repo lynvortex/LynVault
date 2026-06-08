@@ -3,14 +3,12 @@ use rand::{rngs::OsRng, RngCore};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write, Seek, SeekFrom};
 use std::path::Path;
+use zeroize::Zeroize;
 
 /// 安全擦除 Vec<u8> 并释放
 pub fn secure_wipe_vec(mut v: Vec<u8>) {
-    for byte in &mut v {
-        *byte = 0;
-    }
+    v.as_mut_slice().zeroize();
     v.clear();
-    v.shrink_to_fit();
 }
 
 /// DoD 5220.22-M 7 次擦除
@@ -25,9 +23,15 @@ pub fn secure_wipe_vec(mut v: Vec<u8>) {
 ///   Pass 7: 随机
 ///
 /// 每次写入后 fsync 确保落盘，最后删除文件。
+///
+/// 拒绝操作符号链接，防止被利用删除系统文件。
 pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::Result<()> {
-    let metadata = fs::metadata(path)?;
-    let length = metadata.len() as usize;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "拒绝删除符号链接，跳过"));
+    }
+    let length = meta.len() as usize;
     if length == 0 {
         return fs::remove_file(path);
     }
