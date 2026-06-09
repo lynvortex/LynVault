@@ -396,8 +396,8 @@ impl Vault {
             let p = &self.partitions[active];
             (p.index_offset, p.index_length)
         };
-        let file = self.file.as_mut().unwrap();
-        let enc_key = self.enc_key.as_ref().unwrap();
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+        let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
         load_index_from_file(file, enc_key, offset, length)
     }
 
@@ -413,8 +413,8 @@ impl Vault {
             idx.audit = audit.to_vec();
         }
 
-        let file = self.file.as_mut().unwrap();
-        let enc_key = self.enc_key.as_ref().unwrap();
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+        let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
         let (new_off, new_len) = save_index_to_file(file, enc_key, &idx, old_off, old_len)?;
 
         self.partitions[active].index_offset = new_off;
@@ -460,7 +460,7 @@ impl Vault {
         let plain = serde_json::to_vec(&empty_index)?;
         let enc = encrypt_gcm(&keys.enc_key, &plain, b"index", None)?;
 
-        let file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         let offset = file.seek(SeekFrom::End(0))?;
         file.write_all(&enc)?;
         file.flush()?;
@@ -524,10 +524,10 @@ impl Vault {
         let name = src_path.file_name()
             .unwrap_or_default().to_string_lossy().to_string();
 
-        let enc_key = self.enc_key.as_ref().unwrap();
+        let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
         let encrypted = encrypt_gcm(enc_key, &data, vpath.as_bytes(), None)?;
 
-        let file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         let offset = file.seek(SeekFrom::End(0))?;
         file.write_all(&encrypted)?;
         file.flush()?;
@@ -564,7 +564,8 @@ impl Vault {
     // ═══════════════ 文件提取 ═══════════════
 
     pub fn extract_file(&mut self, vpath: &str, dest_folder: &Path) -> Result<(), VaultError> {
-        let (rel_dir, file_name) = {
+        // 单次 load_index：获取文件名和密文位置（去除了二次解密和 unwrap）
+        let (rel_dir, file_name, offset, length) = {
             let index = self.load_index()?;
             let meta = index.files.get(vpath)
                 .ok_or(VaultError::Other("文件不存在".into()))?;
@@ -574,15 +575,14 @@ impl Vault {
                 Some(pos) => &vpath_trimmed[..pos],
                 None => "",
             };
-            (rel_dir.to_string(), meta.name.clone())
+            (rel_dir.to_string(), meta.name.clone(), meta.offset, meta.length)
         };
 
+        // 解密文件数据
         let data = {
-            let index = self.load_index()?;
-            let meta = index.files.get(vpath).unwrap();
-            let file = self.file.as_mut().unwrap();
-            let enc_key = self.enc_key.as_ref().unwrap();
-            read_decrypt_file_data(file, enc_key, meta.offset, meta.length, vpath.as_bytes())?
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
+            read_decrypt_file_data(file, enc_key, offset, length, vpath.as_bytes())?
         };
 
         let safe_name = sanitize_filename(&file_name);
@@ -608,9 +608,7 @@ impl Vault {
         let dest_path = output_dir.join(&safe_name);
 
         // 路径遍历防护：验证最终路径在目标目录下
-        let dest_str = dest_abs.to_string_lossy().replace('\\', "/");
-        let final_str = dest_path.to_string_lossy().replace('\\', "/");
-        if !final_str.starts_with(&dest_str) {
+        if dest_path.strip_prefix(&dest_abs).is_err() {
             if let Some(ref mut audit) = self.audit {
                 audit.add(&format!("拦截路径遍历攻击: '{}'", vpath));
             }
@@ -618,7 +616,33 @@ impl Vault {
             return Err(VaultError::Other("路径遍历攻击已拦截".into()));
         }
 
-        fs::write(&dest_path, &data)?;
+        // 用 O_NOFOLLOW 打开目标文件再写入，防止 TOCTOU 符号链接竞态
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = OpenOptions::new()
+                .write(true).create(true).truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&dest_path)
+                .map_err(|_| VaultError::Other("目标文件路径异常（符号链接？）".into()))?;
+            f.write_all(&data)?;
+            f.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows：先检查再打开（无 O_NOFOLLOW 等价物时缩小窗口）
+            let meta = fs::symlink_metadata(&dest_path);
+            if let Ok(ref m) = meta {
+                if m.file_type().is_symlink() {
+                    if let Some(ref mut audit) = self.audit {
+                        audit.add(&format!("拦截路径遍历攻击: '{}'", vpath));
+                    }
+                    secure_wipe_vec(data);
+                    return Err(VaultError::Other("路径遍历攻击已拦截".into()));
+                }
+            }
+            fs::write(&dest_path, &data)?;
+        }
 
         if let Some(ref mut audit) = self.audit {
             audit.add(&format!("提取文件 '{}'", vpath));
@@ -640,7 +664,7 @@ impl Vault {
         // 用随机数据覆写
         let mut rand_data = vec![0u8; meta.length as usize];
         OsRng.fill_bytes(&mut rand_data);
-        let file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         file.seek(SeekFrom::Start(meta.offset))?;
         file.write_all(&rand_data)?;
         file.flush()?;
@@ -655,21 +679,31 @@ impl Vault {
     }
 
     pub fn delete_folder(&mut self, vpath: &str) -> Result<(), VaultError> {
-        let files_to_delete: Vec<String> = {
-            let index = self.load_index()?;
-            let prefix = format!("{}/", vpath);
-            index.files.keys()
-                .filter(|f| f.starts_with(&prefix) || *f == vpath)
-                .cloned()
-                .collect()
-        };
+        let prefix = format!("{}/", vpath);
 
-        for f in &files_to_delete {
-            self.secure_delete_file(f)?;
+        // 1. 一次性加载索引，收集所有需要覆写和删除的条目
+        let mut index = self.load_index()?;
+
+        let files_to_wipe: Vec<(String, u64, u64)> = index.files.iter()
+            .filter(|(k, _)| k.starts_with(&prefix) || **k == vpath)
+            .map(|(k, m)| (k.clone(), m.offset, m.length))
+            .collect();
+
+        // 2. 批量覆写密文（避免每个文件完整 load/save 索引一次，O(n²)→O(n)）
+        for (_, offset, length) in &files_to_wipe {
+            let mut rand_data = vec![0u8; *length as usize];
+            OsRng.fill_bytes(&mut rand_data);
+            let file = self.file.as_mut().unwrap();
+            file.seek(SeekFrom::Start(*offset))?;
+            file.write_all(&rand_data)?;
+            file.flush()?;
         }
 
-        let prefix = format!("{}/", vpath);
-        let mut index = self.load_index()?;
+        // 3. 从索引中批量移除文件（一次 save_index）
+        for (vpath_key, _, _) in &files_to_wipe {
+            index.files.remove(vpath_key);
+        }
+
         let dirs_to_delete: Vec<String> = index.folders.keys()
             .filter(|d| d.starts_with(&prefix))
             .cloned()
@@ -680,6 +714,7 @@ impl Vault {
         if vpath != "/" {
             index.folders.remove(vpath);
         }
+
         if let Some(ref mut audit) = self.audit {
             audit.add(&format!("删除文件夹 '{}'", vpath));
         }
@@ -696,16 +731,16 @@ impl Vault {
                 .ok_or(VaultError::Other("文件不存在".into()))?;
             (meta.offset, meta.length)
         };
-        let file = self.file.as_mut().unwrap();
-        let enc_key = self.enc_key.as_ref().unwrap();
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+        let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
         read_decrypt_file_data(file, enc_key, offset, length, vpath.as_bytes())
     }
 
     // ═══════════════ 碎片整理 ═══════════════
 
     pub fn defragment_vault<F: Fn(usize)>(&mut self, progress: Option<F>) -> Result<(), VaultError> {
-        let enc_key = *self.enc_key.as_ref().unwrap();
-        let sign_key = *self.sign_key.as_ref().unwrap();
+        let enc_key = *self.enc_key.as_ref().expect("defragment: enc_key 未初始化");
+        let sign_key = *self.sign_key.as_ref().expect("defragment: sign_key 未初始化");
         let vault_path = self.path.as_ref().ok_or(VaultError::NotOpen)?.clone();
 
         // 随机临时文件名，防止符号链接攻击
@@ -743,21 +778,25 @@ impl Vault {
 
                 let new_offset = tmp_file.seek(SeekFrom::End(0))?;
                 tmp_file.write_all(&enc_data)?;
-                index.files.get_mut(vpath).unwrap().offset = new_offset;
+                index.files.get_mut(vpath).expect("defragment: 文件不在索引中").offset = new_offset;
 
                 if let Some(ref cb) = progress {
                     cb((i + 1) * 50 / total.max(1));
                 }
             }
 
-            // 写入加密索引
-            let idx_json = serde_json::to_vec(&index)?;
+            // 写入加密索引（合并审计日志，消除成功路径二次写入）
+            let mut idx_for_write = index.clone();
+            if let Some(ref audit) = self.audit {
+                idx_for_write.audit = audit.to_vec();
+            }
+            let idx_json = serde_json::to_vec(&idx_for_write)?;
             let enc_idx = encrypt_gcm(&enc_key, &idx_json, b"index", None)?;
             let idx_offset = tmp_file.seek(SeekFrom::End(0))?;
             tmp_file.write_all(&enc_idx)?;
             tmp_file.flush()?;
 
-            let active = self.active_partition.unwrap();
+            let active = self.active_partition.expect("defragment: 无活跃分区");
             self.partitions[active].index_offset = idx_offset;
             self.partitions[active].index_length = enc_idx.len() as u64;
 
@@ -792,7 +831,6 @@ impl Vault {
                 if let Some(ref mut audit) = self.audit {
                     audit.add("执行保险柜碎片整理");
                 }
-                self.save_index(&index)?;
                 if let Some(ref cb) = progress {
                     cb(100);
                 }

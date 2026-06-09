@@ -229,7 +229,13 @@ function renderList(data) {
     state.selectedItems = [];
 
     if (!data || !data.length) {
-        list.innerHTML = '<div class="empty-hint">空文件夹 — 使用「导入文件」添加内容</div>';
+        list.innerHTML = '<div class="empty-hint">' +
+            '<svg width="45" height="55" viewBox="0 0 45 55" fill="none" style="display:block;margin:0 auto 12px auto;opacity:0.5">' +
+            '<path d="M0 0H33L45 12V55H0Z" fill="#a0a0a0"/>' +
+            '<path d="M33 0V12H45Z" fill="#828282"/>' +
+            '</svg>' +
+            '<span>将文件拖放至此</span>' +
+            '</div>';
         return;
     }
 
@@ -484,7 +490,9 @@ async function viewFile(vpath, fileName) {
             return;
         }
 
-        showDialog('提示', `<p>暂不支持预览 .${ext} 格式</p><p>请使用「提取选中」导出后查看。</p>`, [{ text: '确定', cls: 'btn-ok' }]);
+        showDialog('提示', '<p>暂不支持预览 .' + ext.replace(/[<>&"']/g, function(c) {
+            return {'<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;'}[c] || c;
+        }) + ' 格式</p><p>请使用「提取选中」导出后查看。</p>', [{ text: '确定', cls: 'btn-ok' }]);
     } catch (e) {
         showError(String(e));
     }
@@ -656,6 +664,81 @@ function bindEvents() {
     // 全局点击关闭右键菜单
     document.addEventListener('click', hideCtxMenu);
     $('overlay').onclick = hideDialog;
+
+    // ────────── 拖放导入 ──────────
+    const fileList = $('file-list');
+
+    // HTML5 dragover 让 drop 光标出现（必须 preventDefault）
+    fileList.addEventListener('dragover', (e) => {
+        if (!state.vaultOpen) return;
+        e.preventDefault();
+        fileList.classList.add('drag-over');
+    });
+    fileList.addEventListener('dragleave', () => {
+        fileList.classList.remove('drag-over');
+    });
+
+    // 用 Tauri Window API 捕获 dropped 文件路径（比 event.listen 更可靠）
+    if (window.__TAURI__ && window.__TAURI__.window) {
+        const appWindow = window.__TAURI__.window.getCurrent();
+        appWindow.onFileDropEvent(async (evt) => {
+            const p = evt.payload;
+            try {
+                if (p.type === 'hover') {
+                    if (state.vaultOpen) fileList.classList.add('drag-over');
+                } else if (p.type === 'drop') {
+                    fileList.classList.remove('drag-over');
+                    const paths = p.paths;
+                    if (!paths || paths.length === 0 || !state.vaultOpen) return;
+                    setStatus(`正在导入 ${paths.length} 个项目...`);
+                    const raw = await invoke('import_dropped_paths', {
+                        paths,
+                        destBase: state.currentFolder,
+                    });
+                    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    await listFolder(state.currentFolder);
+
+                    // 如有成功导入的项目，询问安全删除源文件
+                    const hasFiles = res.files && res.files.length > 0;
+                    const hasFolders = res.folders && res.folders.length > 0;
+                    if (hasFiles || hasFolders) {
+                        const del = await tauriAsk(
+                            `导入完成。是否安全删除以下源文件？\n\n` +
+                            (hasFiles ? `📄 ${res.files.length} 个文件\n` : '') +
+                            (hasFolders ? `📁 ${res.folders.length} 个文件夹\n` : '') +
+                            `\nDoD 5220.22-M 7次擦除，不可恢复。`,
+                            { title: '安全删除源文件', type: 'warning' }
+                        );
+                        if (del) {
+                            setStatus('正在安全删除源文件...');
+                            try {
+                                // 先删文件，再删文件夹（文件夹内文件已由 vault 导入完毕）
+                                let delResult = '';
+                                if (hasFiles) {
+                                    delResult += await invoke('secure_delete_source_files', { paths: res.files }) + '\n';
+                                }
+                                for (const f of (res.folders || [])) {
+                                    delResult += await invoke('secure_delete_source_folder', { folder: f }) + '\n';
+                                }
+                                setStatus(delResult.trim());
+                            } catch (e) {
+                                showError('安全删除失败: ' + String(e));
+                            }
+                        }
+                    }
+                    setStatus(res.summary || '拖放导入完成');
+                } else {
+                    // cancel / leave
+                    fileList.classList.remove('drag-over');
+                }
+            } catch (e) {
+                fileList.classList.remove('drag-over');
+                setStatus('拖放导入失败');
+                showError(String(e));
+                await listFolder(state.currentFolder);
+            }
+        });
+    }
 }
 
 // ───────────────── 启动 ─────────────────

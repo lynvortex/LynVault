@@ -13,6 +13,7 @@ fn main() {
             commands::list_folder,
             commands::import_file,
             commands::import_folder,
+            commands::import_dropped_paths,
             commands::extract_file,
             commands::extract_files,
             commands::delete_files,

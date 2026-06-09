@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::State;
 use vault_core::Vault;
+use zeroize::Zeroize;
 
 /// 全局状态：保险柜实例 + 认证频率限制
 pub struct AppState {
@@ -45,7 +46,7 @@ fn catch<R, F: FnOnce() -> Result<R, String>>(label: &str, f: F) -> Result<R, St
                 format!("{:?}", e)
             };
             eprintln!("[LynVault] PANIC in {}: {}", label, msg);
-            Err(format!("操作失败 ({})", label))
+            Err(format!("内部错误 ({}): {}", label, msg))
         }
     }
 }
@@ -56,7 +57,7 @@ fn catch<R, F: FnOnce() -> Result<R, String>>(label: &str, f: F) -> Result<R, St
 pub fn create_vault(
     state: State<AppState>,
     path: String,
-    password: String,
+    mut password: String,
     key_file_path: Option<String>,
 ) -> Result<String, String> {
     catch("create_vault", || {
@@ -71,6 +72,8 @@ pub fn create_vault(
         if let Some(kd) = key_data {
             vault_core::wipe::secure_wipe_vec(kd);
         }
+        // 零化密码堆内存
+        password.as_mut_str().zeroize();
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         *guard = Some(vault);
         Ok("保险柜创建成功".into())
@@ -81,7 +84,7 @@ pub fn create_vault(
 pub fn open_vault(
     state: State<AppState>,
     path: String,
-    password: String,
+    mut password: String,
     key_file_path: Option<String>,
 ) -> Result<usize, String> {
     catch("open_vault", || {
@@ -93,6 +96,7 @@ pub fn open_vault(
         if let Some(kd) = key_data {
             vault_core::wipe::secure_wipe_vec(kd);
         }
+        password.as_mut_str().zeroize();
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         *guard = Some(vault);
         Ok(idx)
@@ -163,7 +167,13 @@ pub fn import_file(state: State<AppState>, src_path: String, dest_vpath: String)
     catch("import_file", || {
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        vault.import_file(Path::new(&src_path), &dest_vpath).map_err(|e| e.to_string())
+        let src = Path::new(&src_path);
+        // 由文件名 + 目标目录构造完整虚拟路径，使文件放入当前浏览的目录
+        let filename = src.file_name()
+            .ok_or_else(|| "无法获取文件名".to_string())?
+            .to_string_lossy().to_string();
+        let full_vpath = format!("{}/{}", dest_vpath.trim_end_matches('/'), filename);
+        vault.import_file(src, &full_vpath).map_err(|e| e.to_string())
     })
 }
 
@@ -173,6 +183,67 @@ pub fn import_folder(state: State<AppState>, src_folder: String, dest_base: Stri
         let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         vault.import_folder(Path::new(&src_folder), &dest_base).map_err(|e| e.to_string())
+    })
+}
+
+/// 拖放导入：自动判断路径是文件还是文件夹，批量导入到 dest_base 下
+/// 返回 JSON：{ summary, files:[], folders:[] } 供前端提示安全删除源文件
+#[tauri::command]
+pub fn import_dropped_paths(
+    state: State<AppState>,
+    paths: Vec<String>,
+    dest_base: String,
+) -> Result<String, String> {
+    catch("import_dropped_paths", || {
+        let mut guard = state.vault.lock().map_err(|e| e.to_string())?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+
+        let mut imported_files: Vec<String> = Vec::new();
+        let mut imported_folders: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for p in &paths {
+            let path = std::path::Path::new(p);
+            if path.is_dir() {
+                match vault.import_folder(path, &dest_base) {
+                    Ok(_) => imported_folders.push(p.clone()),
+                    Err(e) => errors.push(format!("文件夹 '{}': {}", p, e)),
+                }
+            } else if path.is_file() {
+                let filename = path.file_name()
+                    .unwrap_or_default().to_string_lossy().to_string();
+                let full_vpath = format!("{}/{}", dest_base.trim_end_matches('/'), filename);
+                match vault.import_file(path, &full_vpath) {
+                    Ok(_) => imported_files.push(p.clone()),
+                    Err(e) => errors.push(format!("文件 '{}': {}", p, e)),
+                }
+            } else {
+                errors.push(format!("跳过 '{}': 不是有效文件或目录", p));
+            }
+        }
+
+        let mut parts = Vec::new();
+        if !imported_files.is_empty() { parts.push(format!("{} 个文件", imported_files.len())); }
+        if !imported_folders.is_empty() { parts.push(format!("{} 个文件夹", imported_folders.len())); }
+        let summary = if parts.is_empty() { "未导入任何内容".into() }
+                      else { format!("拖放导入完成：{}", parts.join("，")) };
+
+        let result = serde_json::json!({
+            "summary": summary,
+            "files": imported_files,
+            "folders": imported_folders,
+        });
+
+        if !errors.is_empty() {
+            let mut full = result.clone();
+            full["errors"] = serde_json::json!(errors);
+            full["summary"] = serde_json::json!(
+                format!("{}\n以下项目导入失败：\n{}", summary, errors.join("\n"))
+            );
+            Ok(full.to_string())
+        } else {
+            Ok(result.to_string())
+        }
     })
 }
 
@@ -274,7 +345,7 @@ pub fn rename_item(state: State<AppState>, old_vpath: String, new_name: String, 
 // ───────────────── 分区管理 ─────────────────
 
 #[tauri::command]
-pub fn add_partition(state: State<AppState>, alias: String, password: String, key_file_path: Option<String>) -> Result<(), String> {
+pub fn add_partition(state: State<AppState>, alias: String, mut password: String, key_file_path: Option<String>) -> Result<(), String> {
     catch("add_partition", || {
         // 分区别名校验：只允许安全字符，防止 XSS
         if !alias.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ') {
@@ -290,6 +361,7 @@ pub fn add_partition(state: State<AppState>, alias: String, password: String, ke
         if let Some(kd) = key_data {
             vault_core::wipe::secure_wipe_vec(kd);
         }
+        password.as_mut_str().zeroize();
         result
     })
 }
@@ -348,6 +420,16 @@ pub fn destroy_vault(state: State<AppState>) -> Result<(), String> {
         let vault_path = guard.as_ref()
             .and_then(|v| v.get_path().map(|p| p.to_path_buf()))
             .ok_or("保险柜未打开或路径不可用")?;
+        // 在释放 guard 前先打开文件，缩小 TOCTOU 窗口
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _fd = std::fs::OpenOptions::new().write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&vault_path)
+                .map_err(|_| "目标文件已被符号链接替换")?;
+            drop(_fd);
+        }
         *guard = None;
         vault_core::wipe::dod_erase(&vault_path, None).map_err(|e| e.to_string())?;
         Ok(())

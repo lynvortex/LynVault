@@ -1,4 +1,4 @@
-# LynVault 2.1.1
+# LynVault 2.2.1
 
 抗取证加密保险柜 — 基于 Tauri + Rust 的桌面端加密文件管理系统。
 
@@ -98,7 +98,7 @@
 ## 项目结构
 
 ```
-LynVault 2.1.1/
+LynVault 2.2.1/
 ├── Cargo.toml                 # Workspace 根配置
 ├── Cargo.lock
 ├── src-tauri/                 # Tauri 桌面应用
@@ -221,4 +221,4 @@ cargo tauri build
 - Rust 工具链 (rustup)
 - Tauri 系统依赖：[tauri.app/start/#prerequisites](https://tauri.app/start/#prerequisites)
 - Windows：WebView2 Runtime（Win 10 1803+ 通常已预装）
-- 构建产物：`src-tauri/target/release/LynVault 2.1.1.exe`
+- 构建产物：`src-tauri/target/release/LynVault 2.2.1.exe`

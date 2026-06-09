@@ -10,6 +10,7 @@
 use std::io::{self, Cursor, Read};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use calamine::Reader as CalReader;
 
 // ───────────────── 公共接口 ─────────────────
 
@@ -68,34 +69,61 @@ fn is_ole_compound(data: &[u8]) -> bool {
 // ───────────────── DOC 提取（旧版 Word OLE） ─────────────────
 
 /// 从 OLE 复合文档中提取 .doc 文本
-/// 策略：扫描 UTF-16LE 编码的文本段（Word 内部存储格式）
+///
+/// 先用 `cfb` crate 解析 OLE 结构，读取 "WordDocument" stream，
+/// 再从此 stream 中扫描 UTF-16LE 文本（而非扫描全量文件，大幅降低误报）
 fn extract_doc_text(data: &[u8]) -> io::Result<String> {
+    use cfb::CompoundFile;
+
+    let cursor = Cursor::new(data);
+
+    // 打开 OLE 复合文档（F: Read + Seek）
+    let mut cfb = CompoundFile::open(cursor)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("OLE 解析失败: {}", e)))?;
+
+    // 读取 WordDocument stream（.doc 文件的主文档流，路径以 '/' 开头）
+    let mut stream_data = Vec::new();
+    {
+        let mut stream = cfb.open_stream("/WordDocument")
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound,
+                "未找到 WordDocument stream（可能不是有效的 .doc 文件）"))?;
+        stream.read_to_end(&mut stream_data)?;
+    }
+
+    if stream_data.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "WordDocument stream 为空"));
+    }
+
+    // 从 FIB（File Information Block）之后开始扫描
+    // FIB 通常占据前 1024-2048 字节，文本从 offset 0x0400 附近开始
+    let scan_start = if stream_data.len() > 0x0800 { 0x0400 } else { 0 };
+    let scan_end = stream_data.len() - (stream_data.len() % 2);
+
     let mut texts = Vec::new();
     let mut current = String::new();
-    let mut i = 0;
 
-    // 扫描 UTF-16LE 文本序列
-    while i + 1 < data.len() {
-        let lo = data[i];
-        let hi = data[i + 1];
+    let mut i = scan_start;
+    while i + 1 < scan_end {
+        let lo = stream_data[i];
+        let hi = stream_data[i + 1];
         let ch = u16::from_le_bytes([lo, hi]);
 
         if is_word_text_char(ch) {
             current.push(char::from_u32(ch as u32).unwrap_or('?'));
-        } else {
-            if current.len() >= 4 {
-                // 至少 4 个字符才算有效文本段
-                let trimmed = current.trim();
-                if !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphabetic()) {
-                    texts.push(trimmed.to_string());
-                }
+        } else if current.len() >= 4 {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphabetic()) {
+                texts.push(trimmed.to_string());
             }
+            current.clear();
+        } else {
             current.clear();
         }
         i += 2;
     }
 
-    // 别忘了最后一段
+    // 处理最后一段
     if current.len() >= 4 {
         let trimmed = current.trim();
         if !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphabetic()) {
@@ -137,16 +165,15 @@ fn is_word_text_char(ch: u16) -> bool {
     }
 }
 
-// ───────────────── XLS OLE 提取 ─────────────────
+// ───────────────── XLS / XLSX 通用提取 ─────────────────
 
-/// 从 OLE 复合文档中提取 .xls 文本（旧版 Excel）
-fn extract_xls_ole_text(data: &[u8]) -> io::Result<String> {
-    use calamine::{Reader as CalReader, Xls};
-
-    let cursor = Cursor::new(data);
-    let mut workbook: Xls<Cursor<&[u8]>> = Xls::new(cursor)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+/// 通用 calamine 工作表提取（消除 Xlsx 和 Xls 的重复逻辑）
+fn extract_calamine_sheets<R, RS>(workbook: &mut R) -> io::Result<String>
+where
+    R: calamine::Reader<RS>,
+    RS: std::io::Read + std::io::Seek,
+    R::Error: std::fmt::Display,
+{
     let mut output = Vec::new();
 
     for sheet_name in workbook.sheet_names().to_owned() {
@@ -170,6 +197,15 @@ fn extract_xls_ole_text(data: &[u8]) -> io::Result<String> {
     }
 
     Ok(output.join("\n"))
+}
+
+/// 从 OLE 复合文档中提取 .xls 文本（旧版 Excel）
+fn extract_xls_ole_text(data: &[u8]) -> io::Result<String> {
+    use calamine::Xls;
+    let cursor = Cursor::new(data);
+    let mut workbook: Xls<Cursor<&[u8]>> = Xls::new(cursor)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    extract_calamine_sheets(&mut workbook)
 }
 
 // ───────────────── DOCX 提取 ─────────────────
@@ -248,35 +284,11 @@ fn parse_docx_xml(xml: &str) -> io::Result<String> {
 // ───────────────── XLSX 提取 ─────────────────
 
 fn extract_xlsx_text(data: &[u8]) -> io::Result<String> {
-    use calamine::{Reader as CalReader, Xlsx};
-
+    use calamine::Xlsx;
     let cursor = Cursor::new(data);
     let mut workbook: Xlsx<Cursor<&[u8]>> = Xlsx::new(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let mut output = Vec::new();
-
-    for sheet_name in workbook.sheet_names().to_owned() {
-        output.push(format!("── {} ──", sheet_name));
-
-        match workbook.worksheet_range(&sheet_name) {
-            Ok(range) => {
-                for row in range.rows() {
-                    let cells: Vec<String> = row.iter().map(cell_to_string).collect();
-                    let line = cells.join("\t");
-                    if !line.trim().is_empty() {
-                        output.push(line);
-                    }
-                }
-            }
-            Err(e) => {
-                output.push(format!("[读取错误: {}]", e));
-            }
-        }
-        output.push(String::new());
-    }
-
-    Ok(output.join("\n"))
+    extract_calamine_sheets(&mut workbook)
 }
 
 fn cell_to_string(cell: &calamine::Data) -> String {
