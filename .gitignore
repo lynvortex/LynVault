@@ -1,0 +1,23 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# Tauri 构建产物
+src-tauri/target/
+
+# OS / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 打包产物 / 临时文件
+*.zip
+*.tar.gz
+lynvault-fixed*
+
+# 调试探针 / 临时目录（勿提交）
+.probe/
+
+# 注意：vendor/wry 是打补丁的源码（禁用 WebView2 原生右键菜单），必须提交，勿忽略

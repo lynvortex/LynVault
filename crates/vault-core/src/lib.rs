@@ -12,6 +12,6 @@ pub mod wipe;
 pub mod office;
 pub mod error;
 
-pub use vault::{Vault, PartitionInfo};
+pub use vault::{Vault, PartitionInfo, is_vault_file, VAULT_MAGIC};
 pub use index::{Index, FileMeta};
 pub use error::VaultError;

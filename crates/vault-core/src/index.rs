@@ -29,9 +29,77 @@ impl Index {
         }
     }
 
-    /// 验证虚拟路径是否安全
+    /// 验证虚拟路径是否安全。
+    ///
+    /// 规则（M5 修复）：
+    /// - 必须以 '/' 开头
+    /// - 禁止 '..' 段（防止路径遍历）
+    /// - 禁止反斜杠
+    /// - 禁止空字节 / 控制字符
+    /// - 不允许连续 '/'，不允许以 '/' 结尾（根 '/' 除外）
+    /// - 每段不允许为空
     pub fn validate_vpath(vpath: &str) -> bool {
-        vpath.starts_with('/') && !vpath.contains("..") && !vpath.contains('\\')
+        if !vpath.starts_with('/') {
+            return false;
+        }
+        if vpath == "/" {
+            return true;
+        }
+        if vpath.contains('\\') || vpath.contains('\0') {
+            return false;
+        }
+        if vpath.ends_with('/') {
+            return false;
+        }
+        // 拆段检查。注意："/foo".split('/') 会产生 ["", "foo"]，
+        // 第一个空段来自开头的 '/'，必须跳过。
+        for seg in vpath.split('/').skip(1) {
+            if seg.is_empty() {
+                // 连续 '/' 产生空段
+                return false;
+            }
+            if seg == "." || seg == ".." {
+                return false;
+            }
+            // 禁止控制字符
+            if seg.chars().any(|c| (c as u32) < 0x20) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 归一化虚拟路径：去掉多余的 '/'、结尾 '/'、'.' 段。
+    /// 不允许 '..' 段（直接返回 None）。
+    pub fn normalize_vpath(vpath: &str) -> Option<String> {
+        if vpath.contains('\\') || vpath.contains('\0') {
+            return None;
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for seg in vpath.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                // 不允许跳出根
+                parts.pop();
+                continue;
+            }
+            if seg.chars().any(|c| (c as u32) < 0x20) {
+                return None;
+            }
+            parts.push(seg);
+        }
+        if parts.is_empty() {
+            return Some("/".to_string());
+        }
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -46,11 +114,16 @@ impl<'a> IndexManager<'a> {
     }
 
     pub fn add_file(&mut self, vpath: &str, name: &str, size: u64, offset: u64, length: u64) -> Result<(), VaultError> {
-        if !Index::validate_vpath(vpath) {
-            return Err(VaultError::Other("无效的虚拟路径".into()));
-        }
+        let vpath = Index::normalize_vpath(vpath)
+            .filter(|p| Index::validate_vpath(p))
+            .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
         let mut index = self.vault.load_index()?;
-        index.files.insert(vpath.into(), FileMeta {
+        // C5 修复：重名直接覆盖会丢失旧文件元数据（其密文残留无法清理）。
+        // 改为冲突时报错，让调用方决定是覆盖、重命名还是取消。
+        if index.files.contains_key(&vpath) {
+            return Err(VaultError::Other(format!("目标路径已存在: {}", vpath)));
+        }
+        index.files.insert(vpath.clone(), FileMeta {
             name: name.into(),
             size,
             offset,
@@ -82,11 +155,17 @@ impl<'a> IndexManager<'a> {
     }
 
     pub fn add_folder(&mut self, vpath: &str) -> Result<(), VaultError> {
-        if !Index::validate_vpath(vpath) {
-            return Err(VaultError::Other("无效的虚拟路径".into()));
+        let vpath = Index::normalize_vpath(vpath)
+            .filter(|p| Index::validate_vpath(p))
+            .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
+        if vpath == "/" {
+            return Err(VaultError::Other("不能创建根目录".into()));
         }
         let mut index = self.vault.load_index()?;
-        index.folders.insert(vpath.into(), true);
+        if index.folders.contains_key(&vpath) {
+            return Err(VaultError::Other(format!("文件夹已存在: {}", vpath)));
+        }
+        index.folders.insert(vpath.clone(), true);
         if let Some(audit) = &mut self.vault.audit {
             audit.add(&format!("创建文件夹 '{}'", vpath));
         }
@@ -122,12 +201,31 @@ impl<'a> IndexManager<'a> {
     }
 
     pub fn rename_file(&mut self, old_vpath: &str, new_name: &str) -> Result<(), VaultError> {
+        // 校验新文件名
+        if new_name.is_empty()
+            || new_name.contains('/')
+            || new_name.contains('\\')
+            || new_name.contains('\0')
+            || new_name == "."
+            || new_name == ".."
+            || new_name.chars().any(|c| (c as u32) < 0x20)
+        {
+            return Err(VaultError::Other("新文件名非法".into()));
+        }
         let mut index = self.vault.load_index()?;
-        let meta = index.files.remove(old_vpath).ok_or(VaultError::Other("文件不存在".into()))?;
+        let meta = index.files.remove(old_vpath)
+            .ok_or(VaultError::Other("文件不存在".into()))?;
         let parent = old_vpath.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         let new_vpath = format!("{}/{}", parent, new_name);
         if !Index::validate_vpath(&new_vpath) {
+            // 回滚：把元数据放回去
+            index.files.insert(old_vpath.to_string(), meta);
             return Err(VaultError::Other("新路径非法".into()));
+        }
+        // C5 修复：目标已存在时拒绝覆盖
+        if index.files.contains_key(&new_vpath) {
+            index.files.insert(old_vpath.to_string(), meta);
+            return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
         }
         index.files.insert(new_vpath.clone(), FileMeta {
             name: new_name.into(),
@@ -141,6 +239,16 @@ impl<'a> IndexManager<'a> {
     }
 
     pub fn rename_folder(&mut self, old_vpath: &str, new_name: &str) -> Result<(), VaultError> {
+        if new_name.is_empty()
+            || new_name.contains('/')
+            || new_name.contains('\\')
+            || new_name.contains('\0')
+            || new_name == "."
+            || new_name == ".."
+            || new_name.chars().any(|c| (c as u32) < 0x20)
+        {
+            return Err(VaultError::Other("新文件夹名非法".into()));
+        }
         let mut index = self.vault.load_index()?;
         if !index.folders.contains_key(old_vpath) {
             return Err(VaultError::Other("文件夹不存在".into()));
@@ -149,6 +257,10 @@ impl<'a> IndexManager<'a> {
         let new_vpath = format!("{}/{}", parent, new_name);
         if !Index::validate_vpath(&new_vpath) {
             return Err(VaultError::Other("新路径非法".into()));
+        }
+        // C5 修复：目标已存在时拒绝覆盖
+        if index.folders.contains_key(&new_vpath) || index.files.contains_key(&new_vpath) {
+            return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
         }
 
         // 移动所有子文件和子文件夹
@@ -186,5 +298,33 @@ impl<'a> IndexManager<'a> {
         }
         self.vault.save_index(&index)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_vpath() {
+        assert!(Index::validate_vpath("/"));
+        assert!(Index::validate_vpath("/foo"));
+        assert!(Index::validate_vpath("/foo/bar"));
+        assert!(!Index::validate_vpath("foo"));
+        assert!(!Index::validate_vpath("/foo/"));
+        assert!(!Index::validate_vpath("/foo//bar"));
+        assert!(!Index::validate_vpath("/foo/../bar"));
+        assert!(!Index::validate_vpath("/foo\\bar"));
+        assert!(!Index::validate_vpath("/foo\0bar"));
+    }
+
+    #[test]
+    fn test_normalize_vpath() {
+        assert_eq!(Index::normalize_vpath("/foo/bar").as_deref(), Some("/foo/bar"));
+        assert_eq!(Index::normalize_vpath("/foo//bar").as_deref(), Some("/foo/bar"));
+        assert_eq!(Index::normalize_vpath("/foo/./bar").as_deref(), Some("/foo/bar"));
+        assert_eq!(Index::normalize_vpath("/foo/bar/").as_deref(), Some("/foo/bar"));
+        assert_eq!(Index::normalize_vpath("/").as_deref(), Some("/"));
+        assert_eq!(Index::normalize_vpath("///").as_deref(), Some("/"));
     }
 }

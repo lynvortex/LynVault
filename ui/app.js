@@ -58,9 +58,9 @@ const $ = id => document.getElementById(id);
 // ───────────────── 工具函数 ─────────────────
 function toggleUI(open) {
     state.vaultOpen = open;
+    // 2.3.0：查看/提取/删除/新建文件夹已移入右键菜单，不再占用工具栏
     const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
-        'btn-import-folder', 'btn-extract', 'btn-delete', 'btn-new-folder',
-        'btn-view', 'btn-audit', 'btn-defrag', 'btn-destroy'];
+        'btn-import-folder', 'btn-extract-all', 'btn-audit', 'btn-defrag', 'btn-destroy'];
     ids.forEach(id => { const el = $(id); if (el) el.disabled = !open; });
     $('btn-create').disabled = open;
     $('btn-open').disabled = open;
@@ -101,9 +101,62 @@ function getIcon(name, isFolder) {
     return map[ext] || '📄';
 }
 
+// 扩展名 → 系统图标 data URL 缓存（对齐 1.3.4 QFileIconProvider）
+// 仅 Windows 后端返回非空 data URL；其他平台返回空串 → fallback 到 emoji
+const _sysIconCache = new Map();       // ext -> dataUrl | ''
+const _sysIconPending = new Map();     // ext -> Promise
+
+async function getSysIconDataUrl(name) {
+    if (!invoke) return '';
+    const dot = name.lastIndexOf('.');
+    if (dot < 0) return '';
+    const ext = name.slice(dot + 1).toLowerCase();
+    if (!ext || ext.length > 32) return '';
+
+    if (_sysIconCache.has(ext)) return _sysIconCache.get(ext);
+    if (_sysIconPending.has(ext)) return _sysIconPending.get(ext);
+
+    const p = (async () => {
+        try {
+            const dataUrl = await invoke('get_file_icon', { ext });
+            const v = typeof dataUrl === 'string' ? dataUrl : '';
+            _sysIconCache.set(ext, v);
+            return v;
+        } catch (e) {
+            _sysIconCache.set(ext, '');
+            return '';
+        } finally {
+            _sysIconPending.delete(ext);
+        }
+    })();
+    _sysIconPending.set(ext, p);
+    return p;
+}
+
+// 给文件项图标元素异步替换为系统图标
+async function applySysIcon(spanEl, name, fallbackEmoji) {
+    spanEl.textContent = fallbackEmoji;
+    try {
+        const url = await getSysIconDataUrl(name);
+        if (url) {
+            spanEl.innerHTML = '';
+            const img = document.createElement('img');
+            img.src = url;
+            img.className = 'fi-sysicon';
+            img.alt = '';
+            spanEl.appendChild(img);
+        }
+    } catch (e) { /* keep emoji */ }
+}
+
 // ───────────────── 模态框 ─────────────────
+
+// N3 修复：支持"不立即关闭对话框"的按钮（用于密码框异步验证后再关闭）
+// Q6 修复：异步 action 执行期间禁用所有按钮，防止重复点击触发多次 invoke
 function showDialog(title, bodyHtml, buttons, wide) {
     const dlg = $('dialog');
+    // M10 修复：打开新对话框前清理上一个对话框的 blob URL，防止内存泄漏
+    cleanupDialogBlobs();
     dlg.style.width = wide ? '80vw' : '';
     dlg.style.maxWidth = wide ? '900px' : '';
     $('dialog-title').textContent = title;
@@ -115,13 +168,53 @@ function showDialog(title, bodyHtml, buttons, wide) {
         btn.textContent = b.text;
         if (b.cls) btn.className = b.cls;
         btn.onclick = () => {
-            if (b.action) b.action();
-            hideDialog();
+            // Q6 修复：异步 action 期间禁用所有按钮，防止重复点击
+            if (b.action) {
+                // N3 修复：如果 action 返回 false 或 Promise<false>，则不关闭对话框
+                // 用于密码错误后保留密码框让用户重试
+                const ret = b.action();
+                if (ret && typeof ret.then === 'function') {
+                    // 异步执行期间禁用按钮
+                    const allBtns = btnContainer.querySelectorAll('button');
+                    allBtns.forEach(x => x.disabled = true);
+                    ret.then(shouldClose => {
+                        if (shouldClose === false) {
+                            // 重试：重新启用按钮
+                            allBtns.forEach(x => x.disabled = false);
+                        } else {
+                            hideDialog();
+                        }
+                    }).catch(() => {
+                        // 异常：重新启用按钮让用户重试
+                        allBtns.forEach(x => x.disabled = false);
+                    });
+                } else if (ret !== false) {
+                    hideDialog();
+                }
+            } else {
+                hideDialog();
+            }
         };
         btnContainer.appendChild(btn);
     });
+    // N9 修复：overlay.onclick 只在启动弹窗未显示时绑定 hideDialog
+    // 启动弹窗显示时点击遮罩不关闭任何东西（保持不可关闭语义）
+    if (!$('startup-dialog').classList.contains('hidden')) {
+        $('overlay').onclick = null;
+    } else {
+        $('overlay').onclick = hideDialog;
+    }
     $('overlay').classList.remove('hidden');
     $('dialog').classList.remove('hidden');
+}
+
+// M10 修复：追踪并释放 blob URL，避免图片预览内存泄漏
+let _activeBlobUrls = [];
+function cleanupDialogBlobs() {
+    for (const url of _activeBlobUrls) {
+        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    }
+    _activeBlobUrls = [];
 }
 
 function hideDialog() {
@@ -132,8 +225,14 @@ function hideDialog() {
     dlg.style.left = '';
     dlg.style.top = '';
     dlg.style.transform = 'translate(-50%, -50%)';
-    $('overlay').classList.add('hidden');
+    // 仅在启动弹窗未显示时才隐藏 overlay
+    // 否则会把启动弹窗的灰色遮罩一起隐藏
+    if ($('startup-dialog').classList.contains('hidden')) {
+        $('overlay').classList.add('hidden');
+    }
     dlg.classList.add('hidden');
+    // M10 修复：关闭对话框时释放 blob URL
+    cleanupDialogBlobs();
 }
 
 // ── 四向拖拽调整大小 ──
@@ -187,16 +286,55 @@ function hideDialog() {
     }
 })();
 
-function showInput(title, label, defaultValue, callback, isPassword) {
+// HTML 转义工具函数（M4 修复：防止 XSS）
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c;
+    });
+}
+
+// 构造属性值（用双引号包裹，转义 & < > "）
+function escapeAttr(s) {
+    return String(s).replace(/[&<>"]/g, function(c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] || c;
+    });
+}
+
+// R1 修复：增加 onCancel 回调。取消按钮显式调用 onCancel，
+// 确保启动弹窗流程的状态标志 (_startupProcessing) 总能被重置。
+// R2 修复：密码错误时调用 onInlineError 而非 showError，
+// 在密码框下方显示错误，不销毁密码输入框 DOM，让用户可重试。
+// Q7 修复：密码错误时清空输入框，避免用户直接点确定又错一次
+function showInput(title, label, defaultValue, callback, isPassword, onCancel) {
     const type = isPassword ? 'password' : 'text';
+    // M4 修复：转义 label 和 defaultValue，防止 XSS
+    // N3 修复：callback 返回 false 时不关闭对话框（密码错误可重试）
     showDialog(title,
-        `<label>${label}</label><input type="${type}" id="dlg-input" value="${defaultValue || ''}">`,
+        `<label>${escapeHtml(label)}</label><input type="${type}" id="dlg-input" value="${escapeAttr(defaultValue || '')}"><div id="dlg-input-error" style="color:#ff6666;font-size:12px;margin-top:4px;min-height:14px;"></div>`,
         [
             { text: '确定', cls: 'btn-ok', action: () => callback($('dlg-input').value) },
-            { text: '取消', cls: 'btn-cancel' }
+            { text: '取消', cls: 'btn-cancel', action: () => { if (onCancel) onCancel(); } }
         ]
     );
     setTimeout(() => { const inp = $('dlg-input'); if (inp) { inp.focus(); inp.select(); } }, 50);
+}
+
+// R2 修复：在密码框内联显示错误，不销毁密码框 DOM
+// Q7 修复：同时清空密码输入框，避免用户直接点确定又错一次
+function showInlineInputError(msg) {
+    const el = $('dlg-input-error');
+    if (el) {
+        el.textContent = msg;
+    } else {
+        // fallback：如果找不到内联错误区域，用原生消息框（不破坏 DOM）
+        try { tauriMessage(String(msg), { title: '错误', type: 'error' }); } catch (e) { /* ignore */ }
+    }
+    // Q7：清空输入框并重新聚焦
+    const inp = $('dlg-input');
+    if (inp) {
+        inp.value = '';
+        inp.focus();
+    }
 }
 
 function showError(msg) {
@@ -206,16 +344,65 @@ function showError(msg) {
     showDialog('错误', pre.outerHTML, [{ text: '确定', cls: 'btn-ok' }]);
 }
 
-// ───────────────── 右键菜单 ─────────────────
-function showCtxMenu(x, y, item) {
+// ───────────────── 右键菜单（2.3.0 起动态构建）─────────────────
+// 文件/文件夹右键：打开/查看、提取（支持多选）、重命名、安全删除（支持多选）
+// 空白区右键：新建文件夹、导入文件、导入文件夹
+function renderCtxMenu(items) {
+    const menu = $('ctx-menu');
+    menu.innerHTML = '';
+    items.forEach(it => {
+        if (it.sep) {
+            const s = document.createElement('div');
+            s.className = 'ctx-sep';
+            menu.appendChild(s);
+        } else {
+            const d = document.createElement('div');
+            d.dataset.act = it.act;
+            d.textContent = it.label;
+            if (it.danger) d.className = 'danger';
+            menu.appendChild(d);
+        }
+    });
+    return menu;
+}
+
+// 显示菜单并防止溢出窗口边缘
+function positionMenu(x, y) {
     const menu = $('ctx-menu');
     menu.classList.remove('hidden');
-    menu.style.left = x + 'px';
-    menu.style.top = y + 'px';
+    const rect = menu.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const mx = Math.max(4, Math.min(x, vw - rect.width - 4));
+    const my = Math.max(4, Math.min(y, vh - rect.height - 4));
+    menu.style.left = mx + 'px';
+    menu.style.top = my + 'px';
+}
+
+function showItemMenu(x, y, item, count) {
+    const isFolder = item.type === 'folder';
+    const items = [
+        { act: 'open', label: isFolder ? '打开文件夹' : '安全查看' },
+        { act: 'extract', label: count > 1 ? `提取（${count} 项）` : '提取' },
+        { act: 'rename', label: '重命名', sep: true },
+        { act: 'delete', label: count > 1 ? `安全删除（${count} 项）` : '安全删除', danger: true },
+    ];
+    const menu = renderCtxMenu(items);
     menu._item = item;
-    // 根据类型调整文案
-    const openItem = menu.querySelector('[data-act="open"]');
-    openItem.textContent = item.type === 'folder' ? '打开文件夹' : '安全查看';
+    menu._context = 'item';
+    positionMenu(x, y);
+}
+
+function showBlankMenu(x, y) {
+    const items = [
+        { act: 'select-all', label: state.selectedItems.length > 0 ? `全选（${state.selectedItems.length} 项已选）` : '全选' },
+        { act: 'new-folder', label: '新建文件夹', sep: true },
+        { act: 'import-file', label: '导入文件' },
+        { act: 'import-folder', label: '导入文件夹' },
+    ];
+    const menu = renderCtxMenu(items);
+    menu._item = null;
+    menu._context = 'blank';
+    positionMenu(x, y);
 }
 
 function hideCtxMenu() {
@@ -234,7 +421,7 @@ function renderList(data) {
             '<path d="M0 0H33L45 12V55H0Z" fill="#a0a0a0"/>' +
             '<path d="M33 0V12H45Z" fill="#828282"/>' +
             '</svg>' +
-            '<span>将文件拖放至此</span>' +
+            '<span>将文件拖放至此（右键可新建文件夹 / 导入）</span>' +
             '</div>';
         return;
     }
@@ -246,10 +433,27 @@ function renderList(data) {
         div.dataset.type = f.type;
         div.dataset.name = f.name;
         const isFolder = f.type === 'folder';
-        div.innerHTML = `<span class="fi-icon">${isFolder ? '📁' : getIcon(f.name, false)}</span><span class="fi-name">${f.name}</span><span class="fi-size">${isFolder ? '-' : formatSize(f.size)}</span>`;
+        const fallbackEmoji = isFolder ? '📁' : getIcon(f.name, false);
+        // 先用 emoji 占位渲染，再异步尝试替换为系统图标
+        div.innerHTML = `<span class="fi-icon"></span><span class="fi-name">${escapeHtml(f.name)}</span><span class="fi-size">${isFolder ? '-' : formatSize(f.size)}</span>`;
+        const iconSpan = div.querySelector('.fi-icon');
+        if (isFolder) {
+            iconSpan.textContent = fallbackEmoji;
+        } else {
+            applySysIcon(iconSpan, f.name, fallbackEmoji);
+        }
         div.onclick = e => selectItem(div, e);
         div.ondblclick = () => isFolder ? navigateTo(f.vpath) : viewFile(f.vpath, f.name);
-        div.oncontextmenu = e => { e.preventDefault(); selectItem(div, e); showCtxMenu(e.clientX, e.clientY, { vpath: f.vpath, type: f.type, name: f.name }); };
+        div.oncontextmenu = e => {
+            e.preventDefault();
+            e.stopPropagation(); // 防止触发空白区菜单
+            // 2.3.0：若该条目已在多选中，保留整组选择（提取/删除作用于全部选中项）；
+            // 否则仅选中该条目
+            if (!div.classList.contains('selected')) {
+                selectItem(div, e);
+            }
+            showItemMenu(e.clientX, e.clientY, { vpath: f.vpath, type: f.type, name: f.name }, state.selectedItems.length);
+        };
         list.appendChild(div);
     });
 }
@@ -268,6 +472,19 @@ function selectItem(el, e) {
     }
     const count = state.selectedItems.length;
     setStatus(count > 0 ? `已选中 ${count} 个项目` : '就绪');
+}
+
+// 2.3.0 新增：全选当前目录下的所有文件/文件夹
+function selectAllItems() {
+    const items = document.querySelectorAll('#file-list .file-item');
+    if (!items.length) return;
+    items.forEach(d => d.classList.add('selected'));
+    state.selectedItems = Array.from(items).map(d => ({
+        vpath: d.dataset.vpath,
+        type: d.dataset.type,
+        name: d.dataset.name,
+    }));
+    setStatus(`已选中 ${state.selectedItems.length} 个项目`);
 }
 
 // ───────────────── 核心操作 ─────────────────
@@ -289,22 +506,22 @@ async function navigateTo(vpath) {
 }
 
 async function createVault() {
-    // 选择保存路径
     const filePath = await tauriSave({
         title: '选择保险柜保存位置',
-        filters: [{ name: 'LynVault', extensions: ['vault'] }],
+        filters: VAULT_FILTERS,
     });
     if (!filePath) return;
-
     showInput('创建保险柜', '输入主密码：', '', async (pwd) => {
-        if (!pwd) return;
+        if (!pwd) return true;
         try {
             await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null });
             toggleUI(true);
             await listFolder('/');
             setStatus('保险柜已创建');
+            return true;
         } catch (e) {
-            showError(String(e));
+            showInlineInputError(String(e));
+            return false; // R2 修复：内联错误，保留密码框重试
         }
     }, true);
 }
@@ -312,19 +529,20 @@ async function createVault() {
 async function openVault() {
     const filePath = await tauriOpen({
         title: '选择保险柜文件',
-        filters: [{ name: 'LynVault', extensions: ['vault'] }],
+        filters: VAULT_OPEN_FILTERS,
     });
     if (!filePath) return;
-
     showInput('打开保险柜', '输入主密码：', '', async (pwd) => {
-        if (!pwd) return;
+        if (!pwd) return true;
         try {
             await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
             toggleUI(true);
             await listFolder('/');
             setStatus('保险柜已打开');
+            return true;
         } catch (e) {
-            showError(String(e));
+            showInlineInputError(String(e));
+            return false; // R2 修复：内联错误，保留密码框重试
         }
     }, true);
 }
@@ -416,16 +634,52 @@ async function extractSelected() {
     }
 }
 
+async function extractAllFiles() {
+    // 提取全部：选择父目录，后端会在其下创建与保险柜同名的子文件夹
+    const dest = await tauriOpen({ title: '选择提取目标父目录（将在此创建以保险柜命名的子文件夹）', directory: true });
+    if (!dest) return;
+
+    // N8 修复：预检目标子文件夹是否已存在，存在时提示用户确认覆盖
+    try {
+        const checkRaw = await invoke('check_extract_all_dest', { destParentFolder: dest });
+        const check = typeof checkRaw === 'string' ? JSON.parse(checkRaw) : checkRaw;
+        if (check && check.exists) {
+            const ok = await tauriAsk(
+                `目标文件夹已存在：\n${check.dest_name}\n\n继续提取将覆盖同名文件。是否继续？`,
+                { title: '确认覆盖', type: 'warning' }
+            );
+            if (!ok) return;
+        }
+    } catch (e) {
+        // 预检失败不阻断流程，继续提取
+        console.warn('check_extract_all_dest 失败:', e);
+    }
+
+    setStatus('正在提取全部文件...');
+    try {
+        const raw = await invoke('extract_all_files', { destParentFolder: dest });
+        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (res.fail > 0) {
+            setStatus(`提取完成：成功 ${res.ok} 个，失败 ${res.fail} 个，输出到 ${res.dest}`);
+        } else {
+            setStatus(`提取完成：共 ${res.ok} 个文件，输出到 ${res.dest}`);
+        }
+    } catch (e) {
+        showError(String(e));
+    }
+}
+
 async function deleteSelected() {
     if (!state.selectedItems.length) return;
     const names = state.selectedItems.map(i => i.name).join('\n');
-    const ok = await tauriAsk(`确认安全删除以下项目？\n\n${names}\n\n此操作不可撤销。`, { title: '确认删除', type: 'warning' });
+    const ok = await tauriAsk(`确认安全删除以下项目？\n\n${names}\n\n此操作不可撤销（DoD 7-pass 擦除）。`, { title: '确认删除', type: 'warning' });
     if (!ok) return;
     try {
         const vpaths = state.selectedItems.map(i => i.vpath);
-        await invoke('delete_files', { vpaths });
+        // N1 修复：delete_files 现在能同时处理文件和文件夹（后端 secure_delete_files_batch 展开）
+        const count = await invoke('delete_files', { vpaths });
         await listFolder(state.currentFolder);
-        setStatus('已安全删除');
+        setStatus(`已安全删除 ${count} 个项目`);
     } catch (e) {
         showError(String(e));
     }
@@ -463,6 +717,7 @@ async function viewFile(vpath, fileName) {
         if (imgExts.includes(ext)) {
             const blob = new Blob([new Uint8Array(data)]);
             const url = URL.createObjectURL(blob);
+            _activeBlobUrls.push(url); // M10 修复：追踪以便关闭时释放
             const zoomId = 'img-zoom-' + Date.now();
             showDialog('🖼️ ' + fileName, `<div style="overflow:auto;max-height:60vh;text-align:center;"><img id="${zoomId}" src="${url}" style="max-width:100%;cursor:zoom-in;transition:transform 0.1s;"></div>`, [{ text: '关闭', cls: 'btn-ok' }], true);
             // 滚轮缩放
@@ -566,7 +821,7 @@ async function removePartition() {
             showDialog('提示', '<p>暂无伪装分区</p>', [{ text: '确定', cls: 'btn-ok' }]);
             return;
         }
-        const options = partitions.map(p => `<option value="${p.alias}">${p.alias}</option>`).join('');
+        const options = partitions.map(p => `<option value="${escapeAttr(p.alias)}">${escapeHtml(p.alias)}</option>`).join('');
         showDialog('删除伪装分区',
             `<label>选择要删除的分区：</label><select id="dlg-part-select">${options}</select>`,
             [
@@ -606,12 +861,7 @@ function bindEvents() {
     $('btn-close').onclick = closeVault;
     $('btn-import-file').onclick = importFiles;
     $('btn-import-folder').onclick = importFolder;
-    $('btn-extract').onclick = extractSelected;
-    $('btn-delete').onclick = deleteSelected;
-    $('btn-new-folder').onclick = newFolder;
-    $('btn-view').onclick = () => {
-        if (state.selectedItems.length) viewFile(state.selectedItems[0].vpath, state.selectedItems[0].name);
-    };
+    $('btn-extract-all').onclick = extractAllFiles;
     $('btn-audit').onclick = showAudit;
     $('btn-defrag').onclick = defragmentVault;
     $('btn-destroy').onclick = destroyVault;
@@ -632,33 +882,64 @@ function bindEvents() {
         }
     };
 
-    // 右键菜单
-    $('ctx-menu').querySelectorAll('[data-act]').forEach(el => {
-        el.onclick = async () => {
-            const act = el.dataset.act;
-            const item = $('ctx-menu')._item;
-            hideCtxMenu();
-            if (!item) return;
-            switch (act) {
-                case 'open':
-                    if (item.type === 'folder') navigateTo(item.vpath);
-                    else viewFile(item.vpath, item.name);
-                    break;
-                case 'view': viewFile(item.vpath, item.name); break;
-                case 'extract':
-                    state.selectedItems = [item];
-                    await extractSelected();
-                    break;
-                case 'rename':
-                    state.selectedItems = [item];
-                    await renameSelected();
-                    break;
-                case 'delete':
-                    state.selectedItems = [item];
-                    await deleteSelected();
-                    break;
-            }
-        };
+    // 右键菜单（2.3.0：委托分发，内容由 showItemMenu/showBlankMenu 动态构建）
+    $('ctx-menu').onclick = async (e) => {
+        const el = e.target.closest('[data-act]');
+        if (!el) return;
+        const act = el.dataset.act;
+        const menu = $('ctx-menu');
+        const item = menu._item;
+        hideCtxMenu();
+        switch (act) {
+            case 'open':
+                if (!item) break;
+                if (item.type === 'folder') navigateTo(item.vpath);
+                else viewFile(item.vpath, item.name);
+                break;
+            case 'extract':
+                // 多选时作用于全部选中项（右键时若该条目已在多选中则保留整组选择）
+                await extractSelected();
+                break;
+            case 'rename':
+                if (!item) break;
+                state.selectedItems = [item]; // 重命名为单项操作
+                await renameSelected();
+                break;
+            case 'delete':
+                // 多选时作用于全部选中项
+                await deleteSelected();
+                break;
+            case 'new-folder':
+                await newFolder();
+                break;
+            case 'import-file':
+                await importFiles();
+                break;
+            case 'import-folder':
+                await importFolder();
+                break;
+            case 'select-all':
+                selectAllItems();
+                break;
+        }
+    };
+
+    // 空白区右键：全选 / 新建文件夹 / 导入（仅保险柜打开时）
+    $('file-list').addEventListener('contextmenu', (e) => {
+        if (!state.vaultOpen) return;
+        if (e.target.closest('.file-item')) return; // 条目右键已由条目自身处理
+        e.preventDefault();
+        showBlankMenu(e.clientX, e.clientY);
+    });
+
+    // 2.3.0 新增：Ctrl+A 全选当前目录（输入框内保持原生全选文本行为）
+    document.addEventListener('keydown', (e) => {
+        if (!state.vaultOpen) return;
+        if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'a') return;
+        const tag = e.target && e.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        e.preventDefault();
+        selectAllItems();
     });
 
     // 全局点击关闭右键菜单
@@ -741,13 +1022,222 @@ function bindEvents() {
     }
 }
 
+// ───────────────── 启动检测弹窗 ─────────────────
+// 弹窗不可关闭，背景窗口变灰。仅在选择打开/新建后才会隐藏。
+
+// N13 修复：过滤器配置提取为常量，避免重复
+const VAULT_FILTERS = [
+    { name: 'LynVault', extensions: ['lyt'] },
+    { name: 'LynVault (旧版)', extensions: ['vault'] },
+];
+const VAULT_OPEN_FILTERS = [
+    { name: 'LynVault', extensions: ['lyt', 'vault'] },
+];
+
+// N10 修复：列表项防重入标志，防止快速双击弹出多个密码框
+let _startupProcessing = false;
+
+function showStartupModal() {
+    document.body.classList.add('has-modal');
+    $('overlay').classList.add('startup-modal');
+    $('overlay').classList.remove('hidden');
+    $('startup-dialog').classList.remove('hidden');
+    // N9 修复：启动弹窗显示时，遮罩不绑定 hideDialog（保持不可关闭）
+    $('overlay').onclick = null;
+    _startupProcessing = false;
+}
+
+function hideStartupModal() {
+    document.body.classList.remove('has-modal');
+    $('overlay').classList.remove('startup-modal');
+    $('overlay').classList.add('hidden');
+    $('startup-dialog').classList.add('hidden');
+    // 恢复 overlay 的正常行为
+    $('overlay').onclick = hideDialog;
+}
+
+function renderStartupList(items) {
+    const list = $('startup-list');
+    list.innerHTML = '';
+    if (!items || items.length === 0) {
+        list.innerHTML = '<div class="sd-empty">当前目录下未发现保险柜文件<br>请选择「新建保险柜」或「打开其他保险柜」</div>';
+        return;
+    }
+    for (const it of items) {
+        const div = document.createElement('div');
+        div.className = 'sd-item';
+        const d = new Date((it.mtime || 0) * 1000);
+        const ts = d.toLocaleString('zh-CN');
+        const sizeStr = formatSize(it.size || 0);
+        // 转义防止 XSS
+        const safeName = escapeHtml(it.name);
+        const safePath = escapeAttr(it.path);
+        div.innerHTML = `<span class="sd-icon">🔒</span>` +
+            `<div class="sd-info">` +
+            `<div class="sd-name" title="${safePath}">${safeName}</div>` +
+            `<div class="sd-meta">${ts} · ${sizeStr}</div>` +
+            `</div>`;
+        div.onclick = () => {
+            // N10 修复：防重入，处理中时忽略后续点击
+            if (_startupProcessing) return;
+            _startupProcessing = true;
+            openVaultFromStartup(it.path);
+        };
+        list.appendChild(div);
+    }
+}
+
+// R1+R2 修复：取消时通过 onCancel 重置 _startupProcessing；
+// 密码错误时用 showInlineInputError 不销毁密码框，让用户重试
+// Q2 修复：onCancel 时若启动弹窗已隐藏（来自 sd-open-other 流程），重新显示
+function openVaultFromStartup(filePath) {
+    if (!filePath) { _startupProcessing = false; return; }
+    showInput('打开保险柜', '输入主密码：', '', async (pwd) => {
+        if (!pwd) {
+            // 空密码点确定，等同于取消
+            _startupProcessing = false;
+            // Q2：若启动弹窗已隐藏（来自 sd-open-other），重新显示
+            if ($('startup-dialog').classList.contains('hidden')) {
+                showStartupModal();
+            }
+            return true;
+        }
+        try {
+            await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
+            hideStartupModal();
+            toggleUI(true);
+            await listFolder('/');
+            setStatus('保险柜已打开');
+            _startupProcessing = false;
+            return true; // 成功，关闭密码框
+        } catch (e) {
+            // R2 修复：内联显示错误，不销毁密码框
+            showInlineInputError(String(e));
+            return false; // 保留密码框让用户重试
+        }
+    }, true, () => {
+        // R1 修复：取消按钮回调，重置状态
+        _startupProcessing = false;
+        // Q2 修复：若启动弹窗已隐藏（来自 sd-open-other 流程），重新显示
+        if ($('startup-dialog').classList.contains('hidden')) {
+            showStartupModal();
+        }
+    });
+}
+
+async function detectAndShowStartup() {
+    // 并行扫描多个候选目录（桌面、文档、下载、主目录）
+    const candidates = ['$DESKTOP', '$DOCUMENT', '$DOWNLOAD', '$HOME'];
+    const results = await Promise.all(candidates.map(c =>
+        invoke('scan_vault_files', { dir: c }).catch(() => [])
+    ));
+    // 合并 + 去重（按 path）
+    const seen = new Set();
+    const found = results.flat().filter(it => {
+        if (!it || !it.path || seen.has(it.path)) return false;
+        seen.add(it.path);
+        return true;
+    });
+    // 按修改时间倒序
+    found.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+
+    renderStartupList(found);
+    showStartupModal();
+}
+
 // ───────────────── 启动 ─────────────────
 window.addEventListener('DOMContentLoaded', () => {
     if (!initTauri()) {
         document.body.innerHTML = '<div style="padding:40px;color:#ff6666">Tauri API 不可用，请确保从 Tauri 启动应用。</div>';
         return;
     }
+    // 2.3.0 修复：窗口由「屏幕短边 75% 正方形」改为横屏 3:2 比例，
+    // 并整体按比例缩小（宽度 ≤ 屏幕 60%，上限 1024；高度 ≤ 屏幕 80%），
+    // 避免在常见 16:9 屏幕上窗口过高过大。
+    try {
+        const w = window.__TAURI__ && window.__TAURI__.window;
+        if (w) {
+            const appWin = w.getCurrent();
+            const LogicalSize = w.LogicalSize;
+            const sw = window.screen.width;
+            const sh = window.screen.height;
+            let width = Math.floor(Math.min(sw * 0.6, 1024));
+            let height = Math.floor(Math.min(width * 0.66, sh * 0.8));
+            if (height < Math.floor(width * 0.66)) {
+                width = Math.floor(height * 1.5); // 高度受限时按 3:2 反推宽度
+            }
+            if (LogicalSize) {
+                appWin.setSize(new LogicalSize(width, height));
+            } else {
+                appWin.setSize({ width, height });
+            }
+            appWin.center();
+        }
+    } catch (e) { /* 非致命：尺寸调整失败不影响功能 */ }
     bindEvents();
     toggleUI(false);
+    // N7 修复：扫描期间禁用新建/打开按钮，防止用户在启动弹窗弹出前操作
+    $('btn-create').disabled = true;
+    $('btn-open').disabled = true;
+
+    // 启动弹窗按钮事件
+    $('sd-create').onclick = async () => {
+        if (_startupProcessing) return;
+        _startupProcessing = true;
+        hideStartupModal();
+        const filePath = await tauriSave({
+            title: '选择保险柜保存位置',
+            filters: VAULT_FILTERS,
+        });
+        if (!filePath) {
+            // 用户取消文件选择，重新显示启动弹窗
+            _startupProcessing = false;
+            showStartupModal();
+            return;
+        }
+        // 进入密码输入流程
+        showInput('创建保险柜', '输入主密码：', '', async (pwd) => {
+            if (!pwd) {
+                _startupProcessing = false;
+                showStartupModal();
+                return true; // 空密码等同于取消，回到启动弹窗
+            }
+            try {
+                await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null });
+                hideStartupModal();
+                toggleUI(true);
+                await listFolder('/');
+                setStatus('保险柜已创建');
+                _startupProcessing = false;
+                return true;
+            } catch (e) {
+                // R2 修复：内联错误，不销毁密码框
+                showInlineInputError(String(e));
+                return false; // 保留密码框重试
+            }
+        }, true, () => {
+            // R1 修复：取消按钮，回到启动弹窗
+            _startupProcessing = false;
+            showStartupModal();
+        });
+    };
+    $('sd-open-other').onclick = async () => {
+        if (_startupProcessing) return;
+        _startupProcessing = true;
+        hideStartupModal();
+        const filePath = await tauriOpen({
+            title: '选择保险柜文件',
+            filters: VAULT_OPEN_FILTERS,
+        });
+        if (!filePath) {
+            _startupProcessing = false;
+            showStartupModal();
+            return;
+        }
+        // 复用 openVaultFromStartup（已处理取消/错误重试逻辑）
+        openVaultFromStartup(filePath);
+    };
+    // 启动检测：扫描附近目录的 .lyt / .vault 文件
+    detectAndShowStartup();
     console.log('[LynVault] UI ready');
 });

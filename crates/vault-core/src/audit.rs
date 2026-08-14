@@ -2,6 +2,7 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use serde::{Serialize, Deserialize};
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const AUDIT_MAX_EVENTS: usize = 10000;
@@ -15,7 +16,8 @@ pub struct AuditEntry {
 
 pub struct AuditLog {
     auth_key: [u8; 32],
-    entries: Vec<AuditEntry>,
+    // 使用 VecDeque 替代 Vec，避免超过上限时的 O(n) 整体前移
+    entries: VecDeque<AuditEntry>,
     chain: [u8; 32],
 }
 
@@ -23,7 +25,7 @@ impl AuditLog {
     pub fn new(auth_key: [u8; 32]) -> Self {
         Self {
             auth_key,
-            entries: Vec::new(),
+            entries: VecDeque::new(),
             chain: [0u8; 32],
         }
     }
@@ -31,7 +33,7 @@ impl AuditLog {
     pub fn add(&mut self, event: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs_f64();
 
         let prev = if self.entries.is_empty() {
@@ -47,19 +49,20 @@ impl AuditLog {
         let new_hmac = mac.finalize().into_bytes();
         self.chain = new_hmac.into();
 
-        self.entries.push(AuditEntry {
+        self.entries.push_back(AuditEntry {
             ts: now,
             event: event.to_string(),
             hmac: hex::encode(&self.chain[..]),
         });
 
-        if self.entries.len() > AUDIT_MAX_EVENTS {
-            self.entries.remove(0);
+        // VecDeque::pop_front 是 O(1)，避免旧实现的 O(n) 整体前移
+        while self.entries.len() > AUDIT_MAX_EVENTS {
+            self.entries.pop_front();
         }
     }
 
     pub fn to_vec(&self) -> Vec<AuditEntry> {
-        self.entries.clone()
+        self.entries.iter().cloned().collect()
     }
 
     /// 从持久化条目恢复审计日志（逐条验证链的完整性，篡改的条目将被丢弃）
@@ -76,9 +79,11 @@ impl AuditLog {
             if entry_hmac.len() == 32 {
                 let mut entry_bytes = [0u8; 32];
                 entry_bytes.copy_from_slice(&entry_hmac);
-                if expected.as_slice() == entry_bytes {
+                // 恒定时间比较，防止计时侧信道
+                use subtle::ConstantTimeEq;
+                if expected.as_slice().ct_eq(&entry_bytes).into() {
                     chain = entry_bytes;
-                    log.entries.push(entry.clone());
+                    log.entries.push_back(entry.clone());
                 } else {
                     break;
                 }

@@ -14,6 +14,31 @@ use calamine::Reader as CalReader;
 
 // ───────────────── 公共接口 ─────────────────
 
+/// 预览文本总量上限（64 MiB）。2.3.0 修复：docx/pptx 是 ZIP 容器，
+/// 恶意构造的「压缩炸弹」解压后可占用巨量内存导致 OOM，此处对每个条目、
+/// 条目数量与最终文本总量统一设限。
+const MAX_OFFICE_TEXT: usize = 64 * 1024 * 1024;
+
+/// 从 ZIP 归档中读取单个条目，限制解压后大小（防压缩炸弹）。
+fn read_zip_entry_limited<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> io::Result<Vec<u8>> {
+    let f = archive.by_name(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, format!("{} 不存在", name)))?;
+    if f.size() > MAX_OFFICE_TEXT as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("条目 '{}' 解压尺寸超过预览上限（可能为压缩炸弹）", name)));
+    }
+    let mut buf = Vec::with_capacity(f.size() as usize);
+    f.take((MAX_OFFICE_TEXT as u64) + 1).read_to_end(&mut buf)?;
+    if buf.len() > MAX_OFFICE_TEXT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("条目 '{}' 解压后超过预览上限", name)));
+    }
+    Ok(buf)
+}
+
 /// 自动检测格式并提取 Office 文档文本
 pub fn extract_office_text(data: &[u8], filename: &str) -> Result<String, String> {
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -81,18 +106,22 @@ fn extract_doc_text(data: &[u8]) -> io::Result<String> {
     let mut cfb = CompoundFile::open(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("OLE 解析失败: {}", e)))?;
 
-    // 读取 WordDocument stream（.doc 文件的主文档流，路径以 '/' 开头）
+    // 读取 WordDocument stream（.doc 文件的主文档流，路径以 '/' 开头），限制大小防异常
     let mut stream_data = Vec::new();
     {
-        let mut stream = cfb.open_stream("/WordDocument")
+        let stream = cfb.open_stream("/WordDocument")
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound,
                 "未找到 WordDocument stream（可能不是有效的 .doc 文件）"))?;
-        stream.read_to_end(&mut stream_data)?;
+        stream.take((MAX_OFFICE_TEXT as u64) + 1).read_to_end(&mut stream_data)?;
     }
 
     if stream_data.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
             "WordDocument stream 为空"));
+    }
+    if stream_data.len() > MAX_OFFICE_TEXT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "WordDocument stream 超过预览上限"));
     }
 
     // 从 FIB（File Information Block）之后开始扫描
@@ -175,6 +204,7 @@ where
     R::Error: std::fmt::Display,
 {
     let mut output = Vec::new();
+    let mut total = 0usize;
 
     for sheet_name in workbook.sheet_names().to_owned() {
         output.push(format!("── {} ──", sheet_name));
@@ -185,6 +215,12 @@ where
                     let cells: Vec<String> = row.iter().map(cell_to_string).collect();
                     let line = cells.join("\t");
                     if !line.trim().is_empty() {
+                        // 2.3.0 修复：限制预览文本总量，防止超大数据集拖垮内存
+                        total += line.len() + 1;
+                        if total > MAX_OFFICE_TEXT {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                "表格内容超过预览上限（64 MiB）"));
+                        }
                         output.push(line);
                     }
                 }
@@ -215,11 +251,8 @@ fn extract_docx_text(data: &[u8]) -> io::Result<String> {
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let mut file = archive.by_name("word/document.xml")
-        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "word/document.xml not found"))?;
-
-    let mut xml = String::new();
-    file.read_to_string(&mut xml)?;
+    let xml = read_zip_entry_limited(&mut archive, "word/document.xml")?;
+    let xml = String::from_utf8_lossy(&xml);
 
     parse_docx_xml(&xml)
 }
@@ -318,20 +351,28 @@ fn extract_pptx_text(data: &[u8]) -> io::Result<String> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut slides_text = Vec::new();
+    let mut total_size = 0usize;
 
     let file_names: Vec<String> = archive.file_names()
         .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
         .map(|n| n.to_string())
         .collect();
 
+    // 2.3.0 修复：限制幻灯片数量，防止恶意 pptx 携带海量幻灯片拖垮内存
+    if file_names.len() > 1000 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "幻灯片数量过多（超过 1000 张），已拒绝预览"));
+    }
+
     let mut slide_files = Vec::new();
     for name in &file_names {
-        if let Ok(mut f) = archive.by_name(name) {
-            let mut xml = String::new();
-            if f.read_to_string(&mut xml).is_ok() {
-                slide_files.push(xml);
-            }
+        let xml = read_zip_entry_limited(&mut archive, name)?;
+        total_size += xml.len();
+        if total_size > MAX_OFFICE_TEXT {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "演示文稿解压总量超过预览上限（可能为压缩炸弹）"));
         }
+        slide_files.push(String::from_utf8_lossy(&xml).to_string());
     }
 
     for (i, xml) in slide_files.iter().enumerate() {
@@ -373,9 +414,7 @@ fn parse_pptx_xml(xml: &str) -> io::Result<String> {
                 let name = e.name();
                 let local = name.as_ref();
                 if local == b"a:p" {
-                    if !current_text.trim().is_empty() {
-                        texts.push(current_text.trim().to_string());
-                    }
+                    // S5 修复：移除 Start 时的重复 push（End 已处理），仅重置状态
                     current_text.clear();
                     in_text = true;
                 }
@@ -422,6 +461,11 @@ fn parse_pptx_xml(xml: &str) -> io::Result<String> {
 // ───────────────── CSV 提取 ─────────────────
 
 fn extract_csv_text(data: &[u8]) -> io::Result<String> {
+    // 2.3.0 修复：限制 CSV 预览大小，防止超大文件整串进 UI 拖垮内存
+    if data.len() > MAX_OFFICE_TEXT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "CSV 文件超过预览上限（64 MiB），请提取后查看"));
+    }
     let text = std::str::from_utf8(data)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8"))?;
     Ok(text.to_string())

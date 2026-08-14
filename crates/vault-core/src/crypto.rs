@@ -17,15 +17,70 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::VaultError;
 
-/// 从保险柜 salt 派生锁定 HMAC 密钥（不存储在头部）
-pub fn derive_lock_key(salt: &[u8; 32]) -> [u8; 32] {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(salt);
-    hasher.update(b"pyvault-lock-key-v2");
-    let result = hasher.finalize();
+/// 锁定区 MAC 密钥（公开派生，与密码无关）。
+///
+/// 2.3.0 修复（关键）：旧实现用「密码 + 密钥文件」经 Argon2id 派生锁定密钥，
+/// 导致两个致命问题：
+/// 1. 任何错误密码都过不了锁定区 HMAC 校验，`record_failure` 永远不会执行，
+///    防暴力破解锁定（5 次错误锁 30 分钟）形同虚设；
+/// 2. 锁定区只认主密码，诱饵分区（独立密码）永远无法打开。
+///
+/// 现改为从 salt 独立派生的公开密钥（HKDF-SHA256，无需密码）：
+/// - 任意一次打开尝试（无论密码对错）都能校验锁定区，错误密码会真正递增
+///   `lock_count` 并触发锁定；
+/// - 任何分区的合法密码都能打开保险柜并重置锁定；
+/// - 局限（已文档化）：拥有文件写权限的攻击者可伪造「未锁定」记录，这与
+///   其直接破坏文件的能力同级；离线复制文件暴力破解不受锁定影响（所有密码库皆然）。
+pub fn derive_lock_mac_key(salt: &[u8; 32]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(None, salt);
     let mut key = [0u8; 32];
-    key.copy_from_slice(&result);
+    hkdf.expand(b"lynvault-lock-mac-v4", &mut key)
+        .expect("HKDF expand 失败");
+    key
+}
+
+/// 旧版（<2.3.0）锁定密钥派生 —— 仅用于打开旧保险柜时校验锁定区并自动迁移。
+///
+/// 保留旧的 `password + key_file` 裸拼接格式（无长度前缀）以兼容旧文件格式，
+/// 该拼接歧义是旧格式的固有缺陷，不能在此修复（会破坏旧文件兼容性）；
+/// 新保险柜一律使用 `derive_lock_mac_key`，不涉及密码拼接。
+pub fn derive_legacy_lock_key(
+    salt: &[u8; 32],
+    password: &str,
+    key_file_data: Option<&[u8]>,
+) -> [u8; 32] {
+    // 复刻旧实现：先对 salt 做域分离异或，再 Argon2id + HKDF-SHA256。
+    // 任何一步与旧版不同都会导致旧保险柜锁定区校验失败。
+    let mut lock_salt = [0u8; 32];
+    lock_salt.copy_from_slice(salt);
+    const DOMAIN_SEP: [u8; 32] = *b"LYNVAULT-LOCK-DOMAIN-SEP-V3-----";
+    for i in 0..32 {
+        lock_salt[i] ^= DOMAIN_SEP[i];
+    }
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(password.as_bytes());
+    if let Some(kf) = key_file_data {
+        combined.extend_from_slice(kf);
+    }
+
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .expect("Argon2 参数合法");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut master = [0u8; 32];
+    argon2
+        .hash_password_into(&combined, &lock_salt, &mut master)
+        .expect("Argon2id 派生 legacy lock_key 失败");
+
+    let hkdf = Hkdf::<Sha256>::new(None, &master);
+    let mut key = [0u8; 32];
+    hkdf.expand(b"pyvault4-lock-key-v3", &mut key)
+        .expect("HKDF expand 失败");
+
+    combined.zeroize();
+    master.zeroize();
+    lock_salt.zeroize();
     key
 }
 
@@ -43,15 +98,26 @@ const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
 
 /// 从主密码 + 可选密钥文件 + 盐 派生出三个密钥（Argon2id → HKDF-SHA512）
+///
+/// 安全性：使用长度前缀 + 分隔符避免拼接歧义。
+/// 旧实现 `password + key_file` 会让 `("abc","def")` 与 `("abcd","ef")` 派生相同密钥。
+/// 现在格式为：`u64_le(password_len) || password || u64_le(keyfile_len) || key_file`，
+/// 任意一方长度变化都会改变前缀字节，从根本上消除歧义。
 pub fn derive_keys(
     password: &str,
     key_file_data: Option<&[u8]>,
     salt: &[u8],
 ) -> Result<KeyMaterial, VaultError> {
-    let mut combined = Vec::new();
-    combined.extend_from_slice(password.as_bytes());
+    let pwd_bytes = password.as_bytes();
+    let mut combined = Vec::with_capacity(8 + pwd_bytes.len() + 8);
+    // 长度前缀（小端 u64），消除拼接歧义
+    combined.extend_from_slice(&(pwd_bytes.len() as u64).to_le_bytes());
+    combined.extend_from_slice(pwd_bytes);
     if let Some(kf) = key_file_data {
+        combined.extend_from_slice(&(kf.len() as u64).to_le_bytes());
         combined.extend_from_slice(kf);
+    } else {
+        combined.extend_from_slice(&0u64.to_le_bytes());
     }
 
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))

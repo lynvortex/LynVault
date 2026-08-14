@@ -32,6 +32,10 @@ fn main() {
 
             commands::secure_delete_source_files,
             commands::secure_delete_source_folder,
+            commands::scan_vault_files,
+            commands::check_extract_all_dest,
+            commands::extract_all_files,
+            commands::get_file_icon,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

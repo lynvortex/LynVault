@@ -1,17 +1,40 @@
 [package]
 name = "lynvault-rs"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2021"
+
+# 构建产物文件名：LynVault.exe（默认取包名 lynvault-rs）
+[[bin]]
+name = "LynVault"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = ["dialog", "dialog-all"] }
+tauri = { version = "1", features = [
+    "dialog", "dialog-all",
+    "window-center",
+    "window-set-resizable",
+    "window-set-size",
+    "window-set-title",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 vault-core = { path = "../crates/vault-core" }
 zeroize = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Windows 系统图标读取（仅 Windows 编译）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.57", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
 
 [features]
 default = [ "custom-protocol" ]
