@@ -6,6 +6,5 @@ members = [
     "src-tauri",
 ]
 
-# LynVault 补丁：禁用 WebView2 原生右键菜单（详见 vendor/wry 内注释）
-[patch.crates-io]
-wry = { path = "vendor/wry" }
+# wry uses the crates.io release required by Tauri 1.
+# The former local vendor/wry patch was not included in this repository.

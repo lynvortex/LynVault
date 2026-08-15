@@ -15,9 +15,19 @@ Thumbs.db
 # 打包产物 / 临时文件
 *.zip
 *.tar.gz
+*.msi
+*.msix
+*.msixbundle
+*.exe
 lynvault-fixed*
+
+# 本地保险柜与碎片整理临时文件
+*.lyt
+*.vault
+*.lyt.tmp.*
+*.vault.tmp.*
+*.lyt.bak.*
+*.vault.bak.*
 
 # 调试探针 / 临时目录（勿提交）
 .probe/
-
-# 注意：vendor/wry 是打补丁的源码（禁用 WebView2 原生右键菜单），必须提交，勿忽略

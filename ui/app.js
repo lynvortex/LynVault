@@ -60,7 +60,7 @@ function toggleUI(open) {
     state.vaultOpen = open;
     // 2.3.0：查看/提取/删除/新建文件夹已移入右键菜单，不再占用工具栏
     const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
-        'btn-import-folder', 'btn-extract-all', 'btn-audit', 'btn-defrag', 'btn-destroy'];
+        'btn-import-folder', 'btn-extract-all', 'btn-defrag', 'btn-destroy'];
     ids.forEach(id => { const el = $(id); if (el) el.disabled = !open; });
     $('btn-create').disabled = open;
     $('btn-open').disabled = open;
@@ -298,6 +298,16 @@ function escapeAttr(s) {
     return String(s).replace(/[&<>"]/g, function(c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] || c;
     });
+}
+
+function bytesToBase64(data) {
+    const bytes = new Uint8Array(data);
+    const chunkSize = 0x8000;
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
 }
 
 // R1 修复：增加 onCancel 回调。取消按钮显式调用 onCancel，
@@ -569,20 +579,6 @@ async function importFiles() {
         }
         await listFolder(state.currentFolder);
         setStatus(`导入完成: ${count} 个文件`);
-
-        // 提示安全删除源文件
-        const del = await tauriAsk(`导入完成。是否安全删除源文件？
-
-DoD 5220.22-M 7次擦除，不可恢复。`, { title: '安全删除源文件', type: 'warning' });
-        if (del) {
-            setStatus('正在安全删除源文件...');
-            try {
-                const result = await invoke('secure_delete_source_files', { paths: fileList });
-                setStatus(result);
-            } catch (e) {
-                showError('安全删除失败: ' + String(e));
-            }
-        }
     } catch (e) {
         showError(String(e));
         await listFolder(state.currentFolder);
@@ -597,23 +593,6 @@ async function importFolder() {
         await invoke('import_folder', { srcFolder: folder, destBase: state.currentFolder });
         await listFolder(state.currentFolder);
         setStatus('文件夹导入完成');
-
-        // 提示安全删除源文件夹
-        const del = await tauriAsk(`导入完成。是否安全删除源文件夹？
-
-DoD 5220.22-M 7次擦除，不可恢复。
-
-${folder}`, { title: '安全删除源文件夹', type: 'warning' });
-        if (del) {
-            setStatus('正在安全删除源文件夹...');
-            try {
-                // 遍历文件夹内所有文件并安全删除
-                const result = await invoke('secure_delete_source_folder', { folder });
-                setStatus(result);
-            } catch (e) {
-                showError('安全删除失败: ' + String(e));
-            }
-        }
     } catch (e) {
         showError(String(e));
         await listFolder(state.currentFolder);
@@ -715,11 +694,19 @@ async function viewFile(vpath, fileName) {
         const data = await invoke('load_file_content', { vpath });
 
         if (imgExts.includes(ext)) {
-            const blob = new Blob([new Uint8Array(data)]);
-            const url = URL.createObjectURL(blob);
-            _activeBlobUrls.push(url); // M10 修复：追踪以便关闭时释放
+            const imageMimeTypes = {
+                png: 'image/png',
+                jpg: 'image/jpeg',
+                jpeg: 'image/jpeg',
+                gif: 'image/gif',
+                bmp: 'image/bmp',
+                webp: 'image/webp',
+                tif: 'image/tiff',
+                tiff: 'image/tiff',
+            };
+            const imageUrl = `data:${imageMimeTypes[ext]};base64,${bytesToBase64(data)}`;
             const zoomId = 'img-zoom-' + Date.now();
-            showDialog('🖼️ ' + fileName, `<div style="overflow:auto;max-height:60vh;text-align:center;"><img id="${zoomId}" src="${url}" style="max-width:100%;cursor:zoom-in;transition:transform 0.1s;"></div>`, [{ text: '关闭', cls: 'btn-ok' }], true);
+            showDialog('🖼️ ' + fileName, `<div style="overflow:auto;max-height:60vh;text-align:center;"><img id="${zoomId}" src="${imageUrl}" style="max-width:100%;cursor:zoom-in;transition:transform 0.1s;"></div>`, [{ text: '关闭', cls: 'btn-ok' }], true);
             // 滚轮缩放
             setTimeout(() => {
                 const img = document.getElementById(zoomId);
@@ -765,25 +752,6 @@ async function renameSelected() {
             showError(String(e));
         }
     });
-}
-
-async function showAudit() {
-    try {
-        const raw = await invoke('get_audit_log');
-        const entries = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (!entries.length) {
-            showDialog('审计日志', '<pre>（暂无记录）</pre>', [{ text: '关闭', cls: 'btn-ok' }]);
-            return;
-        }
-        const lines = entries.map(e => {
-            const d = new Date(e.ts * 1000);
-            const ts = d.toLocaleString('zh-CN');
-            return `[${ts}] ${e.event}`;
-        });
-        showDialog('审计日志', `<pre>${lines.join('\n')}</pre>`, [{ text: '关闭', cls: 'btn-ok' }]);
-    } catch (e) {
-        showError(String(e));
-    }
 }
 
 async function defragmentVault() {
@@ -854,15 +822,31 @@ async function destroyVault() {
     }
 }
 
+// ───────────────── 窗口控制 ─────────────────
+function bindWindowControls() {
+    const tauriWindow = window.__TAURI__ && window.__TAURI__.window;
+    if (!tauriWindow) return;
+    const appWindow = tauriWindow.getCurrent();
+
+    $('btn-minimize').onclick = () => appWindow.minimize();
+    $('btn-window-close').onclick = () => appWindow.close();
+    $('btn-maximize').onclick = async () => {
+        try {
+            if (await appWindow.isMaximized()) await appWindow.unmaximize();
+            else await appWindow.maximize();
+        } catch (e) { console.warn('[LynVault] Window maximize failed:', e); }
+    };
+}
+
 // ───────────────── 事件绑定 ─────────────────
 function bindEvents() {
+    bindWindowControls();
     $('btn-create').onclick = createVault;
     $('btn-open').onclick = openVault;
     $('btn-close').onclick = closeVault;
     $('btn-import-file').onclick = importFiles;
     $('btn-import-folder').onclick = importFolder;
     $('btn-extract-all').onclick = extractAllFiles;
-    $('btn-audit').onclick = showAudit;
     $('btn-defrag').onclick = defragmentVault;
     $('btn-destroy').onclick = destroyVault;
     $('btn-add-part').onclick = addPartition;
@@ -979,34 +963,6 @@ function bindEvents() {
                     const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
                     await listFolder(state.currentFolder);
 
-                    // 如有成功导入的项目，询问安全删除源文件
-                    const hasFiles = res.files && res.files.length > 0;
-                    const hasFolders = res.folders && res.folders.length > 0;
-                    if (hasFiles || hasFolders) {
-                        const del = await tauriAsk(
-                            `导入完成。是否安全删除以下源文件？\n\n` +
-                            (hasFiles ? `📄 ${res.files.length} 个文件\n` : '') +
-                            (hasFolders ? `📁 ${res.folders.length} 个文件夹\n` : '') +
-                            `\nDoD 5220.22-M 7次擦除，不可恢复。`,
-                            { title: '安全删除源文件', type: 'warning' }
-                        );
-                        if (del) {
-                            setStatus('正在安全删除源文件...');
-                            try {
-                                // 先删文件，再删文件夹（文件夹内文件已由 vault 导入完毕）
-                                let delResult = '';
-                                if (hasFiles) {
-                                    delResult += await invoke('secure_delete_source_files', { paths: res.files }) + '\n';
-                                }
-                                for (const f of (res.folders || [])) {
-                                    delResult += await invoke('secure_delete_source_folder', { folder: f }) + '\n';
-                                }
-                                setStatus(delResult.trim());
-                            } catch (e) {
-                                showError('安全删除失败: ' + String(e));
-                            }
-                        }
-                    }
                     setStatus(res.summary || '拖放导入完成');
                 } else {
                     // cancel / leave

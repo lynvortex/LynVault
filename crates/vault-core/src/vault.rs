@@ -52,6 +52,8 @@ const DEFAULT_PARTITION: &str = "Main";
 /// 单次操作中内存缓冲区的上限（256 MiB）。
 /// 超过此大小的文件改用流式读写，避免 OOM（M1 修复）。
 const MAX_INMEM_BUFFER: usize = 256 * 1024 * 1024;
+const MAX_IMPORT_DEPTH: usize = 64;
+const MAX_IMPORT_ENTRIES: usize = 100_000;
 
 // ─────────── 自由函数：避免 &mut self 借用冲突 ───────────
 
@@ -248,6 +250,12 @@ fn read_decrypt_file_data(
     length: u64,
     aad: &[u8],
 ) -> Result<Vec<u8>, VaultError> {
+    let file_len = file.metadata()?.len();
+    let end = offset.checked_add(length)
+        .ok_or_else(|| VaultError::Other("文件数据范围溢出".into()))?;
+    if end > file_len || length > MAX_INMEM_BUFFER as u64 {
+        return Err(VaultError::Other("文件数据超出安全读取范围".into()));
+    }
     file.seek(SeekFrom::Start(offset))?;
     let mut enc_data = vec![0u8; length as usize];
     file.read_exact(&mut enc_data)?;
@@ -758,22 +766,45 @@ impl Vault {
     }
 
     pub fn import_folder(&mut self, src: &Path, base: &str) -> Result<(), VaultError> {
+        let source_meta = fs::symlink_metadata(src)?;
+        if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+            return Err(VaultError::Other("导入源必须是非链接目录".into()));
+        }
         let base_name = src.file_name()
             .unwrap_or_default().to_string_lossy().to_string();
         let base_clean = base.trim_end_matches('/');
-        self.walk_import(src, &format!("{}/{}", base_clean, base_name))
+        let mut entries_seen = 0usize;
+        self.walk_import(src, &format!("{}/{}", base_clean, base_name), 0, &mut entries_seen)
     }
 
-    fn walk_import(&mut self, current: &Path, dest_root: &str) -> Result<(), VaultError> {
+    fn walk_import(
+        &mut self,
+        current: &Path,
+        dest_root: &str,
+        depth: usize,
+        entries_seen: &mut usize,
+    ) -> Result<(), VaultError> {
+        if depth > MAX_IMPORT_DEPTH {
+            return Err(VaultError::Other("导入目录层级超过安全上限".into()));
+        }
         for entry in fs::read_dir(current)? {
             let entry = entry?;
+            *entries_seen += 1;
+            if *entries_seen > MAX_IMPORT_ENTRIES {
+                return Err(VaultError::Other("导入项目数量超过安全上限".into()));
+            }
             let path = entry.path();
+            let meta = fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() {
+                log::warn!("跳过符号链接 '{}'", path.display());
+                continue;
+            }
             let name = path.file_name()
                 .unwrap_or_default().to_string_lossy().to_string();
             let dest_path = format!("{}/{}", dest_root, name);
-            if path.is_dir() {
-                self.walk_import(&path, &dest_path)?;
-            } else {
+            if meta.is_dir() {
+                self.walk_import(&path, &dest_path, depth + 1, entries_seen)?;
+            } else if meta.is_file() {
                 // 导入失败时记录但继续，避免单个错误中断整个文件夹导入
                 if let Err(e) = self.import_file(&path, &dest_path) {
                     log::warn!("导入 '{}' 失败: {}", path.display(), e);
@@ -841,8 +872,14 @@ impl Vault {
             dest_abs.clone()
         };
         fs::create_dir_all(&output_dir)?;
+        let output_dir_abs = fs::canonicalize(&output_dir)
+            .map_err(|_| VaultError::Other("输出目录无法访问".into()))?;
+        if !output_dir_abs.starts_with(&dest_abs) {
+            secure_wipe_vec(data);
+            return Err(VaultError::Other("输出目录包含符号链接".into()));
+        }
 
-        let dest_path = output_dir.join(&safe_name);
+        let dest_path = output_dir_abs.join(&safe_name);
 
         // 路径遍历防护：验证最终路径在目标目录下
         if !dest_path.starts_with(&dest_abs) {
@@ -860,40 +897,24 @@ impl Vault {
         {
             use std::os::unix::fs::OpenOptionsExt;
             let mut f = OpenOptions::new()
-                .write(true).create(true).truncate(true)
+                .write(true).create_new(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&dest_path)
-                .map_err(|_| VaultError::Other("目标文件路径异常（符号链接？）".into()))?;
+                .map_err(|_| VaultError::Other("目标文件已存在或路径异常（符号链接？）".into()))?;
             f.write_all(&data)?;
             f.sync_all()?;
-            // 再次验证不是符号链接（防止 O_CREAT 在某些系统上忽略 NO_FOLLOW）
-            let meta = fs::symlink_metadata(&dest_path)
-                .map_err(|_| VaultError::Other("写入后验证失败".into()))?;
-            if meta.file_type().is_symlink() {
-                secure_wipe_vec(data);
-                return Err(VaultError::Other("目标路径被替换为符号链接".into()));
-            }
         }
         #[cfg(not(unix))]
         {
-            // Windows：使用 FILE_FLAG_OPEN_REPARSE_POINT + FILE_FLAG_NO_FOLLOW 等价
-            // 0x00200000 = FILE_FLAG_OPEN_REPARSE_POINT（不解析重解析点，含符号链接）
-            // 0x08000000 = FILE_FLAG_WRITE_THROUGH
+            // FILE_FLAG_OPEN_REPARSE_POINT prevents following a final reparse point.
             use std::os::windows::fs::OpenOptionsExt;
             let mut f = OpenOptions::new()
-                .write(true).create(true).truncate(true)
+                .write(true).create_new(true)
                 .custom_flags(0x00200000 | 0x08000000)
                 .open(&dest_path)
-                .map_err(|_| VaultError::Other("目标文件路径异常（重解析点？）".into()))?;
+                .map_err(|_| VaultError::Other("目标文件已存在或路径异常（重解析点？）".into()))?;
             f.write_all(&data)?;
             f.sync_all()?;
-            // 再次验证
-            let meta = fs::symlink_metadata(&dest_path)
-                .map_err(|_| VaultError::Other("写入后验证失败".into()))?;
-            if meta.file_type().is_symlink() {
-                secure_wipe_vec(data);
-                return Err(VaultError::Other("目标路径被替换为符号链接".into()));
-            }
         }
 
         if let Some(ref mut audit) = self.audit {
@@ -1097,7 +1118,8 @@ impl Vault {
         OsRng.fill_bytes(&mut rand_suffix);
         let temp_name = format!("{}.tmp.{}", vault_path.display(), hex::encode(rand_suffix));
         let temp_path = PathBuf::from(&temp_name);
-        let backup_path = vault_path.with_extension("vault.bak");
+        let backup_name = format!("{}.bak.{}", vault_path.display(), hex::encode(rand_suffix));
+        let backup_path = PathBuf::from(&backup_name);
 
         // C2 修复（关键）：旧实现只迁移活跃分区的文件和索引，
         // fs::rename 后其他分区的索引和文件密文全部丢失。
@@ -1109,15 +1131,19 @@ impl Vault {
         // 简化且正确的做法：复制整个原文件到临时文件，然后在临时文件上
         // 对活跃分区做碎片整理（重写文件数据 + 索引），其他分区数据原样保留。
 
-        // 备份原文件
-        fs::copy(&vault_path, &backup_path)?;
+        // Create unique backup and temporary files exclusively so pre-existing links cannot be followed.
+        let mut backup_file = OpenOptions::new().write(true).create_new(true).open(&backup_path)?;
+        let mut original = File::open(&vault_path)?;
+        std::io::copy(&mut original, &mut backup_file)?;
+        backup_file.sync_all()?;
+        drop(backup_file);
 
         let result = (|| -> Result<(), VaultError> {
             // 步骤 1：整体复制原文件到临时文件（保留所有分区数据）
             {
                 let src_file = File::open(&vault_path)?;
                 let mut tmp_file = OpenOptions::new()
-                    .read(true).write(true).create(true).truncate(true)
+                    .read(true).write(true).create_new(true)
                     .open(&temp_path)?;
                 std::io::copy(&mut &src_file, &mut tmp_file)?;
                 tmp_file.flush()?;

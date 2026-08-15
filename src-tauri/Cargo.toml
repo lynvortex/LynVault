@@ -1,6 +1,6 @@
 [package]
 name = "lynvault-rs"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 
 # 构建产物文件名：LynVault.exe（默认取包名 lynvault-rs）
@@ -15,6 +15,11 @@ tauri-build = { version = "1", features = [] }
 tauri = { version = "1", features = [
     "dialog", "dialog-all",
     "window-center",
+    "window-close",
+    "window-maximize",
+    "window-minimize",
+    "window-start-dragging",
+    "window-unmaximize",
     "window-set-resizable",
     "window-set-size",
     "window-set-title",

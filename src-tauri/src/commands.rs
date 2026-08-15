@@ -414,18 +414,6 @@ pub fn defragment_vault(state: State<AppState>) -> Result<String, String> {
     })
 }
 
-// ───────────────── 审计日志 ─────────────────
-
-#[tauri::command]
-pub fn get_audit_log(state: State<AppState>) -> Result<String, String> {
-    catch("get_audit_log", || {
-        let guard = lock_vault(&state)?;
-        let vault = guard.as_ref().ok_or("保险柜未打开")?;
-        let entries = vault.get_audit_entries();
-        serde_json::to_string(&entries).map_err(|e| e.to_string())
-    })
-}
-
 // ───────────────── 销毁保险柜 ─────────────────
 
 #[tauri::command]
@@ -466,14 +454,6 @@ pub fn destroy_vault(state: State<AppState>) -> Result<(), String> {
         *guard = None;
         vault_core::wipe::dod_erase(&vault_path, None).map_err(|e| e.to_string())?;
 
-        // 2.3.0 修复：碎片整理可能在磁盘上遗留 <name>.vault.bak 完整副本，
-        // 销毁保险柜时一并擦除，避免抗取证死角
-        let backup_path = vault_path.with_extension("vault.bak");
-        if backup_path.exists() {
-            if let Err(e) = vault_core::wipe::dod_erase(&backup_path, None) {
-                eprintln!("[LynVault] 清理保险柜备份失败: {}", e);
-            }
-        }
         Ok(())
     })
 }
@@ -494,73 +474,6 @@ pub fn get_file_info(state: State<AppState>, vpath: String) -> Result<String, St
             Err("文件不存在".into())
         }
     })
-}
-
-// ───────────────── 安全删除源文件（导入后使用） ─────────────────
-
-#[tauri::command]
-pub fn secure_delete_source_files(
-    paths: Vec<String>,
-) -> Result<String, String> {
-    catch("secure_delete_source_files", || {
-        // 拒绝符号链接
-        for p in &paths {
-            let meta = std::fs::symlink_metadata(p)
-                .map_err(|e| format!("无法访问 '{}': {}", p, e))?;
-            if meta.file_type().is_symlink() {
-                return Err(format!("拒绝删除符号链接: '{}'", p));
-            }
-        }
-        let path_refs: Vec<&Path> = paths.iter().map(|p| Path::new(p.as_str())).collect();
-        vault_core::wipe::dod_erase_files(&path_refs, None)
-            .map_err(|e| e.to_string())?;
-        Ok(format!("已安全删除 {} 个源文件（DoD 7-pass）", paths.len()))
-    })
-}
-
-#[tauri::command]
-pub fn secure_delete_source_folder(
-    folder: String,
-) -> Result<String, String> {
-    catch("secure_delete_source_folder", || {
-        let root = Path::new(&folder);
-        let root_meta = std::fs::symlink_metadata(root)
-            .map_err(|_| "无法访问文件夹".to_string())?;
-        if root_meta.file_type().is_symlink() {
-            return Err("拒绝删除符号链接".into());
-        }
-        if !root.is_dir() {
-            return Err("不是有效的文件夹".into());
-        }
-        let files = collect_files_recursive(root).map_err(|e| e.to_string())?;
-        if files.is_empty() {
-            let _ = std::fs::remove_dir_all(root);
-            return Ok("空文件夹已删除".into());
-        }
-        let path_refs: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
-        vault_core::wipe::dod_erase_files(&path_refs, None)
-            .map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_dir_all(root);
-        Ok(format!("已安全删除 {} 个源文件（DoD 7-pass）", files.len()))
-    })
-}
-
-fn collect_files_recursive(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
-    let mut result = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if path.is_dir() {
-            result.extend(collect_files_recursive(&path)?);
-        } else {
-            result.push(path);
-        }
-    }
-    Ok(result)
 }
 
 // ───────────────── 加载文件内容（安全查看用） ─────────────────

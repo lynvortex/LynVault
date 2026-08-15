@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "lynvault-rs"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "base64 0.22.1",
  "image 0.25.10",
@@ -3794,7 +3794,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vault-core"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4498,6 +4498,8 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "wry"
 version = "0.24.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a2a144c3ab5e83e04724bc8e67cea552ffae413185fda459fafdae173fd985d"
 dependencies = [
  "base64 0.13.1",
  "block",

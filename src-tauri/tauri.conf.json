@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "LynVault",
-    "version": "2.3.0"
+    "version": "2.4.0"
   },
   "tauri": {
     "allowlist": {
@@ -30,7 +30,12 @@
         "setResizable": true,
         "setTitle": true,
         "setSize": true,
-        "center": true
+        "center": true,
+        "minimize": true,
+        "maximize": true,
+        "unmaximize": true,
+        "startDragging": true,
+        "close": true
       }
     },
     "bundle": {
@@ -52,11 +57,13 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "LynVault 2.3.0",
+        "title": "LynVault 2.4.0",
         "width": 960,
         "height": 620,
         "center": true,
-        "fileDropEnabled": true
+        "fileDropEnabled": true,
+        "decorations": false,
+        "transparent": true
       }
     ]
   }

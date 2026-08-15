@@ -3,11 +3,20 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LynVault 2.3.0</title>
+    <title>LynVault 2.4.0</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div id="toolbar">
+    <main id="app-shell">
+        <header id="titlebar" data-tauri-drag-region>
+            <div class="app-brand" data-tauri-drag-region><span class="brand-mark">L</span><span>LynVault</span></div>
+            <div class="window-controls">
+                <button id="btn-minimize" class="window-control" title="最小化" aria-label="最小化">−</button>
+                <button id="btn-maximize" class="window-control" title="最大化" aria-label="最大化">□</button>
+                <button id="btn-window-close" class="window-control window-close" title="关闭" aria-label="关闭">×</button>
+            </div>
+        </header>
+        <div id="toolbar">
         <button id="btn-create">新建保险柜</button>
         <button id="btn-open">打开保险柜</button>
         <button id="btn-close" disabled>关闭保险柜</button>
@@ -19,7 +28,6 @@
         <button id="btn-import-folder" disabled>导入文件夹</button>
         <button id="btn-extract-all" disabled>提取全部</button>
         <span class="sep"></span>
-        <button id="btn-audit" disabled>查看审计日志</button>
         <button id="btn-defrag" disabled>整理保险柜</button>
         <button id="btn-destroy" class="danger" disabled>销毁保险箱</button>
     </div>
@@ -62,6 +70,7 @@
     <!-- 右键菜单（内容由 app.js 按上下文动态构建：文件/文件夹 或 空白区） -->
     <div id="ctx-menu" class="hidden"></div>
 
-    <script src="app.js"></script>
+        <script src="app.js"></script>
+    </main>
 </body>
 </html>
