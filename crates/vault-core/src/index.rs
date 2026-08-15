@@ -136,9 +136,7 @@ impl<'a> IndexManager<'a> {
                 index.folders.insert(parent.into(), true);
             }
         }
-        if let Some(audit) = &mut self.vault.audit {
-            audit.add(&format!("添加文件 '{}'", vpath));
-        }
+        self.vault.log_event(&format!("添加文件 '{}'", vpath));
         self.vault.save_index(&index)?;
         Ok(())
     }
@@ -146,9 +144,7 @@ impl<'a> IndexManager<'a> {
     pub fn remove_file(&mut self, vpath: &str) -> Result<(), VaultError> {
         let mut index = self.vault.load_index()?;
         if index.files.remove(vpath).is_some() {
-            if let Some(audit) = &mut self.vault.audit {
-                audit.add(&format!("删除文件 '{}'", vpath));
-            }
+            self.vault.log_event(&format!("删除文件 '{}'", vpath));
             self.vault.save_index(&index)?;
         }
         Ok(())
@@ -166,9 +162,7 @@ impl<'a> IndexManager<'a> {
             return Err(VaultError::Other(format!("文件夹已存在: {}", vpath)));
         }
         index.folders.insert(vpath.clone(), true);
-        if let Some(audit) = &mut self.vault.audit {
-            audit.add(&format!("创建文件夹 '{}'", vpath));
-        }
+        self.vault.log_event(&format!("创建文件夹 '{}'", vpath));
         self.vault.save_index(&index)?;
         Ok(())
     }
@@ -193,9 +187,7 @@ impl<'a> IndexManager<'a> {
         }
         index.folders.remove(vpath);
 
-        if let Some(audit) = &mut self.vault.audit {
-            audit.add(&format!("删除文件夹 '{}'", vpath));
-        }
+        self.vault.log_event(&format!("删除文件夹 '{}'", vpath));
         self.vault.save_index(&index)?;
         Ok(())
     }
@@ -231,9 +223,7 @@ impl<'a> IndexManager<'a> {
             name: new_name.into(),
             ..meta
         });
-        if let Some(audit) = &mut self.vault.audit {
-            audit.add(&format!("重命名 '{}' -> '{}'", old_vpath, new_vpath));
-        }
+        self.vault.log_event(&format!("重命名 '{}' -> '{}'", old_vpath, new_vpath));
         self.vault.save_index(&index)?;
         Ok(())
     }
@@ -293,9 +283,7 @@ impl<'a> IndexManager<'a> {
         index.files = new_files;
         index.folders = new_folders;
 
-        if let Some(audit) = &mut self.vault.audit {
-            audit.add(&format!("重命名文件夹 '{}' -> '{}'", old_vpath, new_vpath));
-        }
+        self.vault.log_event(&format!("重命名文件夹 '{}' -> '{}'", old_vpath, new_vpath));
         self.vault.save_index(&index)?;
         Ok(())
     }

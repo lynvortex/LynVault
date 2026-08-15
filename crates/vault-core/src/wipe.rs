@@ -1,5 +1,6 @@
 //! 安全擦除与内存零化辅助函数
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -51,6 +52,10 @@ pub fn dod_overwrite_range(file: &mut File, offset: u64, length: u64) -> io::Res
     }
     const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
     let length = length as usize;
+    // 2.4.1 优化：随机 pass 改用 ChaCha20Rng（OsRng 一次性播种）流式生成，
+    // 旧实现每个 1MB 块都走系统熵源（慢 1-2 个数量级），大文件擦除耗时大幅下降；
+    // 覆写随机数据的安全语义不变（攻击者无法预测覆写内容与原数据的关系）
+    let mut rng = ChaCha20Rng::from_entropy();
     for pass in DOD_PASSES.iter() {
         let mut written = 0usize;
         while written < length {
@@ -59,7 +64,7 @@ pub fn dod_overwrite_range(file: &mut File, offset: u64, length: u64) -> io::Res
             match pass {
                 Pass::AllOnes => buf.fill(0xFF),
                 Pass::AllZeros => buf.fill(0x00),
-                Pass::Random => OsRng.fill_bytes(&mut buf),
+                Pass::Random => rng.fill_bytes(&mut buf),
             }
             file.seek(SeekFrom::Start(offset + written as u64))?;
             file.write_all(&buf)?;

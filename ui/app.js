@@ -300,15 +300,8 @@ function escapeAttr(s) {
     });
 }
 
-function bytesToBase64(data) {
-    const bytes = new Uint8Array(data);
-    const chunkSize = 0x8000;
-    let binary = '';
-    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-    }
-    return btoa(binary);
-}
+// 2.4.1：bytesToBase64 已删除 —— load_file_content 后端直接返回 base64 字符串，
+// 前端不再需要手工转换（也避免了旧实现对大文件的字符串拼接开销）。
 
 // R1 修复：增加 onCancel 回调。取消按钮显式调用 onCancel，
 // 确保启动弹窗流程的状态标志 (_startupProcessing) 总能被重置。
@@ -570,15 +563,20 @@ async function closeVault() {
 async function importFiles() {
     const files = await tauriOpen({ title: '选择要导入的文件', multiple: true });
     if (!files || files.length === 0) return;
-    const count = Array.isArray(files) ? files.length : 1;
-    setStatus(`正在导入 ${count} 个文件...`);
+    const fileList = Array.isArray(files) ? files : [files];
+    setStatus(`正在导入 ${fileList.length} 个文件...`);
     try {
-        const fileList = Array.isArray(files) ? files : [files];
-        for (const f of fileList) {
-            await invoke('import_file', { srcPath: f, destVpath: state.currentFolder });
-        }
+        // 2.4.1：改为后端批量导入（单次索引加密落盘），
+        // 旧版前端循环 import_file 会对每个文件全量重写一次索引
+        const raw = await invoke('import_files_batch', {
+            srcPaths: fileList,
+            destBase: state.currentFolder,
+        });
+        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
         await listFolder(state.currentFolder);
-        setStatus(`导入完成: ${count} 个文件`);
+        setStatus(res.fail > 0
+            ? `导入完成: 成功 ${res.ok} 个，失败 ${res.fail} 个`
+            : `导入完成: ${res.ok} 个文件`);
     } catch (e) {
         showError(String(e));
         await listFolder(state.currentFolder);
@@ -655,10 +653,15 @@ async function deleteSelected() {
     if (!ok) return;
     try {
         const vpaths = state.selectedItems.map(i => i.vpath);
-        // N1 修复：delete_files 现在能同时处理文件和文件夹（后端 secure_delete_files_batch 展开）
-        const count = await invoke('delete_files', { vpaths });
+        // N1 修复：delete_files 能同时处理文件和文件夹（后端 secure_delete_files_batch 展开）
+        // 2.4.1：返回结构化 { files, folders }，精确反馈删除数量
+        const raw = await invoke('delete_files', { vpaths });
+        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
         await listFolder(state.currentFolder);
-        setStatus(`已安全删除 ${count} 个项目`);
+        const parts = [];
+        if (res.files) parts.push(`${res.files} 个文件`);
+        if (res.folders) parts.push(`${res.folders} 个文件夹`);
+        setStatus(`已安全删除 ${parts.join('、') || '0 个项目'}`);
     } catch (e) {
         showError(String(e));
     }
@@ -691,7 +694,10 @@ async function viewFile(vpath, fileName) {
             return;
         }
 
-        const data = await invoke('load_file_content', { vpath });
+        // 2.4.1：load_file_content 改为返回 base64 字符串。
+        // 旧版 Tauri 1.x 把 Vec<u8> 序列化成 JSON 数字数组（每字节 3-5 个字符），
+        // 预览 5MB 图片要传几十 MB 文本；base64 只有 1.33× 膨胀。
+        const b64 = await invoke('load_file_content', { vpath });
 
         if (imgExts.includes(ext)) {
             const imageMimeTypes = {
@@ -704,7 +710,7 @@ async function viewFile(vpath, fileName) {
                 tif: 'image/tiff',
                 tiff: 'image/tiff',
             };
-            const imageUrl = `data:${imageMimeTypes[ext]};base64,${bytesToBase64(data)}`;
+            const imageUrl = `data:${imageMimeTypes[ext]};base64,${b64}`;
             const zoomId = 'img-zoom-' + Date.now();
             showDialog('🖼️ ' + fileName, `<div style="overflow:auto;max-height:60vh;text-align:center;"><img id="${zoomId}" src="${imageUrl}" style="max-width:100%;cursor:zoom-in;transition:transform 0.1s;"></div>`, [{ text: '关闭', cls: 'btn-ok' }], true);
             // 滚轮缩放
@@ -724,8 +730,11 @@ async function viewFile(vpath, fileName) {
         }
 
         if (textExts.includes(ext)) {
-            const decoder = new TextDecoder('utf-8');
-            const text = decoder.decode(new Uint8Array(data));
+            // 2.4.1：base64 → 字节 → UTF-8 文本
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const text = new TextDecoder('utf-8').decode(bytes);
             const pre = document.createElement('pre');
             pre.textContent = text;
             showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);
@@ -841,6 +850,26 @@ function bindWindowControls() {
 // ───────────────── 事件绑定 ─────────────────
 function bindEvents() {
     bindWindowControls();
+    // 2.4.1：标题栏右侧开源仓库链接 —— 调系统默认浏览器打开。
+    // 优先走 __TAURI__.shell.open（需 tauri.conf.json 开 shell.open 白名单），
+    // 旧注入不可用时退回 plugin:shell|open 命令；两者都失败则不拦截 <a> 默认行为。
+    const repoLink = $('repo-link');
+    if (repoLink) {
+        repoLink.onclick = async (e) => {
+            const url = repoLink.href;
+            try {
+                if (window.__TAURI__ && window.__TAURI__.shell && window.__TAURI__.shell.open) {
+                    e.preventDefault();
+                    await window.__TAURI__.shell.open(url);
+                } else {
+                    e.preventDefault();
+                    await invoke('plugin:shell|open', { url });
+                }
+            } catch (err) {
+                console.warn('打开外部链接失败（保留默认行为）:', err);
+            }
+        };
+    }
     $('btn-create').onclick = createVault;
     $('btn-open').onclick = openVault;
     $('btn-close').onclick = closeVault;
@@ -954,7 +983,29 @@ function bindEvents() {
                 } else if (p.type === 'drop') {
                     fileList.classList.remove('drag-over');
                     const paths = p.paths;
-                    if (!paths || paths.length === 0 || !state.vaultOpen) return;
+                    if (!paths || paths.length === 0) return;
+
+                    // ── 2.4.1 新功能：拖入 .lyt 保险柜文件自动识别 ──
+                    // 保险柜文件不是待加密数据：识别成功直接进入「打开保险柜」
+                    // 密码流程，而不是把它导入当前保险柜。
+                    if (!state.vaultOpen) {
+                        const candidates = paths.filter(x => /\.(lyt|vault)$/i.test(String(x)));
+                        if (candidates.length > 0) {
+                            // 后端双重校验（扩展名 + magic bytes），避免误识别
+                            const checks = await Promise.all(candidates.map(x =>
+                                invoke('check_vault_file', { path: x }).catch(() => false)
+                            ));
+                            const confirmed = candidates.filter((x, i) => checks[i] === true);
+                            if (confirmed.length > 0) {
+                                const skipped = paths.length - confirmed.length;
+                                if (skipped > 0) setStatus(`已识别保险柜文件；另有 ${skipped} 个项目未导入（请打开后再拖入）`);
+                                openVaultFromExternal(confirmed[0]);
+                                return;
+                            }
+                        }
+                        return; // 保险柜未打开且拖入的不是保险柜文件：忽略
+                    }
+
                     setStatus(`正在导入 ${paths.length} 个项目...`);
                     const raw = await invoke('import_dropped_paths', {
                         paths,
@@ -963,7 +1014,12 @@ function bindEvents() {
                     const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
                     await listFolder(state.currentFolder);
 
-                    setStatus(res.summary || '拖放导入完成');
+                    // 2.4.1：后端会把误拖入的保险柜文件分流出来（不导入）
+                    let summary = res.summary || '拖放导入完成';
+                    if (res.vault_files && res.vault_files.length > 0) {
+                        summary += `\n已跳过 ${res.vault_files.length} 个保险柜文件（不能嵌套导入，请先关闭当前保险柜再打开它）`;
+                    }
+                    setStatus(summary);
                 } else {
                     // cancel / leave
                     fileList.classList.remove('drag-over');
@@ -1081,7 +1137,26 @@ function openVaultFromStartup(filePath) {
     });
 }
 
-async function detectAndShowStartup() {
+// ───────────────── 2.4.1：外部来源打开保险柜 ─────────────────
+// 统一处理三种来源：双击 .lyt 启动参数、已运行实例转发的请求、拖放到窗口。
+// 已有保险柜打开时提示先关闭；取消时回到启动检测弹窗。
+function openVaultFromExternal(filePath) {
+    if (!filePath) return;
+    if (state.vaultOpen) {
+        showDialog('提示',
+            '<p>已打开一个保险柜。</p><p>请先关闭当前保险柜，再打开新的保险柜文件。</p>',
+            [{ text: '确定', cls: 'btn-ok' }]);
+        return;
+    }
+    if (_startupProcessing) return; // 防重入
+    _startupProcessing = true;
+    hideStartupModal();
+    openVaultFromStartup(filePath);
+}
+
+// 2.4.1：silent 参数 —— 只填充列表不弹窗。用于「双击 .lyt 启动」场景的
+// 后台预扫描：用户取消密码输入回到启动弹窗时，列表已有内容。
+async function detectAndShowStartup(silent) {
     // 并行扫描多个候选目录（桌面、文档、下载、主目录）
     const candidates = ['$DESKTOP', '$DOCUMENT', '$DOWNLOAD', '$HOME'];
     const results = await Promise.all(candidates.map(c =>
@@ -1098,11 +1173,14 @@ async function detectAndShowStartup() {
     found.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
 
     renderStartupList(found);
-    showStartupModal();
+    if (!silent) showStartupModal();
 }
 
 // ───────────────── 启动 ─────────────────
-window.addEventListener('DOMContentLoaded', () => {
+// 2.4.1 修复：回调必须为 async —— 内部有 await（事件注册 / 启动参数查询）。
+// 旧写法在非 async 回调里用 await 是语法错误，整个 app.js 解析失败，
+// 表现为：按钮全部点不动、启动扫描不运行。
+window.addEventListener('DOMContentLoaded', async () => {
     if (!initTauri()) {
         document.body.innerHTML = '<div style="padding:40px;color:#ff6666">Tauri API 不可用，请确保从 Tauri 启动应用。</div>';
         return;
@@ -1193,6 +1271,32 @@ window.addEventListener('DOMContentLoaded', () => {
         // 复用 openVaultFromStartup（已处理取消/错误重试逻辑）
         openVaultFromStartup(filePath);
     };
+    // ── 2.4.1 新功能：.lyt 文件导航到软件后自动识别 ──
+    // 顺序很重要：先注册事件监听器、再通知后端就绪、最后查询启动参数，
+    // 保证「双击 .lyt 启动」与「运行中双击 .lyt 转发」两条路径都不丢事件。
+    try {
+        if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
+            await window.__TAURI__.event.listen('vault-file-requested', (evt) => {
+                // 已运行实例收到第二个实例双击的 .lyt 文件
+                openVaultFromExternal(evt.payload);
+            });
+        }
+    } catch (e) { console.warn('事件监听注册失败:', e); }
+    invoke('frontend_ready').catch(() => { /* 非致命 */ });
+
+    // 双击 .lyt 文件启动（文件关联）：直接进入该文件的密码输入，跳过启动弹窗
+    try {
+        const launch = await invoke('get_launch_vault_arg');
+        if (launch) {
+            console.log('[LynVault] 检测到启动参数中的保险柜文件:', launch);
+            openVaultFromExternal(launch);
+            // 后台静默预扫描：用户取消密码输入回到启动弹窗时列表已就绪
+            detectAndShowStartup(true).catch(() => {});
+            console.log('[LynVault] UI ready');
+            return;
+        }
+    } catch (e) { console.warn('读取启动参数失败:', e); }
+
     // 启动检测：扫描附近目录的 .lyt / .vault 文件
     detectAndShowStartup();
     console.log('[LynVault] UI ready');

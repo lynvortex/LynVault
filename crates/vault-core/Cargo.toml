@@ -1,6 +1,6 @@
 [package]
 name = "vault-core"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,8 @@ hmac = "0.12"
 hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+# 2.4.1 新增：DoD 擦除的 Random pass 改用 ChaCha20 流式生成（P1-8）
+rand_chacha = "0.3"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

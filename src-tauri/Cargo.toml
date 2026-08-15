@@ -1,6 +1,6 @@
 [package]
 name = "lynvault-rs"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 
 # 构建产物文件名：LynVault.exe（默认取包名 lynvault-rs）
@@ -14,6 +14,7 @@ tauri-build = { version = "1", features = [] }
 [dependencies]
 tauri = { version = "1", features = [
     "dialog", "dialog-all",
+    "shell-open",
     "window-center",
     "window-close",
     "window-maximize",
@@ -30,8 +31,9 @@ vault-core = { path = "../crates/vault-core" }
 zeroize = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
 
-# Windows 系统图标读取（仅 Windows 编译）
+# Windows 专属依赖：系统图标读取 + .lyt 文件关联自注册（本应用仅面向 Windows 发布）
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [
     "Win32_Foundation",
@@ -40,6 +42,7 @@ windows = { version = "0.57", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }
+winreg = "0.52"
 
 [features]
 default = [ "custom-protocol" ]

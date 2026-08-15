@@ -58,7 +58,9 @@ pub fn derive_legacy_lock_key(
         lock_salt[i] ^= DOMAIN_SEP[i];
     }
 
-    let mut combined = Vec::new();
+    // 2.4.1 修复：精确预留容量，避免多次 realloc 在堆上留下含密码的旧副本
+    let kf_len = key_file_data.map_or(0, |kf| kf.len());
+    let mut combined = Vec::with_capacity(password.as_bytes().len() + kf_len);
     combined.extend_from_slice(password.as_bytes());
     if let Some(kf) = key_file_data {
         combined.extend_from_slice(kf);
@@ -109,7 +111,10 @@ pub fn derive_keys(
     salt: &[u8],
 ) -> Result<KeyMaterial, VaultError> {
     let pwd_bytes = password.as_bytes();
-    let mut combined = Vec::with_capacity(8 + pwd_bytes.len() + 8);
+    // 2.4.1 修复：按最终长度精确预留，避免 extend 触发 realloc，
+    // 旧缓冲区（含密码/密钥文件字节）未经 zeroize 残留在堆上
+    let kf_len = key_file_data.map_or(0, |kf| kf.len());
+    let mut combined = Vec::with_capacity(8 + pwd_bytes.len() + 8 + kf_len);
     // 长度前缀（小端 u64），消除拼接歧义
     combined.extend_from_slice(&(pwd_bytes.len() as u64).to_le_bytes());
     combined.extend_from_slice(pwd_bytes);

@@ -3,13 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LynVault 2.4.0</title>
+    <title>LynVault 2.4.1</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <main id="app-shell">
         <header id="titlebar" data-tauri-drag-region>
-            <div class="app-brand" data-tauri-drag-region><span class="brand-mark">L</span><span>LynVault</span></div>
+            <div class="app-brand" data-tauri-drag-region><span>LynVault</span></div>
+            <!-- 2.4.1：开源地址移到标题栏右侧（可点击，shell-open 打开浏览器）；不可拖拽，避免误触拖动窗口 -->
+            <a id="repo-link" class="repo-link" href="https://github.com/lynvortex/LynVault" title="在浏览器中打开开源仓库" draggable="false">开源仓库 ↗</a>
             <div class="window-controls">
                 <button id="btn-minimize" class="window-control" title="最小化" aria-label="最小化">−</button>
                 <button id="btn-maximize" class="window-control" title="最大化" aria-label="最大化">□</button>
@@ -39,7 +41,8 @@
 
     <div id="file-list"></div>
 
-    <div id="status-bar">©绘萤者 开源地址：https://github.com/lynvortex/LynVault</div>
+    <!-- 2.4.1：开源地址已移至标题栏右侧；状态栏文案会被 setStatus 动态覆盖 -->
+    <div id="status-bar">©绘萤者 LynVault 2.4.1</div>
 
     <!-- 模态框 -->
     <div id="overlay" class="hidden"></div>

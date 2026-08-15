@@ -2,14 +2,27 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 use vault_core::Vault;
 use zeroize::Zeroize;
+
+// ───────────────── 全局状态 ─────────────────
 
 /// 全局状态：保险柜实例 + 认证频率限制
 pub struct AppState {
     vault: Mutex<Option<Vault>>,
     last_auth_attempt: Mutex<Option<Instant>>,
+}
+
+/// 2.4.1 新增：通过启动参数 / 文件关联传入的保险柜路径。
+/// main() 启动时解析 argv 写入，前端就绪后用 `get_launch_vault_arg` 读取。
+static LAUNCH_VAULT_ARG: Mutex<Option<String>> = Mutex::new(None);
+
+/// 写入启动参数中的保险柜路径（main.rs 调用）
+pub fn set_launch_vault_arg(path: Option<String>) {
+    if let Ok(mut guard) = LAUNCH_VAULT_ARG.lock() {
+        *guard = path;
+    }
 }
 
 /// 2.3.0 修复（Mutex 中毒恢复）：任何命令在持有锁期间 panic 会使锁永久中毒，
@@ -68,49 +81,67 @@ fn catch<R, F: FnOnce() -> Result<R, String>>(label: &str, f: F) -> Result<R, St
     }
 }
 
+/// 2.4.1 新增（P0-1）：把重 I/O 命令丢到阻塞线程池执行，避免冻结 UI 主线程。
+/// 闭包在阻塞线程中拿到 AppState 引用（锁语义与旧同步命令完全一致）。
+async fn run_blocking<T, F>(app: &AppHandle, label: &str, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+{
+    let app = app.clone();
+    let label = label.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        catch(&label, move || f(&state))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
+}
+
 // ───────────────── 保险柜生命周期 ─────────────────
 
 #[tauri::command]
-pub fn create_vault(
-    state: State<AppState>,
+pub async fn create_vault(
+    app: AppHandle,
     path: String,
     mut password: String,
     key_file_path: Option<String>,
-) -> Result<String, String> {
-    catch("create_vault", || {
+) -> Result<(), String> {
+    run_blocking(&app, "create_vault", move |state| {
         state.check_auth_cooldown()?;
         // 2.3.0 修复：密码 / 密钥文件在所有路径（含 load_key_file 失败、操作失败）上都零化，
         // 旧实现 `?` 提前返回会跳过零化。
-        let result: Result<String, String> = (|| {
+        let result: Result<(), String> = (|| {
             let key_data = load_key_file(&key_file_path)?;
             let created: Result<(), String> = (|| {
-                Vault::create(Path::new(&path), &password, key_data.as_deref())
-                    .map_err(|e| e.to_string())?;
+                // 2.4.1（P2-20）：Vault::create 成功即进入已解锁会话
+                // （旧流程 create 后再 open_and_authenticate 要重复 8 次 Argon2id）
                 let mut vault = Vault::default();
-                vault.open_and_authenticate(Path::new(&path), &password, key_data.as_deref())
+                vault.create(Path::new(&path), &password, key_data.as_deref())
                     .map_err(|e| e.to_string())?;
-                let mut guard = lock_vault(&state)?;
+                let mut guard = lock_vault(state)?;
                 *guard = Some(vault);
                 Ok(())
             })();
             if let Some(kd) = key_data {
                 vault_core::wipe::secure_wipe_vec(kd);
             }
-            created.map(|_| "保险柜创建成功".into())
+            created
         })();
         password.as_mut_str().zeroize();
         result
     })
+    .await
 }
 
 #[tauri::command]
-pub fn open_vault(
-    state: State<AppState>,
+pub async fn open_vault(
+    app: AppHandle,
     path: String,
     mut password: String,
     key_file_path: Option<String>,
 ) -> Result<usize, String> {
-    catch("open_vault", || {
+    run_blocking(&app, "open_vault", move |state| {
         state.check_auth_cooldown()?;
         let result: Result<usize, String> = (|| {
             let key_data = load_key_file(&key_file_path)?;
@@ -118,7 +149,7 @@ pub fn open_vault(
                 let mut vault = Vault::default();
                 let idx = vault.open_and_authenticate(Path::new(&path), &password, key_data.as_deref())
                     .map_err(|e| e.to_string())?;
-                let mut guard = lock_vault(&state)?;
+                let mut guard = lock_vault(state)?;
                 *guard = Some(vault);
                 Ok(idx)
             })();
@@ -130,23 +161,30 @@ pub fn open_vault(
         password.as_mut_str().zeroize();
         result
     })
+    .await
 }
 
 #[tauri::command]
-pub fn close_vault(state: State<AppState>) -> Result<(), String> {
-    catch("close_vault", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn close_vault(app: AppHandle) -> Result<(), String> {
+    run_blocking(&app, "close_vault", move |state| {
+        let mut guard = lock_vault(state)?;
+        if let Some(v) = guard.as_mut() {
+            v.close(); // 2.4.1：清理索引缓存 + 审计补落盘，再释放会话
+        }
         *guard = None;
         Ok(())
     })
+    .await
 }
 
 // ───────────────── 文件浏览 ─────────────────
 
+/// 2.4.1（P1-16）：返回结构化数组而非手工序列化的 JSON 字符串，
+/// 免去前端 JSON.parse；数组语义与旧版一致。
 #[tauri::command]
-pub fn list_folder(state: State<AppState>, folder: String) -> Result<String, String> {
-    catch("list_folder", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<serde_json::Value>, String> {
+    run_blocking(&app, "list_folder", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let index = vault.load_index().map_err(|e| e.to_string())?;
 
@@ -189,16 +227,21 @@ pub fn list_folder(state: State<AppState>, folder: String) -> Result<String, Str
             else { std::cmp::Ordering::Greater }
         });
 
-        serde_json::to_string(&items).map_err(|e| e.to_string())
+        Ok(items)
     })
+    .await
 }
 
 // ───────────────── 文件导入 ─────────────────
 
 #[tauri::command]
-pub fn import_file(state: State<AppState>, src_path: String, dest_vpath: String) -> Result<(), String> {
-    catch("import_file", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn import_file(
+    app: AppHandle,
+    src_path: String,
+    dest_vpath: String,
+) -> Result<(), String> {
+    run_blocking(&app, "import_file", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let src = Path::new(&src_path);
         // 由文件名 + 目标目录构造完整虚拟路径，使文件放入当前浏览的目录
@@ -208,35 +251,73 @@ pub fn import_file(state: State<AppState>, src_path: String, dest_vpath: String)
         let full_vpath = format!("{}/{}", dest_vpath.trim_end_matches('/'), filename);
         vault.import_file(src, &full_vpath).map_err(|e| e.to_string())
     })
+    .await
+}
+
+/// 2.4.1 新增（P0-2）：批量导入文件。
+/// 单次索引加密落盘替代 N 次（旧版前端循环 import_file 时每个文件都全量重写索引 + 10 次 fsync）。
+/// 返回 { ok, fail } 供前端展示结果。
+#[tauri::command]
+pub async fn import_files_batch(
+    app: AppHandle,
+    src_paths: Vec<String>,
+    dest_base: String,
+) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "import_files_batch", move |state| {
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        let (ok, fail) = vault.import_files_batch(&src_paths, &dest_base)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "ok": ok, "fail": fail }))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn import_folder(state: State<AppState>, src_folder: String, dest_base: String) -> Result<(), String> {
-    catch("import_folder", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn import_folder(
+    app: AppHandle,
+    src_folder: String,
+    dest_base: String,
+) -> Result<(), String> {
+    run_blocking(&app, "import_folder", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         vault.import_folder(Path::new(&src_folder), &dest_base).map_err(|e| e.to_string())
     })
+    .await
 }
 
 /// 拖放导入：自动判断路径是文件还是文件夹，批量导入到 dest_base 下
-/// 返回 JSON：{ summary, files:[], folders:[] } 供前端提示安全删除源文件
+/// 2.4.1（P1-16）：返回结构化对象 { summary, files, folders, errors? } 供前端提示安全删除源文件
 #[tauri::command]
-pub fn import_dropped_paths(
-    state: State<AppState>,
+pub async fn import_dropped_paths(
+    app: AppHandle,
     paths: Vec<String>,
     dest_base: String,
-) -> Result<String, String> {
-    catch("import_dropped_paths", || {
-        let mut guard = lock_vault(&state)?;
+) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "import_dropped_paths", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
 
         let mut imported_files: Vec<String> = Vec::new();
         let mut imported_folders: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
 
-        for p in &paths {
-            let path = std::path::Path::new(p);
+        // 2.4.1 新功能：拖入的 .lyt/.vault 是保险柜文件而非待加密文件 —— 分流处理，
+        // 由前端走「打开保险柜」流程，这里直接跳过（不导入、不报错）。
+        let (vault_files, normal_paths): (Vec<String>, Vec<String>) = paths
+            .into_iter()
+            .partition(|p| {
+                let path = Path::new(p);
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("lyt") || s.eq_ignore_ascii_case("vault"))
+                    .unwrap_or(false);
+                ext && vault_core::is_vault_file(path)
+            });
+
+        for p in &normal_paths {
+            let path = Path::new(p);
             if path.is_dir() {
                 match vault.import_folder(path, &dest_base) {
                     Ok(_) => imported_folders.push(p.clone()),
@@ -261,40 +342,52 @@ pub fn import_dropped_paths(
         let summary = if parts.is_empty() { "未导入任何内容".into() }
                       else { format!("拖放导入完成：{}", parts.join("，")) };
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "summary": summary,
             "files": imported_files,
             "folders": imported_folders,
         });
-
+        // 2.4.1：把识别出的保险柜文件带回给前端（触发打开流程）
+        if !vault_files.is_empty() {
+            result["vault_files"] = serde_json::json!(vault_files);
+        }
         if !errors.is_empty() {
-            let mut full = result.clone();
-            full["errors"] = serde_json::json!(errors);
-            full["summary"] = serde_json::json!(
+            result["errors"] = serde_json::json!(errors);
+            result["summary"] = serde_json::json!(
                 format!("{}\n以下项目导入失败：\n{}", summary, errors.join("\n"))
             );
-            Ok(full.to_string())
-        } else {
-            Ok(result.to_string())
         }
+        Ok(result)
     })
+    .await
 }
 
 // ───────────────── 文件提取 ─────────────────
 
 #[tauri::command]
-pub fn extract_file(state: State<AppState>, vpath: String, dest_folder: String) -> Result<(), String> {
-    catch("extract_file", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn extract_file(
+    app: AppHandle,
+    vpath: String,
+    dest_folder: String,
+) -> Result<(), String> {
+    run_blocking(&app, "extract_file", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        vault.extract_file(&vpath, Path::new(&dest_folder)).map_err(|e| e.to_string())
+        // 2.4.1（P0-5）：overwrite=true 显式覆盖（旧实现固定 create_new，
+        // 重复提取同名文件会报错；语义改为「最后提取的生效」）
+        vault.extract_file(&vpath, Path::new(&dest_folder), true).map_err(|e| e.to_string())
     })
+    .await
 }
 
 #[tauri::command]
-pub fn extract_files(state: State<AppState>, vpaths: Vec<String>, dest_folder: String) -> Result<usize, String> {
-    catch("extract_files", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn extract_files(
+    app: AppHandle,
+    vpaths: Vec<String>,
+    dest_folder: String,
+) -> Result<usize, String> {
+    run_blocking(&app, "extract_files", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         // 2.3.0 修复：委托给 vault-core 批量提取（单次 load_index + extract_file_inner，
         // 避免对每个文件重复 load_index 的 O(n²) 退化）
@@ -302,60 +395,77 @@ pub fn extract_files(state: State<AppState>, vpaths: Vec<String>, dest_folder: S
             .map_err(|e| e.to_string())?;
         Ok(ok)
     })
+    .await
 }
 
 // ───────────────── 文件/文件夹删除 ─────────────────
 
+/// 2.4.1：vault-core 的批量删除现在同时展开文件夹并返回 (文件数, 文件夹数)，
+/// 结构化返回 { files, folders } 供 UI 精确反馈。
 #[tauri::command]
-pub fn delete_files(state: State<AppState>, vpaths: Vec<String>) -> Result<usize, String> {
-    catch("delete_files", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn delete_files(app: AppHandle, vpaths: Vec<String>) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "delete_files", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         // 委托给 vault-core 的批量删除方法：一次 load + 批量 DoD 7-pass 擦除 + 一次 save
-        vault.secure_delete_files_batch(&vpaths).map_err(|e| e.to_string())
+        let (files, folders) = vault.secure_delete_files_batch(&vpaths)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "files": files, "folders": folders }))
     })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_folder(state: State<AppState>, vpath: String) -> Result<(), String> {
-    catch("delete_folder", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn delete_folder(app: AppHandle, vpath: String) -> Result<(), String> {
+    run_blocking(&app, "delete_folder", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         vault.delete_folder(&vpath).map_err(|e| e.to_string())
     })
+    .await
 }
 
-// ───────────────── 新建文件夹 ─────────────────
+// ───────────────── 新建文件夹 / 重命名 ─────────────────
 
 #[tauri::command]
-pub fn new_folder(state: State<AppState>, vpath: String) -> Result<(), String> {
-    catch("new_folder", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn new_folder(app: AppHandle, vpath: String) -> Result<(), String> {
+    run_blocking(&app, "new_folder", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let mut im = vault.get_index_manager().map_err(|e| e.to_string())?;
         im.add_folder(&vpath).map_err(|e| e.to_string())
     })
+    .await
 }
 
-// ───────────────── 重命名 ─────────────────
-
 #[tauri::command]
-pub fn rename_item(state: State<AppState>, old_vpath: String, new_name: String, is_folder: bool) -> Result<(), String> {
-    catch("rename_item", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn rename_item(
+    app: AppHandle,
+    old_vpath: String,
+    new_name: String,
+    is_folder: bool,
+) -> Result<(), String> {
+    run_blocking(&app, "rename_item", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let mut im = vault.get_index_manager().map_err(|e| e.to_string())?;
         if is_folder { im.rename_folder(&old_vpath, &new_name) }
         else { im.rename_file(&old_vpath, &new_name) }
         .map_err(|e| e.to_string())
     })
+    .await
 }
 
 // ───────────────── 分区管理 ─────────────────
 
 #[tauri::command]
-pub fn add_partition(state: State<AppState>, alias: String, mut password: String, key_file_path: Option<String>) -> Result<(), String> {
-    catch("add_partition", || {
+pub async fn add_partition(
+    app: AppHandle,
+    alias: String,
+    mut password: String,
+    key_file_path: Option<String>,
+) -> Result<(), String> {
+    run_blocking(&app, "add_partition", move |state| {
         // 分区别名校验：只允许安全字符，防止 XSS
         if !alias.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ') {
             return Err("分区别名只能包含字母、数字、下划线、短横线和空格".into());
@@ -367,7 +477,7 @@ pub fn add_partition(state: State<AppState>, alias: String, mut password: String
         let result: Result<(), String> = (|| {
             let key_data = load_key_file(&key_file_path)?;
             let added: Result<(), String> = (|| {
-                let mut guard = lock_vault(&state)?;
+                let mut guard = lock_vault(state)?;
                 let vault = guard.as_mut().ok_or("保险柜未打开")?;
                 vault.add_partition(&alias, &password, key_data.as_deref()).map_err(|e| e.to_string())
             })();
@@ -379,47 +489,50 @@ pub fn add_partition(state: State<AppState>, alias: String, mut password: String
         password.as_mut_str().zeroize();
         result
     })
+    .await
 }
 
 #[tauri::command]
-pub fn remove_partition(state: State<AppState>, alias: String) -> Result<(), String> {
-    catch("remove_partition", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn remove_partition(app: AppHandle, alias: String) -> Result<(), String> {
+    run_blocking(&app, "remove_partition", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         vault.remove_partition(&alias).map_err(|e| e.to_string())
     })
+    .await
 }
 
+/// 2.4.1（P1-16）：返回结构化数组
 #[tauri::command]
-pub fn list_partitions(state: State<AppState>) -> Result<String, String> {
-    catch("list_partitions", || {
-        let guard = lock_vault(&state)?;
+pub async fn list_partitions(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    run_blocking(&app, "list_partitions", move |state| {
+        let guard = lock_vault(state)?;
         let vault = guard.as_ref().ok_or("保险柜未打开")?;
         let parts: Vec<serde_json::Value> = vault.get_partitions().iter().enumerate().map(|(i, p)| {
             serde_json::json!({ "index": i, "alias": p.alias })
         }).collect();
-        serde_json::to_string(&parts).map_err(|e| e.to_string())
+        Ok(parts)
     })
+    .await
 }
 
-// ───────────────── 碎片整理 ─────────────────
+// ───────────────── 碎片整理 / 销毁 ─────────────────
 
 #[tauri::command]
-pub fn defragment_vault(state: State<AppState>) -> Result<String, String> {
-    catch("defragment_vault", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn defragment_vault(app: AppHandle) -> Result<String, String> {
+    run_blocking(&app, "defragment_vault", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         vault.defragment_vault(None::<fn(usize)>).map_err(|e| e.to_string())?;
         Ok("碎片整理完成".into())
     })
+    .await
 }
 
-// ───────────────── 销毁保险柜 ─────────────────
-
 #[tauri::command]
-pub fn destroy_vault(state: State<AppState>) -> Result<(), String> {
-    catch("destroy_vault", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
+    run_blocking(&app, "destroy_vault", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault_path = guard.as_ref()
             .and_then(|v| v.get_path().map(|p| p.to_path_buf()))
             .ok_or("保险柜未打开或路径不可用")?;
@@ -432,15 +545,7 @@ pub fn destroy_vault(state: State<AppState>) -> Result<(), String> {
         }
 
         // 在释放 guard 前先打开文件，缩小 TOCTOU 窗口
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let _fd = std::fs::OpenOptions::new().write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&vault_path)
-                .map_err(|_| "目标文件已被符号链接替换")?;
-            drop(_fd);
-        }
+        // 2.4.1：仅保留 Windows 分支（本应用仅面向 Windows 发布）
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -451,56 +556,85 @@ pub fn destroy_vault(state: State<AppState>) -> Result<(), String> {
                 .map_err(|_| "目标文件已被重解析点替换")?;
             drop(_fd);
         }
+        if let Some(v) = guard.as_mut() {
+            v.close();
+        }
         *guard = None;
         vault_core::wipe::dod_erase(&vault_path, None).map_err(|e| e.to_string())?;
 
         Ok(())
     })
+    .await
 }
 
-// ───────────────── 文件信息 ─────────────────
+// ───────────────── 文件信息与预览 ─────────────────
 
+/// 2.4.1（P1-16）：返回结构化对象
 #[tauri::command]
-pub fn get_file_info(state: State<AppState>, vpath: String) -> Result<String, String> {
-    catch("get_file_info", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn get_file_info(app: AppHandle, vpath: String) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "get_file_info", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let index = vault.load_index().map_err(|e| e.to_string())?;
         if let Some(meta) = index.files.get(&vpath) {
-            serde_json::to_string(&serde_json::json!({
+            Ok(serde_json::json!({
                 "name": meta.name, "size": meta.size, "vpath": vpath,
-            })).map_err(|e| e.to_string())
+            }))
         } else {
             Err("文件不存在".into())
         }
     })
+    .await
 }
 
-// ───────────────── 加载文件内容（安全查看用） ─────────────────
+/// 预览大小上限（64 MiB）：预览走「整文件读入内存」路径，
+/// 超大文件直接提示提取后查看，避免一次性占用数百 MB 内存。
+const MAX_PREVIEW_SIZE: u64 = 64 * 1024 * 1024;
 
+/// 2.4.1（P0-4）：返回 base64 字符串而不是 Vec<u8>。
+/// Tauri 1.x 把 Vec<u8> 序列化成 JSON 数字数组（每字节一个数字 + 逗号），
+/// 预览一张 5MB 图片实际要在 IPC 上传输几十 MB 的 JSON 文本；
+/// base64 只有 1.33× 膨胀，且前端图片可直接拼 data URL。
+/// 同时在读取前校验文件大小，超过 64 MiB 拒绝预览。
 #[tauri::command]
-pub fn load_file_content(state: State<AppState>, vpath: String) -> Result<Vec<u8>, String> {
-    catch("load_file_content", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn load_file_content(app: AppHandle, vpath: String) -> Result<String, String> {
+    run_blocking(&app, "load_file_content", move |state| {
+        use base64::Engine;
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        vault.load_file_data(&vpath).map_err(|e| e.to_string())
+        let size = {
+            let index = vault.load_index().map_err(|e| e.to_string())?;
+            index.files.get(&vpath)
+                .map(|m| m.size)
+                .ok_or("文件不存在")?
+        };
+        if size > MAX_PREVIEW_SIZE {
+            return Err(format!(
+                "文件过大（{}），预览上限 64 MB，请使用「提取」导出后查看",
+                size
+            ));
+        }
+        let data = vault.load_file_data(&vpath).map_err(|e| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        vault_core::wipe::secure_wipe_vec(data);
+        Ok(b64)
     })
+    .await
 }
 
-// ───────────────── Office 文档预览 ─────────────────
-
 #[tauri::command]
-pub fn preview_office_file(state: State<AppState>, vpath: String) -> Result<String, String> {
-    catch("preview_office_file", || {
-        let mut guard = lock_vault(&state)?;
+pub async fn preview_office_file(app: AppHandle, vpath: String) -> Result<String, String> {
+    run_blocking(&app, "preview_office_file", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         let data = vault.load_file_data(&vpath).map_err(|e| e.to_string())?;
         let filename = vpath.rsplit('/').next().unwrap_or(&vpath);
-        vault_core::office::extract_office_text(&data, filename)
+        let text = vault_core::office::extract_office_text(&data, filename);
+        vault_core::wipe::secure_wipe_vec(data);
+        text
     })
+    .await
 }
-
-
 
 // ───────────────── 辅助函数 ─────────────────
 
@@ -514,6 +648,50 @@ fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+// ───────────────── .lyt 文件自动识别（2.4.1 新功能） ─────────────────
+
+/// 检查一个路径是否为 LynVault 保险柜文件（扩展名 + magic bytes 双重校验）。
+/// 供前端拖放 .lyt 到窗口时自动识别并直接进入密码输入流程，
+/// 避免把保险柜文件本身误当作待加密文件导入另一个保险柜。
+#[tauri::command]
+pub fn check_vault_file(path: String) -> Result<bool, String> {
+    catch("check_vault_file", || {
+        let p = Path::new(&path);
+        let ext = p.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("lyt") || s.eq_ignore_ascii_case("vault"))
+            .unwrap_or(false);
+        if !ext {
+            return Ok(false);
+        }
+        // N6：magic bytes 校验，避免把其他工具的同后缀文件（HashiCorp Vault 等）
+        // 误识别为 LynVault 保险柜
+        Ok(vault_core::is_vault_file(p))
+    })
+}
+
+/// 读取启动参数中传入的保险柜路径（文件关联双击 .lyt 启动时由 main.rs 写入）。
+/// 前端启动时调用；读取后清除，保证重载页面不会重复弹出。
+#[tauri::command]
+pub fn get_launch_vault_arg() -> Result<Option<String>, String> {
+    catch("get_launch_vault_arg", || {
+        if let Ok(mut guard) = LAUNCH_VAULT_ARG.lock() {
+            Ok(guard.take())
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+/// 2.4.1 新增：前端初始化完成后调用，置位就绪标志。
+/// 单实例转发的打开请求会等到前端就绪后才发 `vault-file-requested` 事件，
+/// 避免事件在监听器注册前发出而丢失。
+#[tauri::command]
+pub fn frontend_ready() -> Result<(), String> {
+    crate::single_instance::FRONTEND_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 // ───────────────── 启动检测：扫描目录下的保险柜文件 ─────────────────
 
 /// 扫描指定目录下（非递归）的 .lyt / .vault 文件，返回文件名列表（按修改时间倒序）。
@@ -523,73 +701,79 @@ fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
 ///   1. Tauri 路径变量占位符：`$DESKTOP` / `$DOCUMENT` / `$DOWNLOAD` / `$HOME`
 ///      由后端解析为实际路径
 ///   2. 绝对路径：直接使用
+///
+/// 2.4.1（P0-1）：目录扫描移入阻塞线程池（网络驱动器/大目录不会冻结 UI）。
 #[tauri::command]
-pub fn scan_vault_files(dir: String) -> Result<Vec<serde_json::Value>, String> {
-    catch("scan_vault_files", || {
-        // 解析 Tauri 路径变量占位符
-        let resolved_dir = match dir.as_str() {
-            "$DESKTOP" => tauri::api::path::desktop_dir(),
-            "$DOCUMENT" => tauri::api::path::document_dir(),
-            "$DOWNLOAD" => tauri::api::path::download_dir(),
-            "$HOME" => tauri::api::path::home_dir(),
-            _ => Some(std::path::PathBuf::from(&dir)),
-        };
-        let dir_path = match resolved_dir {
-            Some(p) => p,
-            None => return Ok(Vec::new()),
-        };
-        if !dir_path.is_dir() {
-            return Ok(Vec::new());
-        }
-        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
-        for entry in std::fs::read_dir(&dir_path).map_err(|e| e.to_string())? {
-            let entry = match entry { Ok(e) => e, Err(_) => continue };
-            let path = entry.path();
-            // 仅扫描普通文件，跳过符号链接防止被利用
-            let meta = match std::fs::symlink_metadata(&path) { Ok(m) => m, Err(_) => continue };
-            if meta.file_type().is_symlink() { continue; }
-            if !meta.file_type().is_file() { continue; }
-            // 后缀检查：.lyt 或 .vault（兼容旧版）
-            let ext = path.extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase())
-                .unwrap_or_default();
-            if ext != "lyt" && ext != "vault" { continue; }
-            // N6 修复：验证 magic bytes，避免误识别其他工具的同后缀文件
-            // （如 HashiCorp Vault、1Password 等）
-            if !vault_core::is_vault_file(&path) { continue; }
-            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            entries.push((path, mtime, meta.len()));
-        }
-        // 按修改时间倒序（最新在前）
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        let result = entries.into_iter().map(|(p, mtime, size)| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-            let mtime_secs = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            serde_json::json!({
-                "path": p.to_string_lossy().to_string(),
-                "name": name,
-                "mtime": mtime_secs,
-                "size": size,
-            })
-        }).collect();
-        Ok(result)
+pub async fn scan_vault_files(dir: String) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("scan_vault_files", || {
+            // 解析 Tauri 路径变量占位符
+            let resolved_dir = match dir.as_str() {
+                "$DESKTOP" => tauri::api::path::desktop_dir(),
+                "$DOCUMENT" => tauri::api::path::document_dir(),
+                "$DOWNLOAD" => tauri::api::path::download_dir(),
+                "$HOME" => tauri::api::path::home_dir(),
+                _ => Some(std::path::PathBuf::from(&dir)),
+            };
+            let dir_path = match resolved_dir {
+                Some(p) => p,
+                None => return Ok(Vec::new()),
+            };
+            if !dir_path.is_dir() {
+                return Ok(Vec::new());
+            }
+            let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
+            for entry in std::fs::read_dir(&dir_path).map_err(|e| e.to_string())? {
+                let entry = match entry { Ok(e) => e, Err(_) => continue };
+                let path = entry.path();
+                // 仅扫描普通文件，跳过符号链接防止被利用
+                let meta = match std::fs::symlink_metadata(&path) { Ok(m) => m, Err(_) => continue };
+                if meta.file_type().is_symlink() { continue; }
+                if !meta.file_type().is_file() { continue; }
+                // 后缀检查：.lyt 或 .vault（兼容旧版）
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                if ext != "lyt" && ext != "vault" { continue; }
+                // N6 修复：验证 magic bytes，避免误识别其他工具的同后缀文件
+                // （如 HashiCorp Vault、1Password 等）
+                if !vault_core::is_vault_file(&path) { continue; }
+                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                entries.push((path, mtime, meta.len()));
+            }
+            // 按修改时间倒序（最新在前）
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let result = entries.into_iter().map(|(p, mtime, size)| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                let mtime_secs = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "path": p.to_string_lossy().to_string(),
+                    "name": name,
+                    "mtime": mtime_secs,
+                    "size": size,
+                })
+            }).collect();
+            Ok(result)
+        })
     })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
 }
 
 // ───────────────── 提取全部文件 ─────────────────
 
 /// 检查提取全部文件时目标子文件夹是否已存在（供前端预检覆盖提示）。
-/// 返回 JSON：{ exists, dest_name, dest_path }
+/// 2.4.1（P1-16）：返回结构化对象 { exists, dest_name, dest_path }
 #[tauri::command]
-pub fn check_extract_all_dest(
-    state: State<AppState>,
+pub async fn check_extract_all_dest(
+    app: AppHandle,
     dest_parent_folder: String,
-) -> Result<String, String> {
-    catch("check_extract_all_dest", || {
-        let guard = lock_vault(&state)?;
+) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "check_extract_all_dest", move |state| {
+        let guard = lock_vault(state)?;
         let vault = guard.as_ref().ok_or("保险柜未打开")?;
         let vault_path = vault.get_path().ok_or("保险柜未打开或路径不可用")?;
         let stem = vault_path.file_stem()
@@ -604,25 +788,25 @@ pub fn check_extract_all_dest(
         let dest_parent = Path::new(&dest_parent_folder);
         let dest_root = dest_parent.join(&safe_stem);
         let exists = dest_root.exists();
-        let result = serde_json::json!({
+        Ok(serde_json::json!({
             "exists": exists,
             "dest_name": safe_stem,
             "dest_path": dest_root.to_string_lossy(),
-        });
-        Ok(result.to_string())
+        }))
     })
+    .await
 }
 
 /// 提取保险柜内所有文件到指定父目录下。
 /// 会自动创建一个与保险柜文件同名（去掉 .lyt/.vault 后缀）的子文件夹作为容器。
-/// 返回 JSON：{ ok, fail, dest } 供前端显示结果。
+/// 2.4.1（P1-16）：返回结构化对象 { ok, fail, dest } 供前端显示结果。
 #[tauri::command]
-pub fn extract_all_files(
-    state: State<AppState>,
+pub async fn extract_all_files(
+    app: AppHandle,
     dest_parent_folder: String,
-) -> Result<String, String> {
-    catch("extract_all_files", || {
-        let mut guard = lock_vault(&state)?;
+) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "extract_all_files", move |state| {
+        let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
 
         // 解析保险柜文件名（去掉后缀）作为根文件夹名
@@ -651,14 +835,16 @@ pub fn extract_all_files(
         std::fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
 
         // 委托给 vault-core：单次 load_index，避免 O(n²) 重复加载
-        let (ok, fail) = vault.extract_all_files(&dest_root).map_err(|e| e.to_string())?;
-        let result = serde_json::json!({
+        // 2.4.1（P0-5）：overwrite=true —— 前端已通过 check_extract_all_dest 预检
+        // 并向用户确认覆盖；旧实现确认「覆盖」后仍用 create_new 拒绝，大批失败
+        let (ok, fail) = vault.extract_all_files(&dest_root, true).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
             "ok": ok,
             "fail": fail,
             "dest": dest_root.to_string_lossy(),
-        });
-        Ok(result.to_string())
+        }))
     })
+    .await
 }
 
 // ───────────────── 文件类型图标（Windows 系统图标） ─────────────────
@@ -863,3 +1049,7 @@ impl Drop for DcGuard {
         unsafe { let _ = DeleteDC(self.0); }
     }
 }
+
+// State 引用保留（run_blocking 内部经由 Manager::state 获取，此导入防止误删告警）
+#[allow(unused)]
+fn _state_type_check(_: State<AppState>) {}

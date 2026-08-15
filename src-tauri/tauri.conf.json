@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "LynVault",
-    "version": "2.4.0"
+    "version": "2.4.1"
   },
   "tauri": {
     "allowlist": {
@@ -24,6 +24,10 @@
       "fs": {
         "all": false,
         "scope": ["$APPDATA/**", "$DESKTOP/**", "$DOCUMENT/**", "$DOWNLOAD/**"]
+      },
+      "shell": {
+        "all": false,
+        "open": "https://github.com/lynvortex/LynVault"
       },
       "window": {
         "all": false,
@@ -57,7 +61,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "LynVault 2.4.0",
+        "title": "LynVault 2.4.1",
         "width": 960,
         "height": 620,
         "center": true,

@@ -138,6 +138,20 @@ fn extract_doc_text(data: &[u8]) -> io::Result<String> {
         let hi = stream_data[i + 1];
         let ch = u16::from_le_bytes([lo, hi]);
 
+        // 2.4.1 修复（P2-23）：处理 UTF-16 代理对（CJK 扩展 B 等增补平面字符）。
+        // 旧实现把高/低代理分别当独立 u16 转 char，from_u32 失败全部变 '?'。
+        if (0xD800..=0xDBFF).contains(&ch) && i + 3 < scan_end {
+            let lo2 = stream_data[i + 2];
+            let hi2 = stream_data[i + 3];
+            let low_pair = u16::from_le_bytes([lo2, hi2]);
+            if (0xDC00..=0xDFFF).contains(&low_pair) {
+                let c = (((ch as u32) - 0xD800) << 10 | (low_pair as u32) - 0xDC00) + 0x10000;
+                current.push(char::from_u32(c).unwrap_or('?'));
+                i += 4;
+                continue;
+            }
+        }
+
         if is_word_text_char(ch) {
             current.push(char::from_u32(ch as u32).unwrap_or('?'));
         } else if current.len() >= 4 {

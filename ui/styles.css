@@ -39,7 +39,23 @@ body {
     background: rgba(255, 255, 255, 0.42);
 }
 .app-brand { display: flex; align-items: center; gap: 7px; color: #31546a; font-size: 12px; font-weight: 650; }
-.brand-mark { display: grid; width: 19px; height: 19px; place-items: center; border-radius: 6px; background: linear-gradient(135deg, var(--accent-start), var(--accent-end)); color: #fff; font-size: 11px; }
+/* 2.4.1：开源地址链接（标题栏右侧，紧邻窗口控制按钮前）。
+   margin-left:auto 把它推到最右；标题栏整体是 space-between 布局，
+   auto margin 吸收全部剩余空间后链接与窗口按钮一起靠右。 */
+.repo-link {
+    margin-left: auto;
+    margin-right: 10px;
+    padding: 3px 9px;
+    border-radius: 7px;
+    color: #4a7d99;
+    font-size: 11px;
+    text-decoration: none;
+    border: 1px solid rgba(74, 125, 153, 0.35);
+    background: rgba(255, 255, 255, 0.45);
+    white-space: nowrap;
+    cursor: pointer;
+}
+.repo-link:hover { color: #1f536f; border-color: rgba(31, 83, 111, 0.55); background: rgba(255, 255, 255, 0.75); }
 .window-controls { display: flex; align-self: stretch; }
 button.window-control { width: 42px; min-width: 42px; padding: 0; border-radius: 0; background: transparent; box-shadow: none; color: #496174; font-size: 16px; line-height: 1; }
 button.window-control:hover:not(:disabled) { transform: none; background: rgba(69, 126, 159, 0.13); box-shadow: none; color: #1f536f; }
