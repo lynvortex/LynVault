@@ -89,6 +89,15 @@ const SIGNATURE_SIZE: usize = 64;
 
 const DEFAULT_PARTITION: &str = "Main";
 
+/// 自动整理阈值:删除类操作后,死空间(已被安全擦除但仍占位的区域)同时满足
+/// 「绝对值 ≥ 64 MiB」与「占文件大小 ≥ 30%」时,自动执行一次紧凑整理。
+/// 仅单分区保险柜启用 —— 多分区整理不回收空间(其他分区数据位置未知,不能
+/// 截断文件),自动执行没有收益。
+const AUTO_DEFRAG_MIN_DEAD_BYTES: u64 = 64 * 1024 * 1024;
+/// 30% 用整数运算表示(3/10),避免浮点比较的边界误差
+const AUTO_DEFRAG_DEAD_RATIO_NUM: u64 = 3;
+const AUTO_DEFRAG_DEAD_RATIO_DEN: u64 = 10;
+
 /// 单次操作中内存缓冲区的上限（256 MiB）。
 /// 超过此大小的文件改用流式读写，避免 OOM（M1 修复）。
 const MAX_INMEM_BUFFER: usize = 256 * 1024 * 1024;
@@ -351,6 +360,50 @@ fn sanitize_filename(name: &str) -> String {
     if safe.is_empty() { "extracted_file".to_string() } else { safe }
 }
 
+/// Windows：源文件名为保留设备名（CON/NUL/COM1… 及其带扩展名形式）时，
+/// 普通 Win32 路径的打开请求会被路径归一化重写到设备本身 —— 读到的是
+/// 控制台/空设备（表现为「函数不正确」错误或读取挂起），而非磁盘上的真实
+/// 文件。此类文件可由 msys/WSL/`\\?\` 路径合法创建，导入时需改用 verbatim
+/// （`\\?\`）路径打开以禁用重写；其余文件维持原路径不变。
+#[cfg(windows)]
+fn open_import_source(src_path: &Path) -> std::io::Result<File> {
+    const RESERVED_STEMS: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let is_reserved = src_path.file_name()
+        .and_then(|n| n.to_str())
+        .map_or(false, |n| {
+            let upper = n.to_uppercase();
+            let stem = match upper.rfind('.') { Some(p) => &upper[..p], None => upper.as_str() };
+            RESERVED_STEMS.contains(&stem)
+        });
+    if !is_reserved {
+        return File::open(src_path);
+    }
+    let as_str = match src_path.as_os_str().to_str() {
+        Some(s) if src_path.is_absolute() && !s.starts_with(r"\\?\") => s,
+        _ => return File::open(src_path),
+    };
+    // 本地绝对路径 → \\?\C:\...；UNC → \\?\UNC\server\share\...
+    let verbatim = if let Some(rest) = as_str.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{}", rest)
+    } else {
+        format!(r"\\?\{}", as_str)
+    };
+    match File::open(Path::new(&verbatim)) {
+        Ok(f) => Ok(f),
+        // verbatim 打开失败（非常规路径形式等）→ 退回普通打开，保持原错误语义
+        Err(_) => File::open(src_path),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_import_source(src_path: &Path) -> std::io::Result<File> {
+    File::open(src_path)
+}
+
 /// 校验**新录入**的分区别名（与 commands.rs 前端校验保持一致，供库级 API 直接调用时防护）。
 ///
 /// 2.6.1 加固：字符集收紧为 ASCII-only。旧实现用 `char::is_alphanumeric()`，
@@ -538,6 +591,22 @@ impl Vault {
         }
         if self.is_open() {
             return Err(VaultError::AlreadyOpen);
+        }
+
+        // 2.7.0 修复：create 以 create+truncate 打开，目标路径上的任何已有文件
+        // 会在 open 瞬间被清零且不可恢复（连 7-pass 擦除都没经过）——尤其致命的
+        // 是误覆盖另一个保险柜。UI 的保存对话框虽有「覆盖？」确认，但库级 API
+        // 此前没有任何防护。现在：目标已是保险柜文件（magic 匹配）或目录时直接拒绝；
+        // 非保险柜的普通文件仍允许覆盖（用户已在保存对话框中显式确认）。
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.is_dir() {
+                return Err(VaultError::Other("目标路径是目录，无法创建保险柜".into()));
+            }
+            if is_vault_file(path) {
+                return Err(VaultError::Other(
+                    "目标路径已存在一个保险柜文件，拒绝覆盖（请选择其他位置或先手动删除）".into(),
+                ));
+            }
         }
 
         let mut file = open_vault_rw(path, true)?;
@@ -1099,15 +1168,37 @@ impl Vault {
             return Err(VaultError::Other(format!("目标路径已存在: {}", vpath)));
         }
 
-        // 2.3.0 修复：先查文件大小，超过内存上限直接拒绝，避免整文件读入导致 OOM
-        let src_meta = fs::metadata(src_path)?;
+        // 2.7.0 修复（TOCTOU）：旧实现「fs::metadata 查大小 → fs::read 整读」，
+        // 两步之间源文件可被替换/膨胀，fs::read 会按实际内容无限分配内存（OOM）。
+        // 现改为句柄化读取：按元数据预分配（封顶 MAX_INMEM_BUFFER），并用
+        // take(MAX+1) 硬性限制读取总量，读取后超限即拒绝 —— 无论文件中途如何
+        // 变化，分配都有上界。
+        let src_file = open_import_source(src_path)?;
+        let src_meta = src_file.metadata()?;
         if src_meta.len() > MAX_INMEM_BUFFER as u64 {
             return Err(VaultError::Other(format!(
                 "文件过大（{} 字节），超过单次导入上限 {} 字节",
                 src_meta.len(), MAX_INMEM_BUFFER
             )));
         }
-        let data = fs::read(src_path)?;
+        let mut data = Vec::with_capacity(
+            std::cmp::min(src_meta.len() as usize, MAX_INMEM_BUFFER),
+        );
+        if let Err(e) = (&src_file)
+            .take((MAX_INMEM_BUFFER as u64) + 1)
+            .read_to_end(&mut data)
+        {
+            secure_wipe_vec(data); // 读到一半失败的明文也一并零化
+            return Err(e.into());
+        }
+        drop(src_file);
+        if data.len() > MAX_INMEM_BUFFER {
+            secure_wipe_vec(data);
+            return Err(VaultError::Other(format!(
+                "文件过大（读取时超过 {} 字节），超过单次导入上限",
+                MAX_INMEM_BUFFER
+            )));
+        }
         let size = data.len() as u64;
         let name = src_path.file_name()
             .unwrap_or_default().to_string_lossy().to_string();
@@ -1446,7 +1537,53 @@ impl Vault {
 
     // ═══════════════ 文件删除 ═══════════════
 
-    pub fn secure_delete_file(&mut self, vpath: &str) -> Result<(), VaultError> {
+    /// 估算单分区保险柜的死空间(文件中已被安全擦除、但仍占位的空间总量):
+    /// 文件长度 − 头部 − 活跃分区索引长度 − 全部有效文件密文长度。
+    /// 多分区保险柜无法得知其他分区的死区,返回 None(自动整理跳过)。
+    fn estimate_dead_bytes(&self) -> Option<u64> {
+        if self.partitions.len() != 1 {
+            return None;
+        }
+        let file_len = self.file.as_ref()?.metadata().ok()?.len();
+        let index = self.cached_index.as_ref()?;
+        let used = index
+            .files
+            .values()
+            .fold(0u64, |acc, m| acc.saturating_add(m.length));
+        let dead = file_len
+            .saturating_sub(HEADER_SIZE as u64)
+            .saturating_sub(self.partitions[0].index_length)
+            .saturating_sub(used);
+        Some(dead)
+    }
+
+    /// 2.7.0 新增:删除类操作末尾调用。死空间达到阈值时自动执行一次紧凑整理,
+    /// 把已擦除区域从文件中物理移除(抗取证:死区尽快从磁盘上消失)。
+    /// 返回 Some(回收字节数) 表示已整理;未达阈值 / 多分区 / 估算失败返回 None。
+    fn auto_defragment_if_worthwhile(&mut self) -> Result<Option<u64>, VaultError> {
+        let Some(dead) = self.estimate_dead_bytes() else {
+            return Ok(None);
+        };
+        if dead < AUTO_DEFRAG_MIN_DEAD_BYTES {
+            return Ok(None);
+        }
+        let file_len = self
+            .file
+            .as_ref()
+            .ok_or(VaultError::NotOpen)?
+            .metadata()?
+            .len();
+        if dead.saturating_mul(AUTO_DEFRAG_DEAD_RATIO_DEN)
+            < file_len.saturating_mul(AUTO_DEFRAG_DEAD_RATIO_NUM)
+        {
+            return Ok(None); // 死空间占比不足 30%,攒一攒再整理
+        }
+        self.defragment_vault(None::<fn(usize)>)?;
+        self.log_event(&format!("自动整理保险柜:回收约 {} 字节死空间", dead));
+        Ok(Some(dead))
+    }
+
+    pub fn secure_delete_file(&mut self, vpath: &str) -> Result<Option<u64>, VaultError> {
         // 2.3.0 顺序修正：先更新索引并 save_index（标记已删除），再覆写密文。
         // 旧实现先擦密文后存索引，中途崩溃会让索引仍指向已损坏的密文 → GCM 认证失败 → 永久损坏。
         // 与 secure_delete_files_batch 的「先存索引再擦密文」策略保持一致。
@@ -1466,10 +1603,14 @@ impl Vault {
             let _ = file.flush();
             let _ = file.sync_all();
         }
-        Ok(())
+
+        Ok(self.auto_defragment_if_worthwhile().unwrap_or_else(|e| {
+            log::warn!("删除后自动整理失败（不影响删除结果）: {}", e);
+            None
+        }))
     }
 
-    pub fn delete_folder(&mut self, vpath: &str) -> Result<(), VaultError> {
+    pub fn delete_folder(&mut self, vpath: &str) -> Result<Option<u64>, VaultError> {
         let prefix = format!("{}/", vpath);
 
         // 1. 一次性加载索引，收集所有需要移除的条目
@@ -1511,7 +1652,11 @@ impl Vault {
             let _ = file.flush();
             let _ = file.sync_all();
         }
-        Ok(())
+
+        Ok(self.auto_defragment_if_worthwhile().unwrap_or_else(|e| {
+            log::warn!("删除后自动整理失败（不影响删除结果）: {}", e);
+            None
+        }))
     }
 
     /// 批量安全删除多个文件/文件夹（DoD 7-pass 覆写密文 + 索引移除）。
@@ -1528,11 +1673,13 @@ impl Vault {
     ///   扫描索引判断归属，复杂度 O(n+m)。
     /// - P1-14：逐文件审计改为一条摘要审计（旧实现删 1000 个文件会追加 2000+ 条
     ///   审计，索引与 HMAC 链同步膨胀）。
-    /// - 返回 (删除文件数, 删除文件夹数)，供 UI 精确反馈。
+    /// - 返回 (删除文件数, 删除文件夹数, Some(自动整理回收字节数))，供 UI 精确反馈。
+    ///   2.7.0 起：删除完成后若死空间达到自动整理阈值（见 auto_defragment_if_worthwhile），
+    ///   会追加一次紧凑整理并物理回收空间。
     pub fn secure_delete_files_batch(
         &mut self,
         vpaths: &[String],
-    ) -> Result<(usize, usize), VaultError> {
+    ) -> Result<(usize, usize, Option<u64>), VaultError> {
         let mut index = self.load_index()?;
 
         // 1. 分类：直接文件 → 集合；文件夹 → 前缀（含自身匹配）
@@ -1553,7 +1700,7 @@ impl Vault {
             // 既不是文件也不是文件夹的 vpath 静默跳过（防御性）
         }
         if direct_files.is_empty() && folder_prefixes.is_empty() {
-            return Ok((0, 0));
+            return Ok((0, 0, None));
         }
 
         // 2. 单遍扫描索引：命中「直接文件」或「任一文件夹前缀」即收集
@@ -1577,7 +1724,7 @@ impl Vault {
         }
 
         if to_wipe.is_empty() && folders_to_delete.is_empty() {
-            return Ok((0, 0));
+            return Ok((0, 0, None));
         }
 
         // 3. 先从索引移除所有文件和文件夹（一次 save_index）+ 摘要审计（P1-14）
@@ -1609,7 +1756,12 @@ impl Vault {
             let _ = file.sync_all();
         }
 
-        Ok((to_wipe.len(), folders_to_delete.len()))
+        let reclaimed = self.auto_defragment_if_worthwhile().unwrap_or_else(|e| {
+            log::warn!("删除后自动整理失败（不影响删除结果）: {}", e);
+            None
+        });
+
+        Ok((to_wipe.len(), folders_to_delete.len(), reclaimed))
     }
 
     // ═══════════════ 文件读取 ═══════════════
@@ -1780,6 +1932,11 @@ impl Vault {
             drop(tmp_file);
 
             // 步骤 7：原子替换
+            // 2.7.0 修复：2.6.1 起 open_vault_rw 以 FILE_SHARE_READ 独占共享模式
+            // 打开（不共享 DELETE），而替换式 rename 需要对目标文件取得 DELETE
+            // 访问权 —— 会话句柄未释放时 rename 在 Windows 上会 sharing violation
+            // 失败。先 drop 本进程句柄再替换（成功/失败分支随后都会重新独占打开）。
+            self.file = None;
             fs::rename(&temp_path, &vault_path)?;
             sync_parent_dir(&vault_path);
 
@@ -1847,6 +2004,9 @@ impl Vault {
                 Ok(())
             }
             Err(e) => {
+                // 2.7.0 修复：先释放会话句柄 —— 下方「备份恢复」也是对 vault_path
+                // 的替换式 rename，会话句柄未释放时同样会 sharing violation 失败。
+                self.file = None;
                 let _ = fs::remove_file(&temp_path);
                 if backup_path.exists() {
                     let _ = fs::rename(&backup_path, &vault_path);

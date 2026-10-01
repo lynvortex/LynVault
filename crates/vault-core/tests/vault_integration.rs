@@ -36,6 +36,21 @@ fn write_src(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    // Windows：文件名为保留设备名（CON.txt 等）时，普通路径的 fs::write 会被
+    // 路径归一化重写到设备本身——「成功」写进控制台/空设备而磁盘上无文件。
+    // 一律改用 verbatim（\\?\）路径写入以禁用重写（对普通文件名行为不变）。
+    #[cfg(windows)]
+    if let Some(s) = p.as_os_str().to_str() {
+        if !s.starts_with(r"\\?\") {
+            let verbatim = if let Some(rest) = s.strip_prefix(r"\\") {
+                format!(r"\\?\UNC\{}", rest)
+            } else {
+                format!(r"\\?\{}", s)
+            };
+            fs::write(verbatim, content).unwrap();
+            return p;
+        }
+    }
     fs::write(&p, content).unwrap();
     p
 }
@@ -197,15 +212,101 @@ fn secure_delete_batch_removes_files_and_folders() {
         "/sub/del1.txt".to_string(),
         "/sub2".to_string(),
     ];
-    let (files, folders) = v.secure_delete_files_batch(&targets).expect("批量删除失败");
+    let (files, folders, reclaimed) = v.secure_delete_files_batch(&targets).expect("批量删除失败");
     assert_eq!(files, 3, "2 个直接文件 + 文件夹内 1 个文件");
     assert_eq!(folders, 1);
+    assert!(reclaimed.is_none(), "小文件删除的死空间远低于阈值,不应自动整理");
 
     let idx = v.load_index().unwrap();
     assert!(!idx.files.contains_key("/sub/del0.txt"));
     assert!(!idx.files.contains_key("/sub/del1.txt"));
     assert!(idx.files.contains_key("/sub/del2.txt"), "未选中的文件保留");
     assert!(!idx.files.contains_key("/sub2/nested.txt"));
+}
+
+// 真实加密样本回归：Office 2007（COM 生成）的 Standard Encryption 文档，
+// 口令 Password1234_。覆盖「Agile 之外的真实文件互通性」与 EncryptedPackage 流名。
+#[test]
+fn encrypted_office_2007_real_files() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in ["enc_test.docx", "enc_test.xlsx"] {
+        let data = fs::read(base.join(name)).unwrap_or_else(|_| panic!("缺少测试样本 {}", name));
+        // 无口令 → 哨兵错误
+        assert_eq!(
+            vault_core::office::extract_office_text(&data, name, None).unwrap_err(),
+            "OFFICE_ENCRYPTED"
+        );
+        // 错误口令
+        let err = vault_core::office::extract_office_text(&data, name, Some("wrong-password"))
+            .unwrap_err();
+        assert!(err.contains("密码错误"));
+        // 正确口令
+        let text = vault_core::office::extract_office_text(&data, name, Some("Password1234_"))
+            .unwrap_or_else(|e| panic!("{} 解密失败: {}", name, e));
+        assert!(text.contains("机密"), "{} 应解出文本: {}", name, text);
+    }
+}
+
+#[test]
+fn auto_defrag_after_large_delete_shrinks_file() {
+    let dir = tempdir("autodefrag");
+    let (mut v, vault_path) = new_vault(&dir);
+
+    // 70 MiB 文件:删除后死空间 70 MiB ≥ 64 MiB 阈值,占比 ~100% ≥ 30%
+    let big = write_src(&dir, "big.bin", &vec![0xABu8; 70 * 1024 * 1024]);
+    v.import_file(&big, "/big.bin").unwrap();
+    let len_before = fs::metadata(&vault_path).unwrap().len();
+
+    let (files, folders, reclaimed) = v
+        .secure_delete_files_batch(&["/big.bin".to_string()])
+        .expect("批量删除失败");
+    assert_eq!((files, folders), (1, 0));
+    assert!(reclaimed.is_some(), "死空间 70 MiB 应触发自动整理");
+    assert!(reclaimed.unwrap() >= 64 * 1024 * 1024);
+
+    let len_after = fs::metadata(&vault_path).unwrap().len();
+    assert!(len_after < len_before, "整理后文件应小于整理前");
+    assert!(
+        len_after < 5 * 1024 * 1024,
+        "整理后文件应缩回头部+索引级别(实际 {} 字节)",
+        len_after
+    );
+    assert!(v.load_index().unwrap().files.is_empty());
+}
+
+#[test]
+fn auto_defrag_skipped_below_threshold() {
+    let dir = tempdir("nodefrag");
+    let (mut v, vault_path) = new_vault(&dir);
+
+    let src = write_src(&dir, "small.txt", &vec![b'x'; 1024 * 1024]);
+    v.import_file(&src, "/small.txt").unwrap();
+    let len_before = fs::metadata(&vault_path).unwrap().len();
+
+    let (_, _, reclaimed) = v
+        .secure_delete_files_batch(&["/small.txt".to_string()])
+        .expect("批量删除失败");
+    assert!(reclaimed.is_none(), "死空间未达阈值不应自动整理");
+
+    // 未整理时文件长度只会因追加新索引微涨,不可能缩回(整理会缩到 KB 级)
+    let len_after = fs::metadata(&vault_path).unwrap().len();
+    assert!(len_after >= len_before, "未达阈值时不应回收空间");
+}
+
+#[test]
+fn auto_defrag_skipped_for_multi_partition() {
+    let dir = tempdir("mpnodefrag");
+    let (mut v, _) = new_vault(&dir);
+    v.add_partition("Decoy", "decoy-password-123", None).unwrap();
+
+    let big = write_src(&dir, "big2.bin", &vec![0xCDu8; 70 * 1024 * 1024]);
+    v.import_file(&big, "/big2.bin").unwrap();
+
+    // 多分区整理不回收空间,自动触发没有收益 —— 应跳过
+    let (_, _, reclaimed) = v
+        .secure_delete_files_batch(&["/big2.bin".to_string()])
+        .expect("批量删除失败");
+    assert!(reclaimed.is_none(), "多分区保险柜不应自动整理");
 }
 
 #[test]

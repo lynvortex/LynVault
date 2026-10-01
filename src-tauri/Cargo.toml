@@ -1,6 +1,6 @@
 [package]
 name = "lynvault-rs"
-version = "2.6.1"
+version = "2.7.0"
 edition = "2021"
 
 # 注意：不要用 `[[bin]] name = "..."` 覆盖产物名。

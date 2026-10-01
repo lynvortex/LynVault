@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "lynvault-rs"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "base64 0.22.1",
  "image 0.25.10",
@@ -3838,10 +3838,12 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vault-core"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "argon2",
+ "base64 0.22.1",
  "byteorder",
  "calamine",
  "cfb",
@@ -3855,6 +3857,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "subtle",
  "thiserror 1.0.69",

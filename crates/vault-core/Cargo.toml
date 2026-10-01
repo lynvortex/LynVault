@@ -1,6 +1,6 @@
 [package]
 name = "vault-core"
-version = "2.6.1"
+version = "2.7.0"
 edition = "2021"
 
 [dependencies]
@@ -28,6 +28,11 @@ quick-xml = "0.41"
 zip = "0.6"
 cfb = "0.7"
 libc = "0.2"
+# 2.7.0：加密 Office 预览(Agile Encryption 解密)
+# aes 已在依赖树中(aes-gcm 0.10 的底层),base64 同理;sha1 为新增小依赖
+aes = "0.8"
+base64 = "0.22"
+sha1 = "0.10"
 
 # 2.5.1 新增：销毁路径 delete-on-close（TOCTOU 修复，见 wipe.rs）
 [target.'cfg(windows)'.dependencies]

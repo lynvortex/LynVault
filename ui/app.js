@@ -719,7 +719,10 @@ async function deleteSelected() {
         const parts = [];
         if (res.files) parts.push(`${res.files} 个文件`);
         if (res.folders) parts.push(`${res.folders} 个文件夹`);
-        setStatus(`已安全删除 ${parts.join('、') || '0 个项目'}`);
+        let status = `已安全删除 ${parts.join('、') || '0 个项目'}`;
+        // 2.7.0：死空间达到阈值时后端自动整理保险柜,提示回收量
+        if (res.reclaimed) status += `，已自动整理回收 ${formatSize(res.reclaimed)}`;
+        setStatus(status);
     } catch (e) {
         showError(String(e));
     }
@@ -737,15 +740,51 @@ async function newFolder() {
     });
 }
 
+// 2.7.0：加密 Office 文档的口令输入循环。成功返回预览文本；取消返回 null
+async function promptEncryptedOffice(vpath, fileName) {
+    while (true) {
+        const pwd = await new Promise(resolve => {
+            showInput('🔒 ' + fileName, '该文档已加密，输入文档打开密码：', '', (v) => {
+                resolve(v);
+                return true;
+            }, true, () => resolve(null));
+        });
+        if (!pwd) return null; // 取消或空口令
+        try {
+            return await invoke('preview_office_file', { vpath, password: pwd });
+        } catch (e) {
+            const msg = String(e);
+            if (!msg.includes('密码错误')) {
+                showError(msg);
+                return null;
+            }
+            const retry = await tauriAsk('密码错误，是否重试？', { title: '口令验证失败', type: 'warning' });
+            if (!retry) return null;
+        }
+    }
+}
+
 async function viewFile(vpath, fileName) {
     const ext = fileName.split('.').pop().toLowerCase();
     const imgExts = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'tif'];
     const textExts = ['txt', 'md', 'py', 'log', 'json', 'csv', 'xml', 'ini', 'cfg', 'yaml', 'yml', 'rs', 'js', 'go', 'toml', 'html', 'css', 'sh', 'bat', 'ps1'];
-    const officeExts = ['docx', 'doc', 'xlsx', 'xls', 'pptx'];
+    const officeExts = ['docx', 'doc', 'xlsx', 'xls'];
 
     try {
         if (officeExts.includes(ext)) {
-            const text = await invoke('preview_office_file', { vpath });
+            let text;
+            try {
+                text = await invoke('preview_office_file', { vpath, password: null });
+            } catch (e) {
+                if (String(e).includes('OFFICE_ENCRYPTED')) {
+                    // 2.7.0：加密 Office 文档 —— 弹出口令输入框（可重试）
+                    text = await promptEncryptedOffice(vpath, fileName);
+                    if (text === null) return;
+                } else {
+                    showError(String(e));
+                    return;
+                }
+            }
             const pre = document.createElement('pre');
             pre.textContent = text;
             showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);

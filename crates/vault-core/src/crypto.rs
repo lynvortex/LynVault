@@ -135,14 +135,21 @@ pub fn derive_keys(
         .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
+    // 2.7.0 修复：与 derive_legacy_lock_key 一致，所有错误路径都先零化
+    // combined（含主密码字节）再返回，不允许 `?` 提前返回跳过零化
     let mut master = [0u8; 32];
-    argon2.hash_password_into(&combined, salt, &mut master)
-        .map_err(|e| VaultError::Other(format!("Argon2id 派生失败: {}", e)))?;
+    if let Err(e) = argon2.hash_password_into(&combined, salt, &mut master) {
+        combined.zeroize();
+        return Err(VaultError::Other(format!("Argon2id 派生失败: {}", e)));
+    }
 
     let hkdf = Hkdf::<Sha512>::new(None, &master);
     let mut derived = vec![0u8; 96];
-    hkdf.expand(b"pyvault4-keys", &mut derived)
-        .map_err(|_| VaultError::Other("HKDF 派生失败".into()))?;
+    if hkdf.expand(b"pyvault4-keys", &mut derived).is_err() {
+        combined.zeroize();
+        master.zeroize();
+        return Err(VaultError::Other("HKDF 派生失败".into()));
+    }
 
     let mut keys = KeyMaterial {
         enc_key: [0u8; 32],

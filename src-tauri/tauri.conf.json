@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "LynVault",
-    "version": "2.6.1"
+    "version": "2.7.0"
   },
   "tauri": {
     "allowlist": {
@@ -70,7 +70,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "LynVault 2.6.1",
+        "title": "LynVault 2.7.0",
         "width": 960,
         "height": 620,
         "center": true,

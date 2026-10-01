@@ -413,19 +413,20 @@ pub async fn delete_files(app: AppHandle, vpaths: Vec<String>) -> Result<serde_j
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         // 委托给 vault-core 的批量删除方法：一次 load + 批量 DoD 7-pass 擦除 + 一次 save
-        let (files, folders) = vault.secure_delete_files_batch(&vpaths)
+        let (files, folders, reclaimed) = vault.secure_delete_files_batch(&vpaths)
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "files": files, "folders": folders }))
+        Ok(serde_json::json!({ "files": files, "folders": folders, "reclaimed": reclaimed }))
     })
     .await
 }
 
 #[tauri::command]
-pub async fn delete_folder(app: AppHandle, vpath: String) -> Result<(), String> {
+pub async fn delete_folder(app: AppHandle, vpath: String) -> Result<serde_json::Value, String> {
     run_blocking(&app, "delete_folder", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        vault.delete_folder(&vpath).map_err(|e| e.to_string())
+        let reclaimed = vault.delete_folder(&vpath).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "reclaimed": reclaimed }))
     })
     .await
 }
@@ -657,7 +658,11 @@ pub async fn load_file_content(app: AppHandle, vpath: String) -> Result<String, 
 }
 
 #[tauri::command]
-pub async fn preview_office_file(app: AppHandle, vpath: String) -> Result<String, String> {
+pub async fn preview_office_file(
+    app: AppHandle,
+    vpath: String,
+    mut password: Option<String>,
+) -> Result<String, String> {
     run_blocking(&app, "preview_office_file", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
@@ -679,7 +684,12 @@ pub async fn preview_office_file(app: AppHandle, vpath: String) -> Result<String
         }
         let data = vault.load_file_data(&vpath).map_err(|e| e.to_string())?;
         let filename = vpath.rsplit('/').next().unwrap_or(&vpath);
-        let text = vault_core::office::extract_office_text(&data, filename);
+        // 2.7.0：password 为 Some 时解密 Agile Encryption 加密文档（纯内存）；
+        // 为 None 且文档已加密时返回 OFFICE_ENCRYPTED 哨兵，由前端弹出口令输入
+        let text = vault_core::office::extract_office_text(&data, filename, password.as_deref());
+        if let Some(ref mut p) = password {
+            p.as_mut_str().zeroize();
+        }
         vault_core::wipe::secure_wipe_vec(data);
         text
     })
