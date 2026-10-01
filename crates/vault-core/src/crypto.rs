@@ -44,11 +44,14 @@ pub fn derive_lock_mac_key(salt: &[u8; 32]) -> [u8; 32] {
 /// 保留旧的 `password + key_file` 裸拼接格式（无长度前缀）以兼容旧文件格式，
 /// 该拼接歧义是旧格式的固有缺陷，不能在此修复（会破坏旧文件兼容性）；
 /// 新保险柜一律使用 `derive_lock_mac_key`，不涉及密码拼接。
+///
+/// 2.5.1 修复：Argon2id 派生失败（如内存分配失败）原先直接 `expect` panic，
+/// 现改为错误传播；失败时同样保证中间量被清零。
 pub fn derive_legacy_lock_key(
     salt: &[u8; 32],
     password: &str,
     key_file_data: Option<&[u8]>,
-) -> [u8; 32] {
+) -> Result<[u8; 32], VaultError> {
     // 复刻旧实现：先对 salt 做域分离异或，再 Argon2id + HKDF-SHA256。
     // 任何一步与旧版不同都会导致旧保险柜锁定区校验失败。
     let mut lock_salt = [0u8; 32];
@@ -67,23 +70,26 @@ pub fn derive_legacy_lock_key(
     }
 
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
-        .expect("Argon2 参数合法");
+        .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut master = [0u8; 32];
-    argon2
-        .hash_password_into(&combined, &lock_salt, &mut master)
-        .expect("Argon2id 派生 legacy lock_key 失败");
+    if let Err(e) = argon2.hash_password_into(&combined, &lock_salt, &mut master) {
+        combined.zeroize();
+        lock_salt.zeroize();
+        return Err(VaultError::Other(format!("Argon2id 派生 legacy lock_key 失败: {}", e)));
+    }
 
     let hkdf = Hkdf::<Sha256>::new(None, &master);
     let mut key = [0u8; 32];
+    // HKDF-SHA256 expand 32 字节恒在合法范围（上限 255×32），此处不可失败
     hkdf.expand(b"pyvault4-lock-key-v3", &mut key)
         .expect("HKDF expand 失败");
 
     combined.zeroize();
     master.zeroize();
     lock_salt.zeroize();
-    key
+    Ok(key)
 }
 
 /// 输出密钥类型
@@ -158,7 +164,10 @@ pub fn derive_keys(
 /// AES-256-GCM 加密，返回 nonce(12) || ciphertext
 /// `aad`：关联认证数据（绑定的上下文），解密时必须传入相同值
 pub fn encrypt_gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8], nonce: Option<&[u8]>) -> Result<Vec<u8>, VaultError> {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("invalid AES key");
+    // 2.5.1 修复：expect 改为错误传播（32 字节密钥实际恒有效，但保持加密
+    // 关键路径零 panic 的纪律，避免任何上游重构引入长度错误时直接崩进程）
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| VaultError::EncryptFailed)?;
     let nonce = match nonce {
         Some(n) => Nonce::from_slice(n).to_owned(),
         None => {
@@ -182,26 +191,83 @@ pub fn decrypt_gcm(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let (nonce, ct) = data.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(key).expect("invalid AES key");
+    // 2.5.1 修复：同 encrypt_gcm，expect 改为返回 None（解密失败语义）
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
     let nonce = Nonce::from_slice(nonce);
     let payload = Payload { msg: ct, aad };
     cipher.decrypt(nonce, payload).ok()
 }
 
-/// 生成认证标签（HMAC-SHA256 of b"AUTH_OK"）
+/// 生成认证标签（HMAC-SHA256 of b"AUTH_OK"）—— **旧格式**。
+///
+/// 2.6.1 起新保险柜改用 [`create_auth_tag_bound`]（绑定头部）；本函数仅用于
+/// 兼容打开 2.6.1 之前创建的保险柜，并在首次成功打开时自动迁移。
 pub fn create_auth_tag(auth_key: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key).unwrap();
     mac.update(b"AUTH_OK");
     mac.finalize().into_bytes().into()
 }
 
-/// 验证认证标签（恒定时间比较）
+/// 验证旧格式认证标签（恒定时间比较）
 pub fn verify_auth_tag(auth_key: &[u8], tag: &[u8]) -> bool {
     if tag.len() < 32 { return false; }
     let expected = create_auth_tag(auth_key);
     // 恒定时间比较，防止计时攻击
     use subtle::ConstantTimeEq;
     expected.ct_eq(&tag[..32]).into()
+}
+
+/// 头部绑定认证标签的域分隔符（避免与旧格式标签的计算域混淆）
+const DOMAIN_AUTH_TAG_BOUND: &[u8] = b"LYNVAULT-AUTH-TAG-BOUND-V5";
+
+/// 2.6.1 新增：生成本分区**绑定头部**的认证标签。
+///
+/// 旧实现的分区认证标签 `HMAC(auth_key, "AUTH_OK")` 与头部内容完全无关，头部完整性
+/// 只能由一个**全局**头部签名兜底；而该签名又因「多分区保险柜的头部可能由其他分区
+/// （不同密码）签名」被 `real_count >= 2` 条件整体跳过 —— 该条件取自攻击者可控的
+/// 头部内容：只要塞入一个带合法别名的伪条目，就能把单分区保险柜**降级**为
+/// 「不校验头部签名」的状态（零知识降级）。
+///
+/// 现改为：每个分区的认证标签直接绑定头部中**该分区自身且不可变**的部分 ——
+/// 头部前缀（magic / version / 保留区 / 保险柜 salt）+ 本条目别名字段(16B)
+/// + 本条目 salt(32B)。由此：
+/// - 无论分区有多少，篡改上述任一字节都会使**该分区的 auth_tag 匹配失败 → 认证
+///   直接失败**，头部完整性校验不再依赖任何攻击者可控的分区计数；
+/// - 每个分区只绑定自己的条目与全局前缀（不含 `index_offset` / `index_length`
+///   与其他分区条目），因此任一分区更新头部都不会让其他分区的标签失效；
+/// - `index_offset` / `index_length` 由索引的 AES-GCM 认证标签单独保护。
+pub fn create_auth_tag_bound(
+    auth_key: &[u8],
+    header_prefix: &[u8],
+    entry_alias: &[u8],
+    entry_salt: &[u8],
+) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key).unwrap();
+    mac.update(DOMAIN_AUTH_TAG_BOUND);
+    mac.update(header_prefix);
+    mac.update(entry_alias);
+    mac.update(entry_salt);
+    mac.finalize().into_bytes().into()
+}
+
+/// 恒定时间校验分区认证标签：同时比较「头部绑定」（新）与「AUTH_OK」（旧）两种
+/// 标签，任一匹配即通过。两种标签都完整计算、都用 `ct_eq` 比较（不短路），
+/// 保证每次认证的工作量恒定，与真实分区数量无关。
+pub fn verify_auth_tag_bound(
+    auth_key: &[u8],
+    header_prefix: &[u8],
+    entry_alias: &[u8],
+    entry_salt: &[u8],
+    tag: &[u8],
+) -> bool {
+    if tag.len() < 32 { return false; }
+    use subtle::ConstantTimeEq;
+    let bound = create_auth_tag_bound(auth_key, header_prefix, entry_alias, entry_salt);
+    let legacy = create_auth_tag(auth_key);
+    let stored = &tag[..32];
+    let ok_bound = bound.ct_eq(stored);
+    let ok_legacy = legacy.ct_eq(stored);
+    (ok_bound | ok_legacy).into()
 }
 
 /// 计算头部签名（HMAC-SHA512 over first 887 bytes of header）

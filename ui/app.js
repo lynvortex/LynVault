@@ -58,9 +58,9 @@ const $ = id => document.getElementById(id);
 // ───────────────── 工具函数 ─────────────────
 function toggleUI(open) {
     state.vaultOpen = open;
-    // 2.3.0：查看/提取/删除/新建文件夹已移入右键菜单，不再占用工具栏
+    // 2.5.1：新建文件夹重新加入工具栏（右键菜单入口保留）
     const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
-        'btn-import-folder', 'btn-extract-all', 'btn-defrag', 'btn-destroy'];
+        'btn-import-folder', 'btn-newfolder', 'btn-extract-all', 'btn-defrag', 'btn-destroy'];
     ids.forEach(id => { const el = $(id); if (el) el.disabled = !open; });
     $('btn-create').disabled = open;
     $('btn-open').disabled = open;
@@ -105,6 +105,61 @@ function getIcon(name, isFolder) {
 // 仅 Windows 后端返回非空 data URL；其他平台返回空串 → fallback 到 emoji
 const _sysIconCache = new Map();       // ext -> dataUrl | ''
 const _sysIconPending = new Map();     // ext -> Promise
+// 2.5.1 修复：缓存条目上限。恶意/极端目录可包含海量不同扩展名，
+// 每条 data URL 数 KB，无上限时会持续膨胀 WebView 内存；超限按 FIFO 淘汰。
+const SYS_ICON_CACHE_MAX = 128;
+
+function sysIconCacheSet(ext, v) {
+    if (_sysIconCache.size >= SYS_ICON_CACHE_MAX) {
+        // Map 迭代顺序 = 插入顺序，删最旧条目
+        const oldest = _sysIconCache.keys().next().value;
+        if (oldest !== undefined) _sysIconCache.delete(oldest);
+    }
+    _sysIconCache.set(ext, v);
+}
+
+// 2.6.1 新增（Linux 对齐）：非 Windows 平台后端没有系统图标
+// （get_file_icon 走 #[cfg(not(windows))] 分支返回空串），文件列表只剩 emoji。
+// 这里提供一套内置 SVG 文件类型图标做兜底，使 Linux 观感与 Windows 一致。
+// 仅在「非 Windows」且后端返回空时启用：Windows 仍使用真实系统图标或原有
+// emoji 兜底，行为完全不变（不引入任何 Rust 侧改动与平台依赖）。
+const IS_WINDOWS = /Windows/i.test(navigator.userAgent || '');
+
+// [扩展名列表, 角标文字(≤3 字符), 底色]
+const BUILTIN_ICON_CATEGORIES = [
+    [['pdf'], 'PDF', '#e04646'],
+    [['doc', 'docx', 'rtf', 'odt'], 'DOC', '#2f7cf6'],
+    [['xls', 'xlsx', 'csv', 'ods'], 'XLS', '#21a366'],
+    [['ppt', 'pptx', 'odp'], 'PPT', '#e06c2b'],
+    [['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tif', 'tiff'], 'IMG', '#7c5cff'],
+    [['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm'], 'VID', '#ff5c8a'],
+    [['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a'], 'AUD', '#ff9f43'],
+    [['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz'], 'ZIP', '#ffb020'],
+    [['txt', 'md', 'log'], 'TXT', '#8a94a6'],
+    [['js', 'ts', 'jsx', 'tsx', 'json', 'html', 'css', 'rs', 'py', 'java', 'c', 'cpp', 'h', 'go', 'sh', 'xml', 'yml', 'yaml'], '&lt;/&gt;', '#6b7bd6'],
+];
+
+const _builtinIconCache = new Map();   // ext -> data URL
+
+function builtinIconDataUrl(ext) {
+    if (_builtinIconCache.has(ext)) return _builtinIconCache.get(ext);
+    const hit = BUILTIN_ICON_CATEGORIES.find(c => c[0].indexOf(ext) >= 0);
+    const label = hit ? hit[1] : '?';
+    const color = hit ? hit[2] : '#8a94a6';
+    const svg =
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 48 48">' +
+        '<rect x="4" y="4" width="40" height="40" rx="9" fill="' + color + '"/>' +
+        '<text x="24" y="25" text-anchor="middle" dominant-baseline="central" ' +
+        'font-family="Segoe UI,Roboto,DejaVu Sans,sans-serif" font-size="14" font-weight="700" ' +
+        'fill="#ffffff">' + label + '</text></svg>';
+    const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    if (_builtinIconCache.size >= SYS_ICON_CACHE_MAX) {
+        const oldest = _builtinIconCache.keys().next().value;
+        if (oldest !== undefined) _builtinIconCache.delete(oldest);
+    }
+    _builtinIconCache.set(ext, url);
+    return url;
+}
 
 async function getSysIconDataUrl(name) {
     if (!invoke) return '';
@@ -119,12 +174,15 @@ async function getSysIconDataUrl(name) {
     const p = (async () => {
         try {
             const dataUrl = await invoke('get_file_icon', { ext });
-            const v = typeof dataUrl === 'string' ? dataUrl : '';
-            _sysIconCache.set(ext, v);
+            let v = typeof dataUrl === 'string' ? dataUrl : '';
+            // 2.6.1：非 Windows 后端返回空 → 内置 SVG 图标兜底
+            if (!v && !IS_WINDOWS) v = builtinIconDataUrl(ext);
+            sysIconCacheSet(ext, v);
             return v;
         } catch (e) {
-            _sysIconCache.set(ext, '');
-            return '';
+            const v = IS_WINDOWS ? '' : builtinIconDataUrl(ext);
+            sysIconCacheSet(ext, v);
+            return v;
         } finally {
             _sysIconPending.delete(ext);
         }
@@ -734,10 +792,82 @@ async function viewFile(vpath, fileName) {
             const bin = atob(b64);
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            const text = new TextDecoder('utf-8').decode(bytes);
-            const pre = document.createElement('pre');
-            pre.textContent = text;
-            showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);
+            // 2.5.1 新增：fatal 解码探测 —— 非 UTF-8 文本（如 GBK）保存会破坏
+            // 原编码（替换字符 U+FFFD 固化），这类文件只读预览，不给编辑入口
+            let utf8Valid = true;
+            let text;
+            try {
+                text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            } catch (e) {
+                utf8Valid = false;
+                text = new TextDecoder('utf-8').decode(bytes);
+            }
+            if (!utf8Valid) {
+                const pre = document.createElement('pre');
+                pre.textContent = text;
+                showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);
+                return;
+            }
+            // 2.5.1 新增：文本直接编辑。编辑上限 4 MB —— textarea 渲染超大文本
+            // 会卡死 WebView（后端硬上限 64 MB）；超过则只读预览
+            if (bytes.length > 4 * 1024 * 1024) {
+                const pre = document.createElement('pre');
+                pre.textContent = text;
+                showDialog('📄 ' + fileName + '（超过 4 MB，只读预览）', pre.outerHTML,
+                    [{ text: '关闭', cls: 'btn-ok' }], true);
+                return;
+            }
+            const taId = 'txt-edit-' + Date.now();
+            const ta = document.createElement('textarea');
+            ta.id = taId;
+            ta.className = 'txt-editor';
+            ta.readOnly = true;
+            ta.spellcheck = false;
+            // 内容用文本子节点承载：.value 属性不会序列化进 outerHTML，
+            // 经 dialog-body.innerHTML 重建后会丢失；文本节点会被正确转义并还原
+            ta.appendChild(document.createTextNode(text));
+
+            const startEdit = () => {
+                const el = document.getElementById(taId);
+                if (!el) return false;
+                el.readOnly = false;
+                el.classList.add('editing');
+                el.focus();
+                // 按钮顺序与数组一致：[编辑, 保存, 关闭]
+                const btns = document.querySelectorAll('#dialog-buttons button');
+                if (btns[0]) btns[0].disabled = true;
+                if (btns[1]) btns[1].disabled = false;
+                return false; // 保持对话框打开
+            };
+            const saveEdit = async () => {
+                const el = document.getElementById(taId);
+                if (!el) return true;
+                // UTF-8 编码 → 分块 base64（避免 fromCharCode 一次传超长参数栈溢出）
+                const enc = new TextEncoder().encode(el.value);
+                let binStr = '';
+                const CHUNK = 0x8000;
+                for (let i = 0; i < enc.length; i += CHUNK) {
+                    binStr += String.fromCharCode.apply(null, enc.subarray(i, i + CHUNK));
+                }
+                try {
+                    await invoke('update_file_content', { vpath, contentB64: btoa(binStr) });
+                    await listFolder(state.currentFolder); // 刷新大小显示
+                    setStatus('已保存：' + fileName);
+                    return true; // 关闭对话框
+                } catch (e) {
+                    showError(String(e));
+                    return false; // 保留编辑内容让用户重试
+                }
+            };
+
+            showDialog('📄 ' + fileName, ta.outerHTML, [
+                { text: '编辑', cls: 'btn-cancel', action: startEdit },
+                { text: '保存', cls: 'btn-ok', action: saveEdit },
+                { text: '关闭', cls: 'btn-cancel' },
+            ], true);
+            // 初始「保存」禁用，点「编辑」后启用（按钮顺序同上）
+            const btns = document.querySelectorAll('#dialog-buttons button');
+            if (btns[1]) btns[1].disabled = true;
             return;
         }
 
@@ -875,6 +1005,7 @@ function bindEvents() {
     $('btn-close').onclick = closeVault;
     $('btn-import-file').onclick = importFiles;
     $('btn-import-folder').onclick = importFolder;
+    $('btn-newfolder').onclick = newFolder;
     $('btn-extract-all').onclick = extractAllFiles;
     $('btn-defrag').onclick = defragmentVault;
     $('btn-destroy').onclick = destroyVault;

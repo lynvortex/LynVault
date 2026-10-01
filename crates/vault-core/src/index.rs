@@ -10,6 +10,16 @@ pub struct FileMeta {
     pub size: u64,
     pub offset: u64,
     pub length: u64,
+    /// 导入时冻结的 AAD 标识。
+    ///
+    /// 文件密文的 AAD 原先直接绑定 vpath，而 vpath 是可变的 —— 一旦重命名，
+    /// 索引 key 变了但密文没重加密，GCM 认证随即失败（内容永久不可读）。
+    /// 现在改为：导入时把当时的 vpath 冻结在这里，此后读写一律以它为准，
+    /// 重命名只改索引 key、不再影响 AAD。
+    ///
+    /// 旧索引没有该字段 → `None`，读取时回退到当前 vpath（与历史行为一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aad_tag: Option<String>,
 }
 
 /// 索引结构（序列化为 JSON 后加密存储）
@@ -128,6 +138,9 @@ impl<'a> IndexManager<'a> {
             size,
             offset,
             length,
+            // 约定：调用方加密文件数据时以 vpath 为 AAD（见 read_decrypt_file_data 文档），
+            // 此处把该 vpath 冻结下来，此后重命名不会再影响解密
+            aad_tag: Some(vpath.clone()),
         });
         // 自动创建父文件夹
         if let Some(parent) = vpath.rfind('/') {
@@ -205,8 +218,14 @@ impl<'a> IndexManager<'a> {
             return Err(VaultError::Other("新文件名非法".into()));
         }
         let mut index = self.vault.load_index()?;
-        let meta = index.files.remove(old_vpath)
+        let mut meta = index.files.remove(old_vpath)
             .ok_or(VaultError::Other("文件不存在".into()))?;
+        // AAD 冻结：旧索引（导入早于该修复）没有 aad_tag，而密文是用「重命名前的
+        // vpath」做 AAD 加密的 —— 必须在改 key 之前把它固定下来，否则改完 key
+        // 密文的 AAD 再也对不上，文件内容会永久不可读。
+        if meta.aad_tag.is_none() {
+            meta.aad_tag = Some(old_vpath.to_string());
+        }
         let parent = old_vpath.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         let new_vpath = format!("{}/{}", parent, new_name);
         if !Index::validate_vpath(&new_vpath) {
@@ -260,11 +279,19 @@ impl<'a> IndexManager<'a> {
         let new_prefix = format!("{}/", new_vpath);
 
         for (k, v) in &index.files {
-            if k.starts_with(&old_prefix) {
-                let new_key = new_prefix.to_string() + &k[old_prefix.len()..];
-                new_files.insert(new_key, v.clone());
-            } else if k == old_vpath {
-                new_files.insert(new_vpath.clone(), v.clone());
+            if k.starts_with(&old_prefix) || k == old_vpath {
+                // AAD 冻结：密文用「重命名前的 vpath」做 AAD，必须在改 key 之前
+                // 逐个固定下来，否则整个子树改完 key 后密文全部失配（内容永久不可读）
+                let mut meta = v.clone();
+                if meta.aad_tag.is_none() {
+                    meta.aad_tag = Some(k.clone());
+                }
+                let new_key = if k == old_vpath {
+                    new_vpath.clone()
+                } else {
+                    new_prefix.to_string() + &k[old_prefix.len()..]
+                };
+                new_files.insert(new_key, meta);
             } else {
                 new_files.insert(k.clone(), v.clone());
             }

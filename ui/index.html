@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LynVault 2.4.1</title>
+    <title>LynVault 2.6.1</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -28,6 +28,8 @@
         <span class="sep"></span>
         <button id="btn-import-file" disabled>导入文件</button>
         <button id="btn-import-folder" disabled>导入文件夹</button>
+        <!-- 2.5.1：新建文件夹从右键菜单回归工具栏（右键菜单入口保留） -->
+        <button id="btn-newfolder" disabled>新建文件夹</button>
         <button id="btn-extract-all" disabled>提取全部</button>
         <span class="sep"></span>
         <button id="btn-defrag" disabled>整理保险柜</button>
@@ -42,7 +44,7 @@
     <div id="file-list"></div>
 
     <!-- 2.4.1：开源地址已移至标题栏右侧；状态栏文案会被 setStatus 动态覆盖 -->
-    <div id="status-bar">©绘萤者 LynVault 2.4.1</div>
+    <div id="status-bar">©绘萤者 LynVault 2.6.1</div>
 
     <!-- 模态框 -->
     <div id="overlay" class="hidden"></div>

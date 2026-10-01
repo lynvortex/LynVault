@@ -14,11 +14,11 @@
 //! 扩展名 + magic bytes 双重校验，非保险柜文件直接忽略。最坏影响只是本地
 //! 其他进程让本程序弹出一个密码输入框，等价于用户自己拖放文件。
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
@@ -29,6 +29,16 @@ pub static FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 
 /// 协议握手串：区分「本程序的单实例端口」与「恰好占用同端口的无关程序」
 const PROTO_HELLO: &str = "LYNVAULT_SI_V1";
+
+/// 2.5.1 新增：单实例协议单行长度上限。本地恶意进程连上端口后发送
+/// 无换行的超长数据，旧 read_line 会无限分配内存（本地 DoS）。
+/// Windows 长路径上限约 32K 字符，64 KB 足够且留有余量。
+const MAX_LINE_BYTES: u64 = 64 * 1024;
+
+/// 2.6.1 新增：单实例连接的最大并发处理数。每个连接独立线程处理（见
+/// `server_loop`），无上限会让本地恶意进程通过快速建立大量连接耗尽线程栈；
+/// 正常使用（用户双击 .lyt）远不会超过该值。
+const MAX_CONCURRENT_CONNS: usize = 8;
 
 /// 应用标识（与 tauri.conf.json 的 identifier 一致），用于派生端口
 const APP_ID: &str = "com.lynvault.app";
@@ -119,16 +129,22 @@ fn try_forward(args: &[String], port: u16) -> bool {
     read_expect(&mut reader, "OK")
 }
 
-/// 读一行并比对期望值（忽略行尾空白）
+/// 读一行并比对期望值（忽略行尾空白）。
+/// 2.5.1 修复：take() 限制单行长度，超长行按协议失败处理，不再无限分配。
 fn read_expect<R: BufRead>(reader: &mut R, expect: &str) -> bool {
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    if reader.take(MAX_LINE_BYTES).read_line(&mut line).is_err() {
         return false;
     }
     line.trim() == expect
 }
 
 /// 首实例监听循环（由 main 的 setup 回调在独立线程启动）
+///
+/// 2.6.1 修复（并发化）：旧实现对连接**串行**处理。任何一个客户端「连上但迟迟
+/// 不发数据」都会让 accept 循环卡在读超时上（最长 5 秒），期间其他双击 .lyt 的
+/// 请求全部超时 → 单实例转发名存实亡（本地 DoS）。现在每个连接在独立线程处理；
+/// 并用 `MAX_CONCURRENT_CONNS` 限制同时处理数，避免恶意进程狂发连接耗尽线程。
 pub fn server_loop(handle: AppHandle) {
     let listener = {
         match LISTENER.lock() {
@@ -141,34 +157,55 @@ pub fn server_loop(handle: AppHandle) {
         return;
     };
 
+    let inflight = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let mut reader = BufReader::new(stream);
+        // 并发上限：超限直接丢弃（仅影响同一时刻的并发打开请求，不影响正常单次双击）
+        if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNS {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            drop(stream);
+            continue;
+        }
+        let handle = handle.clone();
+        let inflight = inflight.clone();
+        std::thread::spawn(move || {
+            handle_connection(&handle, stream);
+            inflight.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
 
-        // 1. 握手校验：非本程序协议的连接直接断开
-        if !read_expect(&mut reader, PROTO_HELLO) {
-            continue;
-        }
-        if reader.get_mut().write_all(b"OK\n").is_err() {
-            continue;
-        }
-        // 2. 读路径行 + 结束符
-        let mut path_line = String::new();
-        if reader.read_line(&mut path_line).is_err() {
-            continue;
-        }
-        let mut dot = String::new();
-        let _ = reader.read_line(&mut dot);
-        let _ = reader.get_mut().write_all(b"OK\n");
-        drop(reader);
+/// 处理单个转发连接（握手 → 收路径 → 回执 → 触发打开）。
+/// 在独立线程中运行，因此 `handle_vault_request` 等待前端就绪（最长 60 秒）
+/// 不再阻塞 accept 循环。
+fn handle_connection(handle: &AppHandle, stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut reader = BufReader::new(stream);
 
-        // 3. 校验并处理
-        let path = path_line.trim().to_string();
-        if !path.is_empty() && looks_like_vault(&path) {
-            handle_vault_request(&handle, path);
-        }
+    // 1. 握手校验：非本程序协议的连接直接断开
+    if !read_expect(&mut reader, PROTO_HELLO) {
+        return;
+    }
+    if reader.get_mut().write_all(b"OK\n").is_err() {
+        return;
+    }
+    // 2. 读路径行 + 结束符（2.5.1：同样限制单行长度；
+    //    (&mut reader) 显式借用 —— 直接 reader.take() 会移动 reader，
+    //    后续 get_mut() 无法使用）
+    let mut path_line = String::new();
+    if (&mut reader).take(MAX_LINE_BYTES).read_line(&mut path_line).is_err() {
+        return;
+    }
+    let mut dot = String::new();
+    let _ = (&mut reader).take(8).read_line(&mut dot);
+    let _ = reader.get_mut().write_all(b"OK\n");
+    drop(reader);
+
+    // 3. 校验并处理
+    let path = path_line.trim().to_string();
+    if !path.is_empty() && looks_like_vault(&path) {
+        handle_vault_request(handle, path);
     }
 }
 

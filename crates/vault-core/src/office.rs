@@ -10,7 +10,30 @@
 use std::io::{self, Cursor, Read};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::escape::resolve_xml_entity;
 use calamine::Reader as CalReader;
+
+/// 还原 quick-xml 0.41 拆分出的实体引用事件（GeneralRef）为实际字符。
+///
+/// 0.41 起 reader 不再把 `&amp;` 之类的实体并入 Text 事件，而是单独发出
+/// `Event::GeneralRef`（内容为不含 `&`/`;` 的实体名，如 `amp`、`#x4E2D`）。
+/// 这里解析预定义实体与数字字符引用；未知实体保留原始 `&name;` 形式。
+fn resolve_general_ref(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('#') {
+        let code = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            rest.parse::<u32>().ok()
+        };
+        if let Some(c) = code.and_then(char::from_u32) {
+            return c.to_string();
+        }
+    }
+    if let Some(s) = resolve_xml_entity(name) {
+        return s.to_string();
+    }
+    format!("&{};", name)
+}
 
 // ───────────────── 公共接口 ─────────────────
 
@@ -18,6 +41,17 @@ use calamine::Reader as CalReader;
 /// 恶意构造的「压缩炸弹」解压后可占用巨量内存导致 OOM，此处对每个条目、
 /// 条目数量与最终文本总量统一设限。
 const MAX_OFFICE_TEXT: usize = 64 * 1024 * 1024;
+
+/// 2.5.1 新增：ZIP 容器条目数量上限。恶意 zip 可在中央目录声明海量条目，
+/// zip crate 解析时为每个条目分配元数据，旧实现不检查条目数导致内存耗尽。
+const MAX_ZIP_ENTRIES: usize = 10_000;
+
+/// 2.5.1 新增：工作表数量上限。恶意 xlsx 可声明海量（空）工作表，
+/// 每个表头行不计入文本总量上限，旧实现可被堆到千万级。
+const MAX_SHEETS: usize = 1_000;
+
+/// 2.5.1 新增：单表行数处理上限，超出即拒绝预览（防恶意大表）。
+const MAX_ROWS_PER_SHEET: usize = 1_000_000;
 
 /// 从 ZIP 归档中读取单个条目，限制解压后大小（防压缩炸弹）。
 fn read_zip_entry_limited<R: Read + io::Seek>(
@@ -220,12 +254,26 @@ where
     let mut output = Vec::new();
     let mut total = 0usize;
 
-    for sheet_name in workbook.sheet_names().to_owned() {
+    let sheet_names = workbook.sheet_names().to_owned();
+    // 2.5.1 修复：限制工作表数量（表头行不计入文本总量，需单独设限）
+    if sheet_names.len() > MAX_SHEETS {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("工作表数量过多（{} 个，上限 {}），已拒绝预览", sheet_names.len(), MAX_SHEETS)));
+    }
+
+    for sheet_name in sheet_names {
         output.push(format!("── {} ──", sheet_name));
 
         match workbook.worksheet_range(&sheet_name) {
             Ok(range) => {
+                let mut rows_seen = 0usize;
                 for row in range.rows() {
+                    // 2.5.1 修复：单表行数上限
+                    rows_seen += 1;
+                    if rows_seen > MAX_ROWS_PER_SHEET {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            format!("工作表 '{}' 行数超过预览上限（{} 行）", sheet_name, MAX_ROWS_PER_SHEET)));
+                    }
                     let cells: Vec<String> = row.iter().map(cell_to_string).collect();
                     let line = cells.join("\t");
                     if !line.trim().is_empty() {
@@ -264,6 +312,11 @@ fn extract_docx_text(data: &[u8]) -> io::Result<String> {
     let cursor = Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // 2.5.1 修复：中央目录条目数上限（zip crate 为每个条目分配元数据）
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("ZIP 条目数量过多（{} 个，上限 {}）", archive.len(), MAX_ZIP_ENTRIES)));
+    }
 
     let xml = read_zip_entry_limited(&mut archive, "word/document.xml")?;
     let xml = String::from_utf8_lossy(&xml);
@@ -273,7 +326,7 @@ fn extract_docx_text(data: &[u8]) -> io::Result<String> {
 
 fn parse_docx_xml(xml: &str) -> io::Result<String> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
 
     let mut paragraphs: Vec<String> = Vec::new();
@@ -301,8 +354,15 @@ fn parse_docx_xml(xml: &str) -> io::Result<String> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_para {
-                    if let Ok(text) = e.unescape() {
+                    if let Ok(text) = e.xml10_content() {
                         current_para.push_str(&text);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                if in_para {
+                    if let Ok(name) = e.decode() {
+                        current_para.push_str(&resolve_general_ref(&name));
                     }
                 }
             }
@@ -363,6 +423,11 @@ fn extract_pptx_text(data: &[u8]) -> io::Result<String> {
     let cursor = Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // 2.5.1 修复：中央目录条目数上限（与 docx 同策略）
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("ZIP 条目数量过多（{} 个，上限 {}）", archive.len(), MAX_ZIP_ENTRIES)));
+    }
 
     let mut slides_text = Vec::new();
     let mut total_size = 0usize;
@@ -415,7 +480,7 @@ fn extract_pptx_text(data: &[u8]) -> io::Result<String> {
 
 fn parse_pptx_xml(xml: &str) -> io::Result<String> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
 
     let mut texts = Vec::new();
@@ -435,8 +500,15 @@ fn parse_pptx_xml(xml: &str) -> io::Result<String> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_text {
-                    if let Ok(t) = e.unescape() {
+                    if let Ok(t) = e.xml10_content() {
                         current_text.push_str(&t);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                if in_text {
+                    if let Ok(name) = e.decode() {
+                        current_text.push_str(&resolve_general_ref(&name));
                     }
                 }
             }

@@ -1,12 +1,15 @@
 [package]
 name = "lynvault-rs"
-version = "2.4.1"
+version = "2.6.1"
 edition = "2021"
 
-# 构建产物文件名：LynVault.exe（默认取包名 lynvault-rs）
-[[bin]]
-name = "LynVault"
-path = "src/main.rs"
+# 注意：不要用 `[[bin]] name = "..."` 覆盖产物名。
+# tauri-cli v1 的 app_binary_path() 硬编码用 package.name 定位二进制
+# （见 tooling/cli/src/interface/rust.rs），随后 rename_app() 再把它重命名为
+# Windows 的 productName（LynVault.exe）或 Linux 的 kebab 形式（lyn-vault）。
+# 一旦把 bin 名改成 LynVault，bundler 去找 lynvault-rs 会找不到而报
+# 「failed to rename」，Windows 与 Linux 打包都会失败。
+# 保持默认 bin 名（= 包名 lynvault-rs），产物名由 Tauri 重命名保证。
 
 [build-dependencies]
 tauri-build = { version = "1", features = [] }
@@ -31,7 +34,7 @@ vault-core = { path = "../crates/vault-core" }
 zeroize = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
-log = "0.4"
+log = { version = "0.4", features = ["std"] }
 
 # Windows 专属依赖：系统图标读取 + .lyt 文件关联自注册（本应用仅面向 Windows 发布）
 [target.'cfg(windows)'.dependencies]
@@ -43,6 +46,10 @@ windows = { version = "0.57", features = [
     "Win32_Graphics_Gdi",
 ] }
 winreg = "0.52"
+
+# 2.5.1：destroy_vault 句柄化打开的 O_NOFOLLOW（非 Windows 平台编译用）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = [ "custom-protocol" ]

@@ -190,7 +190,12 @@ pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<serde_jso
 
         // 2.3.0 修复：归一化目录参数（去掉结尾 '/'，根目录保持 "/"），
         // 避免用户在路径框输入 "dir/" 时返回空列表
-        let folder_norm = if folder == "/" { folder.clone() } else { folder.trim_end_matches('/').to_string() };
+        // 2.5.1 修复：改用 Index::normalize_vpath 统一归一化 —— 旧实现只去掉
+        // 结尾 '/'，路径框输入 "foo//bar"、"///" 等仍会因不匹配返回空列表，
+        // 与其他模块（导入/删除/提取）的归一化规则不一致
+        let folder_norm = vault_core::Index::normalize_vpath(&folder)
+            .filter(|p| vault_core::Index::validate_vpath(p))
+            .ok_or_else(|| "无效的目录路径".to_string())?;
 
         let mut items: Vec<serde_json::Value> = Vec::new();
 
@@ -466,9 +471,11 @@ pub async fn add_partition(
     key_file_path: Option<String>,
 ) -> Result<(), String> {
     run_blocking(&app, "add_partition", move |state| {
-        // 分区别名校验：只允许安全字符，防止 XSS
-        if !alias.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ') {
-            return Err("分区别名只能包含字母、数字、下划线、短横线和空格".into());
+        // 分区别名校验：只允许安全字符，防止 XSS。
+        // 2.6.1：收紧为 ASCII-only，禁止 Unicode 同形字符造成「视觉同名」的
+        // 分区别名混淆（与 vault-core::is_valid_alias 保持一致）。
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ') {
+            return Err("分区别名只能包含 ASCII 字母、数字、下划线、短横线和空格".into());
         }
         if alias.trim().is_empty() || alias.len() > 16 {
             return Err("分区别名长度需在 1-16 字符之间".into());
@@ -537,32 +544,59 @@ pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
             .and_then(|v| v.get_path().map(|p| p.to_path_buf()))
             .ok_or("保险柜未打开或路径不可用")?;
 
-        // C8 修复：所有平台都检查符号链接，防止销毁操作跟随符号链接删除系统文件
-        let meta = std::fs::symlink_metadata(&vault_path)
-            .map_err(|e| format!("无法访问保险柜文件: {}", e))?;
-        if meta.file_type().is_symlink() {
-            return Err("拒绝销毁符号链接".into());
-        }
-
-        // 在释放 guard 前先打开文件，缩小 TOCTOU 窗口
-        // 2.4.1：仅保留 Windows 分支（本应用仅面向 Windows 发布）
+        // 2.5.1 修复（TOCTOU，关键）：旧实现是「symlink_metadata 检查 → 打开验证
+        // → 立刻 drop → 关闭会话 → 按路径重新打开擦除」，检查与擦除之间存在
+        // 竞态窗口：同用户目录写权限的攻击者可在窗口内把保险柜文件替换为指向
+        // 受害者文件的硬链接/符号链接，使 7-pass 覆写作用于受害者文件。
+        //
+        // 现在整个销毁流程锚定在**一次打开、全程持有**的句柄上：
+        // 1. 以 FILE_FLAG_OPEN_REPARSE_POINT / O_NOFOLLOW 打开（句柄必然指向
+        //    文件自身而非重解析目标）；
+        // 2. 通过**句柄**元数据原子性地确认非符号链接（不再依赖按路径的
+        //    symlink_metadata 检查）；
+        // 3. 关闭保险柜会话（drop Vault 自身持有的句柄）；
+        // 4. 擦除与删除全部经由该句柄（Windows 下 delete-on-close 不经路径）。
         #[cfg(windows)]
-        {
+        let file = {
             use std::os::windows::fs::OpenOptionsExt;
             // 0x00200000 = FILE_FLAG_OPEN_REPARSE_POINT
-            let _fd = std::fs::OpenOptions::new().write(true)
+            std::fs::OpenOptions::new().write(true).read(true)
                 .custom_flags(0x00200000)
                 .open(&vault_path)
-                .map_err(|_| "目标文件已被重解析点替换")?;
-            drop(_fd);
+                .map_err(|e| format!("无法打开保险柜文件: {}", e))?
+        };
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().write(true).read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&vault_path)
+                .map_err(|e| format!("无法打开保险柜文件: {}", e))?
+        };
+        // 非 Windows / Unix 平台（未官方支持）退化为普通打开
+        #[cfg(not(any(windows, unix)))]
+        let file = std::fs::OpenOptions::new().write(true).read(true)
+            .open(&vault_path)
+            .map_err(|e| format!("无法打开保险柜文件: {}", e))?;
+        // 句柄级符号链接验证（Unix 上 O_NOFOLLOW 已在打开时拒绝，无需重复）
+        #[cfg(windows)]
+        {
+            let ftype = file.metadata()
+                .map_err(|e| format!("无法读取保险柜文件元数据: {}", e))?
+                .file_type();
+            if ftype.is_symlink() {
+                return Err("拒绝销毁符号链接".into());
+            }
         }
+
+        // 关闭会话（drop Vault 内部持有的文件句柄，落盘审计）
         if let Some(v) = guard.as_mut() {
             v.close();
         }
-        *guard = None;
-        vault_core::wipe::dod_erase(&vault_path, None).map_err(|e| e.to_string())?;
+        drop(guard);
 
-        Ok(())
+        // 基于已持有句柄完成 DoD 7-pass 擦除 + 删除（全程不按路径重开）
+        vault_core::wipe::dod_erase_handle(file, &vault_path).map_err(|e| e.to_string())
     })
     .await
 }
@@ -627,11 +661,55 @@ pub async fn preview_office_file(app: AppHandle, vpath: String) -> Result<String
     run_blocking(&app, "preview_office_file", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        // 2.5.1 修复（OOM）：旧实现直接 load_file_data（内部上限 256 MiB），
+        // 而 load_file_content 的预览路径有 64 MiB 上限 —— 同为「预览」，
+        // Office 路径却允许整读 256 MiB 再做解压解析，恶意/超大文件可瞬间
+        // 占用数百 MB 内存。现与预览路径统一 64 MiB 上限。
+        let size = {
+            let index = vault.load_index().map_err(|e| e.to_string())?;
+            index.files.get(&vpath)
+                .map(|m| m.size)
+                .ok_or("文件不存在")?
+        };
+        if size > MAX_PREVIEW_SIZE {
+            return Err(format!(
+                "文件过大（{} 字节），预览上限 64 MB，请使用「提取」导出后查看",
+                size
+            ));
+        }
         let data = vault.load_file_data(&vpath).map_err(|e| e.to_string())?;
         let filename = vpath.rsplit('/').next().unwrap_or(&vpath);
         let text = vault_core::office::extract_office_text(&data, filename);
         vault_core::wipe::secure_wipe_vec(data);
         text
+    })
+    .await
+}
+
+/// 2.5.1 新增：把编辑后的文件内容（base64）写回保险柜内同名 vpath。
+/// 供 txt 预览的「直接编辑保存」使用 —— 全程不解密到磁盘：
+/// 新内容加密追加到保险柜末尾 → 更新索引（先落盘）→ DoD 7-pass 覆写旧密文。
+/// 编辑上限与预览一致（64 MiB）。
+#[tauri::command]
+pub async fn update_file_content(
+    app: AppHandle,
+    vpath: String,
+    content_b64: String,
+) -> Result<(), String> {
+    run_blocking(&app, "update_file_content", move |state| {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(content_b64.as_bytes())
+            .map_err(|e| format!("内容编码无效: {}", e))?;
+        if data.len() as u64 > MAX_PREVIEW_SIZE {
+            vault_core::wipe::secure_wipe_vec(data);
+            return Err("内容过大：文本编辑上限 64 MB".into());
+        }
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        let result = vault.update_file_content(&vpath, &data).map_err(|e| e.to_string());
+        vault_core::wipe::secure_wipe_vec(data);
+        result
     })
     .await
 }

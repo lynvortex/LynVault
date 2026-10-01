@@ -8,6 +8,7 @@
 //! - P2-19：密码按字符数校验（4 个 12+ 字符汉字可通过，11 个 ASCII 字符拒绝）
 //! - is_vault_file：magic bytes 识别（.lyt 自动识别功能的基础）
 //! - 碎片整理后数据完整性（P0-3：旧数据擦除 + 布局重写）
+//! - 重命名回归：rename_file / rename_folder 后密文仍可解密（AAD 不得绑定可变 vpath）
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -312,6 +313,76 @@ fn partition_add_remove_and_wrong_partition_password() {
         .expect_err("已删除的分区密码不应再有效");
 }
 
+// ───────────────── 分区别名（2.6.1 加固回归） ─────────────────
+
+/// 新录入的别名必须是 ASCII-only：Unicode 字母（如全角/汉字）会被拒绝，
+/// 防止「视觉同名」的分区别名混淆。合法 ASCII 别名不受影响。
+#[test]
+fn new_partition_alias_must_be_ascii_only() {
+    let dir = tempdir("aliasascii");
+    let (mut v, _) = new_vault(&dir);
+
+    for bad in ["分区", "ｄｅｃｏｙ", "Décoy", "a\tb"] {
+        assert!(
+            v.add_partition(bad, "decoy password 123", None).is_err(),
+            "非 ASCII / 控制字符别名应被拒绝: {:?}",
+            bad
+        );
+    }
+    // 合法 ASCII（字母/数字/下划线/短横线/空格）仍可通过
+    v.add_partition("decoy 2", "decoy password 123", None)
+        .expect("合法 ASCII 别名应通过");
+    assert!(v.get_partitions().iter().any(|p| p.alias == "decoy 2"));
+}
+
+// ───────────────── 头部完整性（2.6.1 回归） ─────────────────
+
+/// 多分区（real_count ≥ 2）下篡改头部条目也必须被捕获。
+/// 旧实现以「头部声明的有效分区数 ≤ 1」为条件校验头部签名，多分区时整体跳过，
+/// 导致头部可被静默篡改。新实现改用「绑定头部」的分区 auth_tag，无条件捕获。
+#[test]
+fn header_tamper_detected_even_with_multiple_partitions() {
+    let dir = tempdir("headertamper");
+    let (mut v, path) = new_vault(&dir);
+    v.add_partition("decoy", "decoy password 123", None).expect("添加分区失败");
+    drop(v);
+
+    // 篡改主分区条目的别名字段（条目 0 偏移 = 106）。
+    // 别名不参与锁定区 HMAC、也不参与密钥派生，旧实现在多分区下无法发现。
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[106] ^= 0xFF;
+    fs::write(&path, &bytes).unwrap();
+
+    let mut v2 = Vault::default();
+    assert!(
+        v2.open_and_authenticate(&path, PWD, None).is_err(),
+        "多分区保险柜的头部篡改必须导致认证失败（不得因分区数 ≥ 2 而跳过校验）"
+    );
+}
+
+/// 单分区保险柜不得通过「注入带合法别名的伪条目」把头部完整性校验降级跳过。
+/// 旧实现中：注入伪条目 → real_count 变为 2 → 头部签名校验被整体跳过 → 篡改可成功。
+#[test]
+fn fake_partition_cannot_downgrade_header_integrity() {
+    let dir = tempdir("fakedowngrade");
+    let (_, path) = new_vault(&dir);
+
+    let mut b = fs::read(&path).unwrap();
+    // 条目 1 偏移 = 106 + 96 = 202。整段别名先清零，再写入合法别名 "evil"，
+    // 使 is_valid_alias 判定为真（把 real_count 抬到 2）。
+    b[202..218].copy_from_slice(&[0u8; 16]);
+    b[202..206].copy_from_slice(b"evil");
+    // 同时篡改主分区别名（让头部与主分区 auth_tag 不再匹配）
+    b[106] ^= 0xFF;
+    fs::write(&path, &b).unwrap();
+
+    let mut v = Vault::default();
+    assert!(
+        v.open_and_authenticate(&path, PWD, None).is_err(),
+        "注入伪条目不得使头部完整性校验被跳过"
+    );
+}
+
 // ───────────────── 虚拟路径校验（回归） ─────────────────
 
 #[test]
@@ -341,4 +412,125 @@ fn vpath_validation_neutralizes_traversal() {
 
     // 合法路径成功
     assert!(v.import_file(&src, "/ok/t.txt").is_ok());
+}
+
+// ───────────────── 重命名（回归） ─────────────────
+
+/// 重命名只改索引 key，密文在原地不动（FileMeta 的 offset/length 被 `..meta` 原样保留）。
+/// 因此解密时若拿「当前 vpath」当 AAD，重命名后 GCM 认证必然失败 —— 内容静默不可读。
+#[test]
+fn rename_file_keeps_content_readable() {
+    let dir = tempdir("renamefile");
+    let (mut v, path) = new_vault(&dir);
+
+    let data = b"rename me \xe4\xbd\xa0\xe5\xa5\xbd payload".to_vec();
+    let src = write_src(&dir, "before.bin", &data);
+    v.import_file(&src, "/before.bin").unwrap();
+
+    {
+        let mut im = v.get_index_manager().unwrap();
+        im.rename_file("/before.bin", "after.bin").expect("重命名失败");
+    }
+
+    let idx = v.load_index().unwrap();
+    assert!(idx.files.contains_key("/after.bin"), "索引应指向新路径");
+    assert!(!idx.files.contains_key("/before.bin"), "旧路径应消失");
+
+    // 关键断言：密文没有被重新加密，重命名后必须仍能解密
+    assert_eq!(
+        v.load_file_data("/after.bin").expect("重命名后应仍能读取"),
+        data
+    );
+
+    let out = dir.join("out");
+    v.extract_file("/after.bin", &out, true).expect("重命名后应仍能提取");
+    assert_eq!(fs::read(out.join("after.bin")).unwrap(), data);
+
+    // 重开验证磁盘状态：排除内存索引缓存掩盖问题的可能
+    drop(v);
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None).unwrap();
+    assert_eq!(
+        v2.load_file_data("/after.bin").expect("重开后应仍能读取"),
+        data
+    );
+}
+
+/// rename_folder 会按 new_prefix 批量改写所有子文件的索引 key（index.rs），
+/// 所以整个文件夹改名时，里面每个文件都会遭遇同一次 AAD 失配。
+#[test]
+fn rename_folder_keeps_children_readable() {
+    let dir = tempdir("renamefolder");
+    let (mut v, path) = new_vault(&dir);
+
+    let a = b"child a".to_vec();
+    let b = b"child b".to_vec();
+    v.import_file(&write_src(&dir, "a.bin", &a), "/docs/a.bin").unwrap();
+    v.import_file(&write_src(&dir, "b.bin", &b), "/docs/sub/b.bin").unwrap();
+
+    {
+        let mut im = v.get_index_manager().unwrap();
+        im.rename_folder("/docs", "reference").expect("重命名文件夹失败");
+    }
+
+    let idx = v.load_index().unwrap();
+    assert!(idx.folders.contains_key("/reference"), "文件夹应移到新路径");
+    assert!(idx.files.contains_key("/reference/a.bin"), "一级子文件应随之移动");
+    assert!(idx.files.contains_key("/reference/sub/b.bin"), "嵌套子文件也应随之移动");
+
+    // 关键断言：一级与嵌套子文件都仍可解密
+    assert_eq!(
+        v.load_file_data("/reference/a.bin").expect("一级子文件应仍可读"),
+        a
+    );
+    assert_eq!(
+        v.load_file_data("/reference/sub/b.bin").expect("嵌套子文件应仍可读"),
+        b
+    );
+
+    drop(v);
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None).unwrap();
+    assert_eq!(v2.load_file_data("/reference/sub/b.bin").unwrap(), b);
+}
+
+/// 兼容性契约：修复前写入的索引没有 aad_tag（反序列化后为 None），读取必须
+/// 回退到当前 vpath —— 存量保险柜不能因为这次修复而读不出来。
+/// 同时验证「重命名时才冻结」这条路径：旧条目在首次改名后即获得保护。
+#[test]
+fn legacy_index_without_aad_tag_still_readable() {
+    let dir = tempdir("legacyaad");
+    let (mut v, _) = new_vault(&dir);
+
+    let data = b"legacy entry".to_vec();
+    v.import_file(&write_src(&dir, "old.bin", &data), "/old.bin").unwrap();
+
+    // 模拟修复前写入的索引条目：把冻结标识抹掉（等价于旧版本序列化出的 JSON）
+    {
+        let mut idx = v.load_index().unwrap();
+        idx.files.get_mut("/old.bin").unwrap().aad_tag = None;
+        v.save_index(&idx).unwrap();
+    }
+
+    // 回退路径：按当前 vpath 解密，仍应成功
+    assert_eq!(
+        v.load_file_data("/old.bin").expect("旧索引应回退到当前 vpath"),
+        data
+    );
+
+    // 重命名时才冻结，冻结后仍可读
+    {
+        let mut im = v.get_index_manager().unwrap();
+        im.rename_file("/old.bin", "renamed.bin").unwrap();
+    }
+    let idx = v.load_index().unwrap();
+    assert_eq!(
+        idx.files.get("/renamed.bin").unwrap().aad_tag.as_deref(),
+        Some("/old.bin"),
+        "重命名应把旧 vpath 冻结为 AAD"
+    );
+    assert_eq!(
+        v.load_file_data("/renamed.bin").expect("冻结后应仍可读"),
+        data
+    );
 }

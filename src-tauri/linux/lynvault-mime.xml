@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 2.6.1：.lyt 文件类型定义（仅随 deb 安装到 /usr/share/mime/packages/）。
+     Debian 的 shared-mime-info 对该目录注册了 dpkg trigger，安装/卸载时会自动
+     执行 update-mime-database，无需在包内附带 postinst 脚本。 -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-lynvault-vault">
+    <comment>LynVault 加密保险柜</comment>
+    <comment xml:lang="en">LynVault encrypted vault</comment>
+    <glob pattern="*.lyt"/>
+    <icon name="application-x-lynvault-vault"/>
+  </mime-type>
+</mime-info>

@@ -131,6 +131,73 @@ pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::
     Ok(())
 }
 
+/// 2.5.1 新增：基于调用方**预打开句柄**做 DoD 7-pass 擦除并删除文件。
+///
+/// 消除销毁路径上的 TOCTOU：旧的 `dod_erase(path)` 是「symlink 检查 →
+/// 按路径重新打开 → 擦除 → 按路径删除」，检查与擦除之间存在竞态窗口 ——
+/// 同用户目录写权限的攻击者可在窗口内把目标替换为指向受害者文件的
+/// 硬链接/符号链接，使 7-pass 覆写作用于受害者文件。
+///
+/// 调用方约定：以 `O_NOFOLLOW`（Unix）/ `FILE_FLAG_OPEN_REPARSE_POINT`
+/// （Windows）打开并通过句柄元数据确认非符号链接后，把句柄交给本函数；
+/// 擦除与删除全程只作用于该句柄代表的文件对象。
+///
+/// 删除方式：Windows 优先 delete-on-close（POSIX 语义，句柄关闭即由系统
+/// 删除，不经路径，失败时回退 `remove_file`）；非 Windows 回退
+/// `remove_file`（此时数据已被覆写，残余风险仅为删除目标被替换，
+/// 无法造成保险柜内容泄露）。
+pub fn dod_erase_handle(file: File, path: &Path) -> io::Result<()> {
+    let length = file.metadata()?.len();
+    let mut file = file;
+    if length > 0 {
+        dod_overwrite_range(&mut file, 0, length)?;
+    }
+    #[cfg(windows)]
+    {
+        if mark_delete_on_close(&file) {
+            // 标记成功：句柄 drop 时由系统直接删除文件（不经路径）
+            drop(file);
+            return Ok(());
+        }
+        // 不支持 delete-on-close（旧系统 / 特殊文件系统）→ 回退按路径删除
+    }
+    drop(file);
+    fs::remove_file(path)
+}
+
+/// Windows：把已打开句柄标记为「关闭时删除」（POSIX 删除语义）。
+/// 成功返回 true；失败（旧系统 / 文件系统不支持）返回 false 由调用方回退。
+#[cfg(windows)]
+fn mark_delete_on_close(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    // 注意：windows-rs 0.57 中 `FileDispositionInfoEx` 是模块级常量（该版本将其生成为
+    // 带 pub i32 的 newtype + 自由常量），而非常量项；`SetFileInformationByHandle`
+    // 期望 `HANDLE(isize)`，而 `as_raw_handle()` 返回 `*mut c_void`，故需显式转换。
+    use windows::Win32::Storage::FileSystem::{
+        FileDispositionInfoEx, SetFileInformationByHandle, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+        FILE_DISPOSITION_INFO_EX_FLAGS,
+    };
+
+    // POSIX_SEMANTICS：即使其他进程仍持有该文件句柄也强制在关闭时删除，
+    // 与 unlink 语义一致（避免杀毒软件等第三方句柄导致文件残留）。
+    let mut info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
+            FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0,
+        ),
+    };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle() as isize),
+            FileDispositionInfoEx,
+            &mut info as *mut _ as *const core::ffi::c_void,
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    ok.is_ok()
+}
+
 /// 安全删除多个文件（DoD 7-pass）
 pub fn dod_erase_files(paths: &[&Path], progress_callback: Option<&dyn Fn(usize, &str)>) -> io::Result<()> {
     for (i, path) in paths.iter().enumerate() {
