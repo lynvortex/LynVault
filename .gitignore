@@ -20,6 +20,7 @@ Thumbs.db
 *.msixbundle
 *.exe
 lynvault-fixed*
+*.deb
 
 # 本地保险柜与碎片整理临时文件
 *.lyt
