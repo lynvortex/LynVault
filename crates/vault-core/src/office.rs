@@ -85,7 +85,7 @@ fn read_zip_entry_limited<R: Read + io::Seek>(
 // - Standard（版本 2/3.2，Office 2007）：SHA-1 迭代 50000 次后做 0x36/0x5c 双散列扩展；
 //   校验器与载荷均为 AES-**ECB**（无 IV），载荷首 4 字节为 u32 明文总长
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
 use aes::{Aes128, Aes192, Aes256};
 use base64::Engine;
 use sha1::Sha1;
@@ -100,8 +100,9 @@ const BLK_KEY_VERIFIER_HASH_INPUT: [u8; 8] = [0xFE, 0xA7, 0xD2, 0x76, 0x3B, 0x4B
 const BLK_KEY_VERIFIER_HASH_VALUE: [u8; 8] = [0xD7, 0xAA, 0x0F, 0x6D, 0x30, 0x61, 0x34, 0x4E];
 const BLK_KEY_KEY_VALUE: [u8; 8] = [0x14, 0x6E, 0x0B, 0xE7, 0xAB, 0xAC, 0xD0, 0xD6];
 
-/// spinCount 上限：正规文档为 10 万（Office 默认）；恶意 XML 声称超大值会拖死预览
-const MAX_SPIN_COUNT: u32 = 10_000_000;
+/// spinCount 上限：Office 默认值为 10 万。恶意 XML 声称超大值（如 10⁷）会让
+/// 口令派生的迭代散列在预览路径上消耗大量 CPU —— 超出即按参数异常拒绝
+const MAX_SPIN_COUNT: u32 = 100_000;
 
 #[derive(Clone, Copy)]
 enum HashAlg {
@@ -127,6 +128,16 @@ fn new_hasher(alg: HashAlg) -> Box<dyn DynDigest> {
         HashAlg::Sha256 => Box::new(Sha256::new()),
         HashAlg::Sha384 => Box::new(Sha384::new()),
         HashAlg::Sha512 => Box::new(Sha512::new()),
+    }
+}
+
+/// 各散列算法的摘要长度（EncryptionInfo 参数校验用）
+fn hash_digest_len(alg: HashAlg) -> usize {
+    match alg {
+        HashAlg::Sha1 => 20,
+        HashAlg::Sha256 => 32,
+        HashAlg::Sha384 => 48,
+        HashAlg::Sha512 => 64,
     }
 }
 
@@ -180,13 +191,18 @@ fn derive_iterated_hash(password_utf16: &[u8], salt: &[u8], alg: HashAlg, spin: 
     let mut buf = salt.to_vec();
     buf.extend_from_slice(password_utf16);
     let mut h = hash_bytes(alg, &buf);
+    // 2.7.1：含口令字节的中间量用后即清零，不允许随作用域结束残留
+    buf.zeroize();
     let mut tmp = Vec::with_capacity(4 + h.len());
     for i in 0u32..spin {
         tmp.clear();
         tmp.extend_from_slice(&i.to_le_bytes());
         tmp.extend_from_slice(&h);
-        h = hash_bytes(alg, &tmp);
+        let next = hash_bytes(alg, &tmp);
+        h.zeroize();
+        h = next;
     }
+    tmp.zeroize();
     h
 }
 
@@ -290,19 +306,29 @@ fn parse_encryption_info(info: &[u8]) -> Result<AgileParams, String> {
     if !matches!(enc_key_bits, 128 | 192 | 256) || !matches!(data_key_bits, 128 | 192 | 256) {
         return Err("不支持的密钥长度".into());
     }
+    let enc_hash = hash_alg_by_name(&get(&enc_key, "hashAlgorithm")?)
+        .ok_or_else(|| "不支持的散列算法".to_string())?;
+    let data_hash = hash_alg_by_name(&get(&key_data, "hashAlgorithm")?)
+        .ok_or_else(|| "不支持的散列算法".to_string())?;
+    // 2.7.1 修复（恶意文档 panic）：Agile EncryptionInfo 声明 SHA-1 + AES-192/256 时，
+    // derive_key 会按 keyBits 截断散列输出 → 越界切片 panic。解析阶段校验
+    // 「摘要长度 ≥ 密钥长度」，超出即按参数异常拒绝。
+    if hash_digest_len(enc_hash) < enc_key_bits / 8
+        || hash_digest_len(data_hash) < data_key_bits / 8
+    {
+        return Err("加密参数异常（散列长度小于密钥长度）".into());
+    }
 
     Ok(AgileParams {
         spin_count,
         enc_key_bits,
-        enc_hash: hash_alg_by_name(&get(&enc_key, "hashAlgorithm")?)
-            .ok_or_else(|| "不支持的散列算法".to_string())?,
+        enc_hash,
         enc_salt: b64(&get(&enc_key, "saltValue")?)?,
         verifier_hash_input: b64(&get(&enc_key, "encryptedVerifierHashInput")?)?,
         verifier_hash_value: b64(&get(&enc_key, "encryptedVerifierHashValue")?)?,
         key_value: b64(&get(&enc_key, "encryptedKeyValue")?)?,
         data_key_bits,
-        data_hash: hash_alg_by_name(&get(&key_data, "hashAlgorithm")?)
-            .ok_or_else(|| "不支持的散列算法".to_string())?,
+        data_hash,
         data_salt: b64(&get(&key_data, "saltValue")?)?,
     })
 }
@@ -312,7 +338,7 @@ fn read_stream_limited<R: Read + io::Seek>(
     name: &str,
     cap: u64,
 ) -> Result<Vec<u8>, String> {
-    let mut stream = cfb
+    let stream = cfb
         .open_stream(name)
         .map_err(|_| format!("缺少流 {}", name))?;
     let mut out = Vec::new();
@@ -352,19 +378,33 @@ fn decrypt_encrypted_package(data: &[u8], password: &str) -> Result<Vec<u8>, Str
 
 /// 口令校验：解密 verifierHashInput 取散列，与解密后的 verifierHashValue 比较
 fn password_ok(p: &AgileParams, password_key: &dyn Fn(&[u8]) -> Vec<u8>) -> bool {
+    use subtle::ConstantTimeEq;
     let key1 = password_key(&BLK_KEY_VERIFIER_HASH_INPUT);
     let verifier_input = match aes_cbc_decrypt(&key1, &p.enc_salt, &p.verifier_hash_input) {
         Some(v) => v,
-        None => return false,
+        None => {
+            secure_wipe_vec(key1);
+            return false;
+        }
     };
     let key2 = password_key(&BLK_KEY_VERIFIER_HASH_VALUE);
     let expected = match aes_cbc_decrypt(&key2, &p.enc_salt, &p.verifier_hash_value) {
         Some(v) => v,
-        None => return false,
+        None => {
+            secure_wipe_vec(key1);
+            secure_wipe_vec(key2);
+            secure_wipe_vec(verifier_input);
+            return false;
+        }
     };
+    // 2.7.1：两把临时密钥与 verifier_input 用后即清零
+    secure_wipe_vec(key1);
+    secure_wipe_vec(key2);
     let actual = hash_bytes(p.enc_hash, &verifier_input);
-    // Office 对非块对齐的散列会零填充到块大小，只比较 digest 长度的前缀
-    expected.len() >= actual.len() && expected[..actual.len()] == actual[..]
+    secure_wipe_vec(verifier_input);
+    // Office 对非块对齐的散列会零填充到块大小，只比较 digest 长度的前缀；
+    // 2.7.1：比较改为恒定时间（与 vault 侧认证纪律一致，防止计时侧信道）
+    expected.len() >= actual.len() && bool::from(expected[..actual.len()].ct_eq(&actual[..]))
 }
 
 /// 解密 Agile Encryption 载荷，返回原始 OOXML ZIP 字节
@@ -417,7 +457,7 @@ fn decrypt_agile_package(info: &[u8], package: &[u8], password: &str) -> Result<
         let mut iv_input = p.data_salt.clone();
         iv_input.extend_from_slice(&(i as u32).to_le_bytes());
         let iv = hash_bytes(p.data_hash, &iv_input);
-        let mut dec = match aes_cbc_decrypt(&secret, &iv, chunk) {
+        let dec = match aes_cbc_decrypt(&secret, &iv, chunk) {
             Some(d) => d,
             None => {
                 secret.zeroize();
@@ -509,8 +549,15 @@ fn derive_standard_key(h_final: &[u8], key_bits: usize) -> Vec<u8> {
     }
     let mut x3 = hash_bytes(HashAlg::Sha1, &buf1);
     let x2 = hash_bytes(HashAlg::Sha1, &buf2);
+    // 2.7.1：扩展缓冲含密钥材料，用后即清零
+    buf1.zeroize();
+    buf2.zeroize();
     x3.extend_from_slice(&x2);
-    x3[..key_bits / 8].to_vec()
+    let mut x2 = x2;
+    x2.zeroize();
+    let key = x3[..key_bits / 8].to_vec();
+    x3.zeroize();
+    key
 }
 
 /// AES-ECB 解密（Standard Encryption 的校验器与数据段不使用 IV）
@@ -540,15 +587,24 @@ fn derive_standard_key_from_password(password: &str, salt: &[u8], key_bits: usiz
     // h = SHA1(salt ‖ pwd)；迭代 50000 次 hn = SHA1(u32_le(i) ‖ hn-1)；hfinal = SHA1(h ‖ 0)
     let mut buf = salt.to_vec();
     buf.extend_from_slice(&pwd16);
+    // 2.7.1：全部中间量（pwd16/buf/h/tmp/h_final）用后即清零
+    pwd16.zeroize();
     let mut h = hash_bytes(HashAlg::Sha1, &buf);
+    buf.zeroize();
     for i in 0u32..50_000 {
         let mut tmp = i.to_le_bytes().to_vec();
         tmp.extend_from_slice(&h);
-        h = hash_bytes(HashAlg::Sha1, &tmp);
+        let next = hash_bytes(HashAlg::Sha1, &tmp);
+        tmp.zeroize();
+        h.zeroize();
+        h = next;
     }
     h.extend_from_slice(&0u32.to_le_bytes());
-    let h_final = hash_bytes(HashAlg::Sha1, &h);
-    derive_standard_key(&h_final, key_bits)
+    let mut h_final = hash_bytes(HashAlg::Sha1, &h);
+    h.zeroize();
+    let key = derive_standard_key(&h_final, key_bits);
+    h_final.zeroize();
+    key
 }
 
 fn decrypt_standard_package(
@@ -625,7 +681,7 @@ fn extract_encrypted_ooxml(
     let Some(password) = password else {
         return Err("OFFICE_ENCRYPTED".into());
     };
-    let mut plain = decrypt_encrypted_package(data, password)?;
+    let plain = decrypt_encrypted_package(data, password)?;
     let text = match kind {
         EncryptedKind::Docx => extract_docx_text(&plain).map_err(|e| e.to_string()),
         EncryptedKind::Xlsx => extract_xlsx_text(&plain).map_err(|e| e.to_string()),
@@ -997,6 +1053,9 @@ fn extract_csv_text(data: &[u8]) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // BlockEncrypt 仅测试内的加密辅助（aes_cbc_encrypt）使用：
+    // 留在顶层会在非测试构建报 unused import，收进测试模块
+    use aes::cipher::BlockEncrypt;
 
     // 规范向量一（与 msoffcrypto-tool 6.0.0 doctest 一致，源自 Word 实际生成的文件）：
     // 口令派生 + encryptedKeyValue 解密必须得到固定的中间密钥
@@ -1081,10 +1140,21 @@ mod tests {
         assert!(text.contains("机密测试内容"), "解密后应能提取文本: {}", text);
     }
 
+    // 2.7.1 回归：spinCount 超过上限（10 万，Office 默认值）必须在解析阶段按
+    // 参数异常拒绝，不再允许 10⁷ 次迭代散列的预览路径 DoS
+    #[test]
+    fn spin_count_above_cap_is_rejected() {
+        let docx = build_minimal_docx("spin");
+        let ole = agile_encrypt_for_test(&docx, "Password1234_", MAX_SPIN_COUNT + 1);
+        let err = extract_office_text(&ole, "t.docx", Some("Password1234_")).unwrap_err();
+        assert!(err.contains("spinCount"), "应报 spinCount 参数异常: {}", err);
+    }
+
     fn build_minimal_docx(text: &str) -> Vec<u8> {
         use std::io::Write;
         let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        zw.start_file("word/document.xml", zip::write::FileOptions::default())
+        // zip 8：FileOptions 带泛型参数，SimpleFileOptions 是无额外选项的别名
+        zw.start_file("word/document.xml", zip::write::SimpleFileOptions::default())
             .unwrap();
         zw.write_all(
             format!(

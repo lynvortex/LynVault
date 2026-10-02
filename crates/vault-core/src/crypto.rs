@@ -1,9 +1,10 @@
 //! 密码学原语封装
 
-/// 头部签名相关常量（与 vault.rs 保持一致）
-const SIGNED_LENGTH: usize = 887;
-const SIGNATURE_OFFSET: usize = 960;
-const SIGNATURE_SIZE: usize = 64;
+/// 头部签名相关常量（单一来源：vault.rs 侧一律从本模块导入，
+/// 不再各自维护一份靠注释提醒保持一致）
+pub const SIGNED_LENGTH: usize = 887;
+pub const SIGNATURE_OFFSET: usize = 960;
+pub const SIGNATURE_SIZE: usize = 64;
 
 use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
@@ -61,6 +62,12 @@ pub fn derive_legacy_lock_key(
         lock_salt[i] ^= DOMAIN_SEP[i];
     }
 
+    // 2.7.1 修复：参数校验前置 —— 旧实现在口令已拼进 combined 之后再
+    // `Params::new(...)?`，该错误路径会跳过下方 zeroize，留下含口令的堆残留
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
     // 2.4.1 修复：精确预留容量，避免多次 realloc 在堆上留下含密码的旧副本
     let kf_len = key_file_data.map_or(0, |kf| kf.len());
     let mut combined = Vec::with_capacity(password.as_bytes().len() + kf_len);
@@ -68,10 +75,6 @@ pub fn derive_legacy_lock_key(
     if let Some(kf) = key_file_data {
         combined.extend_from_slice(kf);
     }
-
-    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
-        .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut master = [0u8; 32];
     if let Err(e) = argon2.hash_password_into(&combined, &lock_salt, &mut master) {
@@ -116,6 +119,12 @@ pub fn derive_keys(
     key_file_data: Option<&[u8]>,
     salt: &[u8],
 ) -> Result<KeyMaterial, VaultError> {
+    // 2.7.1 修复：参数校验前置（与 derive_legacy_lock_key 同一问题）——
+    // 口令已拼进 combined 之后再 `?` 会跳过零化
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
     let pwd_bytes = password.as_bytes();
     // 2.4.1 修复：按最终长度精确预留，避免 extend 触发 realloc，
     // 旧缓冲区（含密码/密钥文件字节）未经 zeroize 残留在堆上
@@ -130,10 +139,6 @@ pub fn derive_keys(
     } else {
         combined.extend_from_slice(&0u64.to_le_bytes());
     }
-
-    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
-        .map_err(|e| VaultError::Other(format!("Argon2 参数错误: {}", e)))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     // 2.7.0 修复：与 derive_legacy_lock_key 一致，所有错误路径都先零化
     // combined（含主密码字节）再返回，不允许 `?` 提前返回跳过零化

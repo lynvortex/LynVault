@@ -635,3 +635,64 @@ fn legacy_index_without_aad_tag_still_readable() {
         data
     );
 }
+
+// ───────────────── 2.7.1 回归 ─────────────────
+
+/// 创建保险柜不得覆盖已有保险柜：create_new 优先 —— 目标已存在（即便已被换成
+/// 另一个保险柜）时直接拒绝，且拒绝后原件必须完好可用。旧实现「先 is_vault_file
+/// 检查再 create+truncate」的两步之间存在竞态，检查失效时会把另一个保险柜清零。
+#[test]
+fn create_refuses_to_overwrite_existing_vault() {
+    let dir = tempdir("noclobber");
+    let (mut v, path) = new_vault(&dir);
+    let data = b"precious payload".to_vec();
+    v.import_file(&write_src(&dir, "p.bin", &data), "/p.bin").unwrap();
+    drop(v);
+
+    let mut v2 = Vault::default();
+    assert!(
+        v2.create(&path, "another password 123", None).is_err(),
+        "创建必须拒绝覆盖已有保险柜"
+    );
+    assert!(!v2.is_open());
+
+    // 拒绝后原件完好：仍可用原密码打开并读出数据
+    let mut v3 = Vault::default();
+    v3.open_and_authenticate(&path, PWD, None)
+        .expect("拒绝覆盖后原件必须完好");
+    assert_eq!(v3.load_file_data("/p.bin").unwrap(), data);
+}
+
+/// 三个删除入口（secure_delete_file / secure_delete_files_batch / delete_folder）
+/// 统一按索引键规则归一化：`/docs//a.txt`、`/docs/./a.txt`、带尾斜杠的输入都能
+/// 命中；删除根目录明确报错。
+#[test]
+fn delete_entries_normalize_vpath() {
+    let dir = tempdir("delnorm");
+    let (mut v, _) = new_vault(&dir);
+    v.import_file(&write_src(&dir, "a.txt", b"a"), "/docs/a.txt").unwrap();
+    v.import_file(&write_src(&dir, "b.txt", b"b"), "/docs/b.txt").unwrap();
+
+    // 批量删除：冗余斜杠输入命中
+    let (files, _, _) = v
+        .secure_delete_files_batch(&["/docs//b.txt".to_string()])
+        .expect("批量删除失败");
+    assert_eq!(files, 1, "归一化后应命中 /docs/b.txt");
+
+    // 单文件删除：'.' 段输入命中
+    let reclaimed = v.secure_delete_file("/docs/./a.txt").expect("单文件删除失败");
+    assert!(reclaimed.is_none(), "小文件删除不应触发自动整理");
+
+    // 文件夹删除：尾斜杠输入命中；根目录明确报错
+    v.import_file(&write_src(&dir, "c.txt", b"c"), "/more/c.txt").unwrap();
+    assert!(v.delete_folder("/").is_err(), "删除根目录应明确报错");
+    let reclaimed = v.delete_folder("/more/").expect("文件夹删除失败");
+    assert!(reclaimed.is_none());
+
+    let idx = v.load_index().unwrap();
+    assert!(
+        idx.files.is_empty(),
+        "三种输入形式都应命中删除（仍剩 {} 项）",
+        idx.files.len()
+    );
+}

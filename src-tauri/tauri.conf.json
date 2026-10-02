@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "LynVault",
-    "version": "2.7.0"
+    "version": "2.7.1"
   },
   "tauri": {
     "allowlist": {
@@ -22,8 +22,7 @@
         "save": true
       },
       "fs": {
-        "all": false,
-        "scope": ["$APPDATA/**", "$DESKTOP/**", "$DOCUMENT/**", "$DOWNLOAD/**"]
+        "all": false
       },
       "shell": {
         "all": false,
@@ -66,18 +65,6 @@
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'"
     },
-    "windows": [
-      {
-        "fullscreen": false,
-        "resizable": true,
-        "title": "LynVault 2.7.0",
-        "width": 960,
-        "height": 620,
-        "center": true,
-        "fileDropEnabled": true,
-        "decorations": false,
-        "transparent": true
-      }
-    ]
+    "windows": []
   }
 }

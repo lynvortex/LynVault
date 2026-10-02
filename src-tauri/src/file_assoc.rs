@@ -50,11 +50,25 @@ pub fn register_if_absent() {
     };
 
     // 已有关联？
+    // 2.7.1 修复：此前只要 .lyt 指向本 ProgId 就会重写全部 4 个键并广播
+    // SHCNE_ASSOCCHANGED —— 既无意义，又会被安全软件反复判为「修改文件关联」
+    // 的高危行为而弹风险提示。现已注册且 open 命令指向当前 exe 时直接跳过
+    //（exe 移动 / 替换后命令不匹配，自然重新注册）。
     if let Ok(dot) = classes.open_subkey_with_flags(".lyt", KEY_READ) {
         if let Ok(existing) = dot.get_value::<String, _>("") {
-            if !existing.is_empty() && !existing.eq_ignore_ascii_case(PROG_ID) {
+            if existing.eq_ignore_ascii_case(PROG_ID) {
+                if let Ok(cmd_key) = classes.open_subkey_with_flags(
+                    format!("{}\\shell\\open\\command", PROG_ID),
+                    KEY_READ,
+                ) {
+                    if let Ok(cmd) = cmd_key.get_value::<String, _>("") {
+                        if cmd == format!("\"{}\" \"%1\"", exe_str) {
+                            return;
+                        }
+                    }
+                }
+            } else if !existing.is_empty() {
                 // 用户已将 .lyt 关联到其他程序 —— 尊重用户选择，不覆盖
-                log::info!("[LynVault] .lyt 已关联到 '{}'，跳过自注册", existing);
                 return;
             }
         }
@@ -80,8 +94,8 @@ pub fn register_if_absent() {
     }
 
     // 通知 Explorer 刷新关联（失败无妨，重启 Explorer 后自然生效）
+    //（2.7.1：日志器只落 Warn 及以上，移除永不记录的 info 日志）
     notify_shell();
-    log::info!("[LynVault] .lyt 文件关联已注册（用户级，双击 .lyt 可直接打开本程序）");
 }
 
 /// 广播 SHCNE_ASSOCCHANGED，让资源管理器立即刷新图标与关联。

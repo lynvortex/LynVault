@@ -124,6 +124,65 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// 启动失败的最终出口：日志已由调用方落盘，这里弹系统消息框告知原因。
+/// 发布版（windows_subsystem="windows"）没有控制台，弹窗是用户唯一能看到的线索。
+#[cfg(windows)]
+fn fatal_startup_error(title: &str, msg: &str) {
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let t = to_wide(title);
+    let m = to_wide(msg);
+    unsafe {
+        MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), MB_OK | MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn fatal_startup_error(title: &str, msg: &str) {
+    let _ = title;
+    eprintln!("[LynVault] {}", msg);
+}
+
+/// WebView2 数据目录候选列表（按优先级）：
+/// 不再直接用 %LOCALAPPDATA%\<bundle identifier>（该目录被残留进程持有句柄 /
+/// 处于删除挂起态时无法恢复），改为 %LOCALAPPDATA%\LynVault\WebView2Data；
+/// 不可用时回退临时目录。两个目录都创建失败时返回空表（调用方不设置环境变量，
+/// WebView2 用系统默认位置）。
+fn webview2_data_dir_candidates() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        let dir = std::path::PathBuf::from(base)
+            .join("LynVault")
+            .join("WebView2Data");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            dirs.push(dir);
+        }
+    }
+    let fallback = std::env::temp_dir().join("LynVault").join("WebView2Data");
+    if std::fs::create_dir_all(&fallback).is_ok() && !dirs.contains(&fallback) {
+        dirs.push(fallback);
+    }
+    dirs
+}
+
+/// 创建主窗口。`transparent` 失败时由调用方降级重试（透明 → 不透明）。
+/// 2.7.1 起窗口由代码创建（tauri.conf.json 的 windows 置空），启动失败可控。
+fn create_main_window(app: &tauri::App, transparent: bool) -> Result<(), String> {
+    tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::default())
+        .title("LynVault 2.7.1")
+        .inner_size(960.0, 620.0)
+        .resizable(true)
+        .fullscreen(false)
+        .decorations(false)
+        .transparent(transparent)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     // 2.5.1 修复：必须在一切可能产生告警的逻辑（单实例、命令线程）之前初始化
     init_logging();
@@ -144,7 +203,15 @@ fn main() {
         return;
     }
 
-    tauri::Builder::default()
+    // 2.7.1 修复：启动失败不再表现为「闪退」。旧实现把 Builder::run() 的结果交给
+    // .expect()，窗口 / WebView2 初始化一旦失败（E_UNEXPECTED / ERROR_BUSY /
+    // ACCESS_DENIED，或数据目录 create_dir_all 的 PermissionDenied）只会让进程
+    // panic 退出；发布版是 windows_subsystem="windows"、没有控制台，panic 不走
+    // log，用户看到的就是「双击后什么都没发生」，%TEMP%\LynVault.log 里同样
+    // 一片空白。现改为 build() 后手动创建主窗口（tauri.conf.json 的 windows 置空），
+    // 失败依次降级重试：透明 → 不透明 → 换备用 WebView2 数据目录 → 不透明；
+    // 仍失败才记日志并弹系统消息框告之原因。
+    let app = match tauri::Builder::default()
         .manage(commands::AppState::new())
         .setup(|app| {
             // 首实例：启动单实例监听线程（持有端口监听器直到进程退出）
@@ -161,11 +228,9 @@ fn main() {
             commands::open_vault,
             commands::close_vault,
             commands::list_folder,
-            commands::import_file,
             commands::import_files_batch,
             commands::import_folder,
             commands::import_dropped_paths,
-            commands::extract_file,
             commands::extract_files,
             commands::delete_files,
             commands::delete_folder,
@@ -192,6 +257,66 @@ fn main() {
             commands::get_launch_vault_arg,
             commands::frontend_ready,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+    {
+        Ok(app) => app,
+        Err(e) => {
+            log::error!("Tauri 应用初始化失败: {:?}", e);
+            fatal_startup_error(
+                "LynVault 启动失败",
+                &format!(
+                    "应用初始化失败：{:?}
+
+常见原因：WebView2 Runtime 缺失或损坏、用户数据目录无写权限。请修复后重新启动。",
+                    e
+                ),
+            );
+            return;
+        }
+    };
+
+    // 主窗口降级重试：每个 WebView2 数据目录先试透明（与旧版观感一致）再试
+    // 不透明；全部失败才放弃并告之原因。候选目录为空时不设置环境变量
+    //（WebView2 用系统默认位置）。
+    let data_dirs = webview2_data_dir_candidates();
+    let attempts: Vec<Option<&std::path::Path>> = if data_dirs.is_empty() {
+        vec![None]
+    } else {
+        data_dirs.iter().map(|d| Some(d.as_path())).collect()
+    };
+    let mut last_err: Option<String> = None;
+    let mut created = false;
+    'outer: for dir in attempts {
+        if let Some(d) = dir {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", d);
+        }
+        for &transparent in &[true, false] {
+            match create_main_window(&app, transparent) {
+                Ok(()) => {
+                    created = true;
+                    break 'outer;
+                }
+                Err(e) => {
+                    log::warn!("主窗口创建失败（transparent={}，降级重试）: {}", transparent, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    if !created {
+        let err = last_err.unwrap_or_default();
+        log::error!("主窗口创建失败（含全部降级重试）: {}", err);
+        fatal_startup_error(
+            "LynVault 启动失败",
+            &format!(
+                "主窗口创建失败：{}
+
+常见原因：WebView2 Runtime 缺失或损坏、用户数据目录无写权限或被占用。请修复后重新启动。",
+                err
+            ),
+        );
+        return;
+    }
+
+    app.run(|_app, _event| {});
 }

@@ -1,6 +1,6 @@
 [package]
 name = "vault-core"
-version = "2.7.0"
+version = "2.7.1"
 edition = "2021"
 
 [dependencies]
@@ -25,7 +25,9 @@ log = "0.4"
 # NsReader 命名空间声明无界分配导致内存耗尽 DoS）。
 calamine = "0.36"
 quick-xml = "0.41"
-zip = "0.6"
+# 2.7.1：zip 0.6 → 8。0.6 主线已停止维护（依赖树中曾与 8.x 双份并存）；
+# 本仓库仅用内存内 by_name 读取（无 Zip-Slip 面）与测试内 ZipWriter，API 兼容
+zip = "8"
 cfb = "0.7"
 libc = "0.2"
 # 2.7.0：加密 Office 预览(Agile Encryption 解密)

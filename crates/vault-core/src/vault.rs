@@ -46,6 +46,11 @@ pub fn is_vault_file(path: &Path) -> bool {
 /// `is_vault_file` 的 magic 探测、杀软扫描），但拒绝其他任何**写**打开，从文件
 /// 句柄层面排除并发写（纯 std，无需额外依赖）。
 /// Unix 侧由 [`lock_vault_exclusive`] 的 `flock` 提供同等保证。
+///
+/// 2.7.1 加固：打开阶段即拒绝符号链接 / 重解析点 —— 带
+/// `FILE_FLAG_OPEN_REPARSE_POINT` / `O_NOFOLLOW` 打开，并用句柄元数据确认。
+/// 销毁路径（`Vault::destroy`）全程复用会话句柄，防护因此不再有「按路径重开」
+/// 的削弱窗口。
 fn open_vault_rw(path: &Path, create: bool) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
@@ -56,9 +61,46 @@ fn open_vault_rw(path: &Path, create: bool) -> std::io::Result<File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        opts.share_mode(FILE_SHARE_READ);
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.share_mode(FILE_SHARE_READ).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    opts.open(path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    // 句柄级确认：重解析点（含符号链接）一律拒绝 —— 打开必然锚定文件本体
+    #[cfg(windows)]
+    {
+        if file.metadata()?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "拒绝通过符号链接 / 重解析点打开保险柜文件",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+/// 2.7.1 新增：以 create_new 语义独占创建保险柜文件（目标已存在时失败，
+/// 绝不清零已有内容）。打开标志与 [`open_vault_rw`] 完全一致。
+fn open_vault_create_new(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.share_mode(FILE_SHARE_READ).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    Ok(opts.open(path)?)
 }
 
 /// 2.6.1 新增：取得保险柜文件的独占锁，防止双实例并发写坏头部/索引。
@@ -82,10 +124,8 @@ fn lock_vault_exclusive(_file: &File) -> std::io::Result<()> {
 
 const LOCK_OFFSET: usize = 887;
 // 签名范围仅到 lock_offset 之前；锁定区（887-927）由自身 HMAC 保护，
-// 每次认证失败都会修改锁定区，若包含在签名中会导致后续认证因签名不匹配而失败
-const SIGNED_LENGTH: usize = 887;
-const SIGNATURE_OFFSET: usize = 960;
-const SIGNATURE_SIZE: usize = 64;
+// 每次认证失败都会修改锁定区，若包含在签名中会导致后续认证因签名不匹配而失败。
+// 2.7.1：常量单一来源收敛到 crypto.rs（本文件经 `use crate::crypto::*` 导入）
 
 const DEFAULT_PARTITION: &str = "Main";
 
@@ -142,13 +182,13 @@ fn load_index_from_file(
 ///   2. 更新头部偏移指向新索引（旧索引位置暂存）
 ///   3. 擦除旧索引（此时即使崩溃，新索引已可由头部定位，旧索引只是垃圾）
 /// 由于头部更新在本函数内无法完成（需要 &mut self 全字段），
-/// 此处返回 new_off/new_len + 旧位置信息，由 save_index 协调顺序。
+/// 此处返回 new_off/new_len，由 save_index 协调顺序。
+/// 2.7.1：移除已弃用的 old_offset/old_length 参数（擦除由调用方在头部更新后
+/// 经 wipe_old_index_range 完成，本函数从未使用过这两个参数）。
 fn save_index_to_file(
     file: &mut File,
     enc_key: &[u8; 32],
     index: &Index,
-    old_offset: u64,
-    old_length: u64,
 ) -> Result<(u64, u64), VaultError> {
     let plain = serde_json::to_vec(index)?;
     let encrypted = encrypt_gcm(enc_key, &plain, b"index", None)?;
@@ -161,7 +201,6 @@ fn save_index_to_file(
 
     // 注意：旧索引的擦除推迟到 save_index 完成 update_header 之后，
     // 以保证头部偏移先于旧索引擦除被持久化（C3 修复）。
-    let _ = (old_offset, old_length);
 
     secure_wipe_vec(plain);
     Ok((new_offset, encrypted.len() as u64))
@@ -230,6 +269,115 @@ fn sync_parent_dir(path: &Path) {
     {
         let _ = File::open(parent).and_then(|d| d.sync_all());
     }
+}
+
+/// 2.7.1 新增：查询路径所在卷的可用空间（碎片整理预检用）。
+/// Windows：GetDiskFreeSpaceExW；Unix：statvfs；其他平台返回 u64::MAX（跳过预检）。
+fn disk_free_bytes(dir: &Path) -> std::io::Result<u64> {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free: u64 = 0;
+        unsafe {
+            GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), None, None)
+        }
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(free)
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径包含空字节"))?;
+        let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(vfs.f_bavail as u64 * vfs.f_frsize as u64)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = dir;
+        Ok(u64::MAX)
+    }
+}
+
+/// 2.7.1 新增：碎片整理中间副本（.tmp/.bak）统一「先 DoD 擦除再删除」——
+/// 直接 remove_file 会把可恢复的保险柜内容残留在磁盘上。擦除失败时仍尽力
+/// 移除（避免残留占位），失败仅记日志。
+fn wipe_scratch_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Err(e) = dod_erase(path, None) {
+        log::warn!("擦除碎片整理中间文件失败（将尝试直接删除）: {}", e);
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// 2.7.1 修复：用临时文件替换保险柜本体，同时保留原文件的安全属性。
+/// 旧实现 `fs::rename` 后保险柜变成新建的临时文件对象，属性/ACL 改为目录继承
+/// —— 用户为 `.lyt` 单独设置的「仅本人可访问」静默失效。
+/// - Windows：`ReplaceFileW`（替换内容同时保留被替换文件的安全描述符 / 属性 /
+///   创建时间），不支持时（旧系统 / 特殊文件系统）回退 rename；
+/// - Unix：rename 后把原文件的权限位还原到新文件。
+fn replace_vault_file(temp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        match replace_file_windows(temp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                log::warn!("ReplaceFileW 替换失败，回退 rename: {}", e);
+            }
+        }
+    }
+    #[cfg(unix)]
+    let old_perms = fs::metadata(dest).ok().map(|m| m.permissions());
+    fs::rename(temp, dest)?;
+    #[cfg(unix)]
+    if let Some(perms) = old_perms {
+        let _ = fs::set_permissions(dest, perms);
+    }
+    Ok(())
+}
+
+/// Windows：ReplaceFileW 替换（保留安全描述符/属性/创建时间）。
+/// 调用方需已释放对目标文件的所有句柄（替换式操作需取得 DELETE 访问权）。
+#[cfg(windows)]
+fn replace_file_windows(temp: &Path, dest: &Path) -> std::io::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        ReplaceFileW, REPLACE_FILE_FLAGS,
+        REPLACEFILE_IGNORE_MERGE_ERRORS, REPLACEFILE_WRITE_THROUGH,
+    };
+    fn to_wide(p: &Path) -> Vec<u16> {
+        p.as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let dest_w = to_wide(dest);
+    let temp_w = to_wide(temp);
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(dest_w.as_ptr()),
+            PCWSTR(temp_w.as_ptr()),
+            PCWSTR::null(), // 不保留备份文件（备份由整理流程自行管理）
+            REPLACE_FILE_FLAGS(REPLACEFILE_WRITE_THROUGH.0 | REPLACEFILE_IGNORE_MERGE_ERRORS.0),
+            None,
+            None,
+        )
+    }
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
 /// 写入完整头部（含签名）
@@ -471,14 +619,24 @@ fn path_within(child: &Path, base: &Path) -> bool {
     }
 }
 
-/// 别名的 16 字节头部字段（按字符截断，避免切断多字节字符）。
+/// 别名的 16 字节头部字段（按字符截断，且**截断点必须落在字符边界上**）。
+/// 2.7.1 修复：旧实现先按字符取 16 个、再按字节截断到 16 字节 —— 多字节字符
+/// 会在字节中间被切断，重开时 `from_utf8_lossy` 产出 U+FFFD，该分区被
+/// `is_plausible_alias` 误判为伪条目而消失（表现为「内部错误：匹配分区丢失」）。
+/// 现按字符边界累加；ASCII 别名的字节序列与旧实现完全一致。
 /// 与 [`write_header_to_file`] 写出的别名字段、以及 [`auth_tag_header_prefix`]
 /// 绑定载荷所用字节完全一致。
 fn alias_field16(alias: &str) -> [u8; 16] {
     let mut field = [0u8; 16];
-    let bytes: Vec<u8> = alias.chars().take(16).collect::<String>().into_bytes();
-    let n = bytes.len().min(16);
-    field[..n].copy_from_slice(&bytes[..n]);
+    let mut n = 0usize;
+    for c in alias.chars() {
+        let len = c.len_utf8();
+        if n + len > 16 {
+            break;
+        }
+        c.encode_utf8(&mut field[n..]);
+        n += len;
+    }
     field
 }
 
@@ -593,23 +751,34 @@ impl Vault {
             return Err(VaultError::AlreadyOpen);
         }
 
-        // 2.7.0 修复：create 以 create+truncate 打开，目标路径上的任何已有文件
-        // 会在 open 瞬间被清零且不可恢复（连 7-pass 擦除都没经过）——尤其致命的
-        // 是误覆盖另一个保险柜。UI 的保存对话框虽有「覆盖？」确认，但库级 API
-        // 此前没有任何防护。现在：目标已是保险柜文件（magic 匹配）或目录时直接拒绝；
-        // 非保险柜的普通文件仍允许覆盖（用户已在保存对话框中显式确认）。
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.is_dir() {
-                return Err(VaultError::Other("目标路径是目录，无法创建保险柜".into()));
+        // 2.7.1 修复（检查-再清零竞态）：旧实现先 is_vault_file 检查再以 create+truncate
+        // 打开，两步之间目标文件可能被替换 —— 检查失效时直接把另一个保险柜清零且
+        // 不可恢复。现改为 **create_new 优先**：目标已存在时不会被清零；确认
+        // 「已存在且非保险柜」（用户已在保存对话框确认覆盖普通文件）后才以
+        // create+truncate 重开。
+        let mut file = match open_vault_create_new(path) {
+            Ok(f) => f,
+            Err(e) => {
+                // create_new 失败：区分「已存在」与目录 / 权限等
+                if let Ok(meta) = fs::metadata(path) {
+                    if meta.is_dir() {
+                        return Err(VaultError::Other("目标路径是目录，无法创建保险柜".into()));
+                    }
+                }
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e.into());
+                }
+                if is_vault_file(path) {
+                    return Err(VaultError::Other(
+                        "目标路径已存在一个保险柜文件，拒绝覆盖（请选择其他位置或先手动删除）".into(),
+                    ));
+                }
+                // 已存在且非保险柜的普通文件：UI 保存对话框已让用户显式确认覆盖，
+                // 此时才允许 create+truncate 重开（目标此刻若已被换成保险柜文件，
+                // 上述 is_vault_file 检查已在重开前拒绝，不再有清零窗口）
+                open_vault_rw(path, true)?
             }
-            if is_vault_file(path) {
-                return Err(VaultError::Other(
-                    "目标路径已存在一个保险柜文件，拒绝覆盖（请选择其他位置或先手动删除）".into(),
-                ));
-            }
-        }
-
-        let mut file = open_vault_rw(path, true)?;
+        };
         // 2.6.1：创建即为独占会话，避免与另一实例并发写同一文件
         lock_vault_exclusive(&file)
             .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
@@ -719,8 +888,13 @@ impl Vault {
             }
         };
         if !verified {
-            // 新密钥与旧派生方式都无法校验 → 锁定区确实被篡改（或密码与密钥文件不匹配的旧保险柜）
-            return Err(VaultError::Other("头部锁定区被篡改".into()));
+            // 2.7.1 修复：<2.3.0 的旧格式保险柜锁定区用密码派生密钥校验，输错密码
+            // 同样走到该分支 —— 旧文案「头部锁定区被篡改」会诱导用户误以为文件
+            // 被破坏而丢弃重要保险柜。现明确告知旧版保险柜通常只是密码或密钥
+            // 文件不正确。
+            return Err(VaultError::Other(
+                "头部锁定区校验失败。若是 2.3.0 之前创建的旧版保险柜，这通常只是密码或密钥文件不正确，请确认后重试（文件并未损坏，请勿删除）；新版保险柜出现该错误则说明头部可能被篡改".into(),
+            ));
         }
         if lock_state.is_locked() {
             return Err(VaultError::Locked);
@@ -798,8 +972,22 @@ impl Vault {
                     }
                     Err(e) => {
                         // 匹配分区但头部/索引校验失败 → 视为篡改，中止并清理全部密钥
+                        // 2.7.1 诊断：先以头部 HMAC 签名（此前只写不校验）取证，
+                        // 再统一清零全部密钥
+                        let sig_ok = verify_header_signature(&header, &keys.sign_key);
                         for k in keys_list.iter_mut() { k.zeroize(); }
-                        return Err(e);
+                        // 2.7.1 修复：分区密码正确但索引解不出来时，旧实现只抛
+                        // 「Invalid ciphertext or corrupted data」，与「密码错误」
+                        // 不可区分，也没有下一步指引。现明确告知「分区密码正确」。
+                        return Err(VaultError::Other(format!(
+                            "分区密码正确，但该分区数据校验失败（{}）。头部签名{}。为避免进一步损坏，请勿再向此保险柜写入任何数据，并改用更早时间点的副本（用其他分区密码打开不受影响）",
+                            e,
+                            if sig_ok {
+                                "校验通过 —— 头部未被篡改，损坏位于索引数据区"
+                            } else {
+                                "校验失败 —— 头部可能也被篡改"
+                            }
+                        )));
                     }
                 }
             }
@@ -980,7 +1168,7 @@ impl Vault {
         let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
         // 步骤 1：写新索引到末尾（不擦旧索引）
-        let (new_off, new_len) = save_index_to_file(file, enc_key, &idx, old_off, old_len)?;
+        let (new_off, new_len) = save_index_to_file(file, enc_key, &idx)?;
 
         // 步骤 2：更新内存中的分区信息
         self.partitions[active].index_offset = new_off;
@@ -1584,14 +1772,19 @@ impl Vault {
     }
 
     pub fn secure_delete_file(&mut self, vpath: &str) -> Result<Option<u64>, VaultError> {
+        // 2.7.1 修复：删除入口统一走 normalize_vpath —— 旧实现只有 delete_folder
+        // 去过尾斜杠，`/docs//a.txt`、`/docs/./a.txt` 之类输入会「文件不存在」静默失配
+        let vpath = Index::normalize_vpath(vpath)
+            .filter(|p| Index::validate_vpath(p))
+            .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
         // 2.3.0 顺序修正：先更新索引并 save_index（标记已删除），再覆写密文。
         // 旧实现先擦密文后存索引，中途崩溃会让索引仍指向已损坏的密文 → GCM 认证失败 → 永久损坏。
         // 与 secure_delete_files_batch 的「先存索引再擦密文」策略保持一致。
         let mut index = self.load_index()?;
-        let meta = index.files.get(vpath)
+        let meta = index.files.get(&vpath)
             .ok_or_else(|| VaultError::Other("文件不存在".into()))?
             .clone();
-        index.files.remove(vpath);
+        index.files.remove(&vpath);
         self.log_event(&format!("安全删除文件 '{}'", vpath));
         self.save_index(&index)?;
 
@@ -1611,6 +1804,15 @@ impl Vault {
     }
 
     pub fn delete_folder(&mut self, vpath: &str) -> Result<Option<u64>, VaultError> {
+        // 2.7.1 修复：带尾斜杠的删除请求 `delete_folder("/a/")` 会得到前缀 "/a//"，
+        // 一个文件都没删却返回成功 —— 入口统一按索引键规则归一化；删除根目录
+        // 改为明确报错（不再静默全删）
+        let vpath = Index::normalize_vpath(vpath)
+            .filter(|p| Index::validate_vpath(p))
+            .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
+        if vpath == "/" {
+            return Err(VaultError::Other("拒绝删除根目录".into()));
+        }
         let prefix = format!("{}/", vpath);
 
         // 1. 一次性加载索引，收集所有需要移除的条目
@@ -1634,7 +1836,7 @@ impl Vault {
             index.folders.remove(&d);
         }
         if vpath != "/" {
-            index.folders.remove(vpath);
+            index.folders.remove(&vpath);
         }
 
         self.log_event(&format!("删除文件夹 '{}'（含 {} 个文件）", vpath, files_to_wipe.len()));
@@ -1686,16 +1888,22 @@ impl Vault {
         let mut direct_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut folder_prefixes: Vec<String> = Vec::new();
         let mut folder_self: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // 归一化结果统一落到这里（String），随后的分类只借用
+        let mut normalized: Vec<String> = Vec::with_capacity(vpaths.len());
         for vp in vpaths {
-            let vp_norm = vp.trim_end_matches('/');
-            if vp_norm.is_empty() || vp_norm == "/" {
-                continue;
+            // 2.7.1 修复：入口统一按索引键规则归一化（与 secure_delete_file /
+            // delete_folder 一致），`/docs//a.txt` 之类输入不再静默失配
+            match Index::normalize_vpath(vp) {
+                Some(p) if Index::validate_vpath(&p) && p != "/" => normalized.push(p),
+                _ => continue,
             }
-            if index.files.contains_key(vp_norm) {
-                direct_files.insert(vp_norm);
-            } else if index.folders.contains_key(vp_norm) {
+        }
+        for vp_norm in &normalized {
+            if index.files.contains_key(vp_norm.as_str()) {
+                direct_files.insert(vp_norm.as_str());
+            } else if index.folders.contains_key(vp_norm.as_str()) {
                 folder_prefixes.push(format!("{}/", vp_norm));
-                folder_self.insert(vp_norm);
+                folder_self.insert(vp_norm.as_str());
             }
             // 既不是文件也不是文件夹的 vpath 静默跳过（防御性）
         }
@@ -1807,6 +2015,20 @@ impl Vault {
         // 新数据区天然不相交（blob 均追加写入，互不重叠），擦除旧区不会伤及新数据
         let orig_len = std::fs::metadata(&vault_path)?.len();
 
+        // 2.7.1 修复：整理前预检磁盘可用空间 —— 备份（完整副本）+ 临时文件都在
+        // 同一磁盘上，按「约 2× 文件大小 + 4 MiB」预留；不足时明确拒绝且不产生
+        // 任何中间文件（旧实现写到一半才失败，留下半份残留副本）。
+        let need = orig_len.saturating_mul(2).saturating_add(4 * 1024 * 1024);
+        if let Ok(free) = disk_free_bytes(vault_path.parent().unwrap_or(Path::new("."))) {
+            if free < need {
+                return Err(VaultError::Other(format!(
+                    "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），已取消整理，未产生任何中间文件",
+                    need / (1024 * 1024),
+                    free / (1024 * 1024),
+                )));
+            }
+        }
+
         // 随机临时文件名，防止符号链接攻击
         let mut rand_suffix = [0u8; 16];
         OsRng.fill_bytes(&mut rand_suffix);
@@ -1826,11 +2048,22 @@ impl Vault {
         // 对活跃分区做碎片整理（重写文件数据 + 索引），其他分区数据原样保留。
 
         // Create unique backup and temporary files exclusively so pre-existing links cannot be followed.
-        let mut backup_file = OpenOptions::new().write(true).create_new(true).open(&backup_path)?;
-        let mut original = File::open(&vault_path)?;
-        std::io::copy(&mut original, &mut backup_file)?;
-        backup_file.sync_all()?;
-        drop(backup_file);
+        // 2.7.1 修复：备份 io::copy 中途失败（磁盘不足最常见）时半份 .bak 永久
+        // 残留 —— 失败分支统一「先 DoD 擦除再删除」。
+        let backup_result: std::io::Result<()> = (|| {
+            let mut backup_file =
+                OpenOptions::new().write(true).create_new(true).open(&backup_path)?;
+            let mut original = File::open(&vault_path)?;
+            let copy = std::io::copy(&mut original, &mut backup_file);
+            let sync = backup_file.sync_all();
+            drop(backup_file);
+            drop(original);
+            copy.and(sync).map(|_| ())
+        })();
+        if let Err(e) = backup_result {
+            wipe_scratch_file(&backup_path);
+            return Err(e.into());
+        }
 
         // 2.4.1：闭包返回整理后的最终索引（供成功分支刷新内存缓存）
         let result = (|| -> Result<Index, VaultError> {
@@ -1937,7 +2170,12 @@ impl Vault {
             // 访问权 —— 会话句柄未释放时 rename 在 Windows 上会 sharing violation
             // 失败。先 drop 本进程句柄再替换（成功/失败分支随后都会重新独占打开）。
             self.file = None;
-            fs::rename(&temp_path, &vault_path)?;
+            // 2.7.1 修复：fs::rename 会让保险柜变成新建的临时文件对象，属性/ACL
+            // 改为目录继承 —— 用户为 .lyt 单独设置的「仅本人可访问」静默失效，
+            // 而 2.7.0 起删除会自动触发整理，该副作用已从偶发变常态。Windows 改用
+            // ReplaceFileW（替换内容同时保留安全描述符/属性/创建时间），不支持时
+            // 回退 rename；Unix rename 后还原 mode。
+            replace_vault_file(&temp_path, &vault_path)?;
             sync_parent_dir(&vault_path);
 
             // 2.3.0 修复：备份是保险柜的完整副本，直接删除会在磁盘上留下抗取证死角。
@@ -1970,7 +2208,8 @@ impl Vault {
                     && old_idx_off.saturating_add(old_idx_len) <= orig_len
                     && old_file_ranges.iter().all(|&(o, l)| o.saturating_add(l) <= orig_len);
                 if single_partition {
-                    log::debug!("单分区紧凑整理：旧数据区未进入新文件，无需擦除");
+                    // 单分区紧凑整理：旧数据区未进入新文件，无需擦除
+                    //（2.7.1：日志器只落 Warn 及以上，移除永不记录的 debug 日志）
                 } else if !wipe_safe {
                     log::warn!("碎片整理布局校验未通过，跳过旧数据擦除（残留垃圾，无害）");
                 }
@@ -2007,9 +2246,22 @@ impl Vault {
                 // 2.7.0 修复：先释放会话句柄 —— 下方「备份恢复」也是对 vault_path
                 // 的替换式 rename，会话句柄未释放时同样会 sharing violation 失败。
                 self.file = None;
-                let _ = fs::remove_file(&temp_path);
+                // 2.7.1 修复：temp 是保险柜内容的中间副本，先 DoD 擦除再删除
+                //（旧实现直接 remove_file，半份副本可恢复）
+                wipe_scratch_file(&temp_path);
                 if backup_path.exists() {
-                    let _ = fs::rename(&backup_path, &vault_path);
+                    // 2.7.1 修复：备份恢复的 rename 失败不再被静默吞掉 —— 此时
+                    // 保险柜本体已被移走，必须告知用户并保留 .bak 以便手动恢复
+                    if let Err(re) = fs::rename(&backup_path, &vault_path) {
+                        log::error!(
+                            "碎片整理失败后从备份恢复保险柜失败：{}；同目录残留的 .bak 备份文件未被删除，请手动恢复",
+                            re
+                        );
+                        return Err(VaultError::Other(format!(
+                            "整理失败（{}），且自动恢复失败（{}）：请勿再次写入，同目录的 .bak 备份文件可手动恢复",
+                            e, re
+                        )));
+                    }
                     // 2.4.1 修复：闭包内可能已把 self.partitions[active] 指向**新**偏移，
                     // 而恢复回来的原文件仍是旧布局 —— 不回滚会导致后续读写错位。
                     // （旧实现在此存在状态不一致缺陷）
@@ -2151,6 +2403,60 @@ impl Vault {
 
     pub fn is_open(&self) -> bool {
         self.enc_key.is_some() && self.file.is_some()
+    }
+
+    // ═══════════════ 销毁 ═══════════════
+
+    /// 2.7.1 修复（Windows 上销毁必然失败的回归）：旧流程是命令层按路径以
+    /// 「读+写」重新打开同一文件再擦除 —— 但会话句柄以 `FILE_SHARE_READ` 独占
+    /// 共享模式打开（2.6.1），任何**写**打开都会被系统拒绝
+    /// （`ERROR_SHARING_VIOLATION` / os error 32），销毁从未成功过；失效期间
+    /// 用户很可能改用普通文件管理器删除 —— 数据未经任何擦除。
+    ///
+    /// 现改为销毁全程**交出会话句柄本身**，不按路径二次打开：
+    /// - 符号链接 / 重解析点的拒绝前移到**打开阶段**（`open_vault_rw` 的
+    ///   `FILE_FLAG_OPEN_REPARSE_POINT` / `O_NOFOLLOW` + 句柄元数据确认），
+    ///   句柄锚定的 TOCTOU 防护因此不再削弱；
+    /// - 未落盘的审计先随索引持久化（此时仍持有会话句柄），随后交出句柄做
+    ///   DoD 7-pass 擦除 + 删除（Windows 下优先 delete-on-close，不经路径）。
+    pub fn destroy(&mut self) -> Result<(), VaultError> {
+        if !self.is_open() {
+            return Err(VaultError::NotOpen);
+        }
+        let path = self.path.clone().ok_or(VaultError::NotOpen)?;
+
+        // 与 close 相同：先把未落盘的审计持久化（此时仍持有会话句柄）
+        if self.audit.is_some() {
+            if let Some(ref mut audit) = self.audit {
+                audit.add("保险柜已销毁");
+            }
+            self.audit_dirty = true;
+        }
+        if self.enc_key.is_some() && self.audit_dirty {
+            if let Err(e) = self.load_index().and_then(|idx| self.save_index(&idx)) {
+                log::warn!("销毁前落盘审计失败（不影响销毁）: {}", e);
+            }
+        }
+
+        // 交出会话句柄 —— 后续擦除与删除只作用于该句柄代表的文件对象
+        let file = self.file.take().ok_or(VaultError::NotOpen)?;
+
+        // 清理会话状态（与 close 相同的密钥/缓存清理）
+        self.path = None;
+        if let Some(mut idx) = self.cached_index.take() {
+            idx.files.clear();
+            idx.folders.clear();
+            idx.audit.clear();
+        }
+        if let Some(mut key) = self.enc_key.take() { key.zeroize(); }
+        if let Some(mut key) = self.auth_key.take() { key.zeroize(); }
+        if let Some(mut key) = self.sign_key.take() { key.zeroize(); }
+        self.active_partition = None;
+        self.audit = None;
+        self.audit_dirty = false;
+
+        // 基于已持有的句柄完成 DoD 7-pass 擦除 + 删除（全程不按路径重开）
+        Ok(crate::wipe::dod_erase_handle(file, &path)?)
     }
 
     // ═══════════════ 关闭 ═══════════════

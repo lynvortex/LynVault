@@ -239,25 +239,9 @@ pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<serde_jso
 
 // ───────────────── 文件导入 ─────────────────
 
-#[tauri::command]
-pub async fn import_file(
-    app: AppHandle,
-    src_path: String,
-    dest_vpath: String,
-) -> Result<(), String> {
-    run_blocking(&app, "import_file", move |state| {
-        let mut guard = lock_vault(state)?;
-        let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        let src = Path::new(&src_path);
-        // 由文件名 + 目标目录构造完整虚拟路径，使文件放入当前浏览的目录
-        let filename = src.file_name()
-            .ok_or_else(|| "无法获取文件名".to_string())?
-            .to_string_lossy().to_string();
-        let full_vpath = format!("{}/{}", dest_vpath.trim_end_matches('/'), filename);
-        vault.import_file(src, &full_vpath).map_err(|e| e.to_string())
-    })
-    .await
-}
+// 2.7.1：移除死命令 `import_file` / `extract_file` —— 自 2.4.1 批量路径上线后
+// 无前端调用方，且后者硬编码 overwrite=true（静默覆盖语义），留着是无调用方
+// 约束的危险默认值。批量入口：import_files_batch / extract_files。
 
 /// 2.4.1 新增（P0-2）：批量导入文件。
 /// 单次索引加密落盘替代 N 次（旧版前端循环 import_file 时每个文件都全量重写索引 + 10 次 fsync）。
@@ -370,35 +354,21 @@ pub async fn import_dropped_paths(
 // ───────────────── 文件提取 ─────────────────
 
 #[tauri::command]
-pub async fn extract_file(
-    app: AppHandle,
-    vpath: String,
-    dest_folder: String,
-) -> Result<(), String> {
-    run_blocking(&app, "extract_file", move |state| {
-        let mut guard = lock_vault(state)?;
-        let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        // 2.4.1（P0-5）：overwrite=true 显式覆盖（旧实现固定 create_new，
-        // 重复提取同名文件会报错；语义改为「最后提取的生效」）
-        vault.extract_file(&vpath, Path::new(&dest_folder), true).map_err(|e| e.to_string())
-    })
-    .await
-}
-
-#[tauri::command]
 pub async fn extract_files(
     app: AppHandle,
     vpaths: Vec<String>,
     dest_folder: String,
-) -> Result<usize, String> {
+) -> Result<serde_json::Value, String> {
     run_blocking(&app, "extract_files", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         // 2.3.0 修复：委托给 vault-core 批量提取（单次 load_index + extract_file_inner，
         // 避免对每个文件重复 load_index 的 O(n²) 退化）
-        let (ok, _fail) = vault.extract_files_batch(&vpaths, Path::new(&dest_folder))
+        // 2.7.1 修复：失败数不再被静默丢弃 —— 旧实现只回传成功数且前端连它都
+        // 不用，默认拒绝覆盖同名文件时整批失败也报「提取完成」
+        let (ok, fail) = vault.extract_files_batch(&vpaths, Path::new(&dest_folder))
             .map_err(|e| e.to_string())?;
-        Ok(ok)
+        Ok(serde_json::json!({ "ok": ok, "fail": fail }))
     })
     .await
 }
@@ -541,63 +511,14 @@ pub async fn defragment_vault(app: AppHandle) -> Result<String, String> {
 pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
     run_blocking(&app, "destroy_vault", move |state| {
         let mut guard = lock_vault(state)?;
-        let vault_path = guard.as_ref()
-            .and_then(|v| v.get_path().map(|p| p.to_path_buf()))
-            .ok_or("保险柜未打开或路径不可用")?;
-
-        // 2.5.1 修复（TOCTOU，关键）：旧实现是「symlink_metadata 检查 → 打开验证
-        // → 立刻 drop → 关闭会话 → 按路径重新打开擦除」，检查与擦除之间存在
-        // 竞态窗口：同用户目录写权限的攻击者可在窗口内把保险柜文件替换为指向
-        // 受害者文件的硬链接/符号链接，使 7-pass 覆写作用于受害者文件。
-        //
-        // 现在整个销毁流程锚定在**一次打开、全程持有**的句柄上：
-        // 1. 以 FILE_FLAG_OPEN_REPARSE_POINT / O_NOFOLLOW 打开（句柄必然指向
-        //    文件自身而非重解析目标）；
-        // 2. 通过**句柄**元数据原子性地确认非符号链接（不再依赖按路径的
-        //    symlink_metadata 检查）；
-        // 3. 关闭保险柜会话（drop Vault 自身持有的句柄）；
-        // 4. 擦除与删除全部经由该句柄（Windows 下 delete-on-close 不经路径）。
-        #[cfg(windows)]
-        let file = {
-            use std::os::windows::fs::OpenOptionsExt;
-            // 0x00200000 = FILE_FLAG_OPEN_REPARSE_POINT
-            std::fs::OpenOptions::new().write(true).read(true)
-                .custom_flags(0x00200000)
-                .open(&vault_path)
-                .map_err(|e| format!("无法打开保险柜文件: {}", e))?
-        };
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new().write(true).read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&vault_path)
-                .map_err(|e| format!("无法打开保险柜文件: {}", e))?
-        };
-        // 非 Windows / Unix 平台（未官方支持）退化为普通打开
-        #[cfg(not(any(windows, unix)))]
-        let file = std::fs::OpenOptions::new().write(true).read(true)
-            .open(&vault_path)
-            .map_err(|e| format!("无法打开保险柜文件: {}", e))?;
-        // 句柄级符号链接验证（Unix 上 O_NOFOLLOW 已在打开时拒绝，无需重复）
-        #[cfg(windows)]
-        {
-            let ftype = file.metadata()
-                .map_err(|e| format!("无法读取保险柜文件元数据: {}", e))?
-                .file_type();
-            if ftype.is_symlink() {
-                return Err("拒绝销毁符号链接".into());
-            }
-        }
-
-        // 关闭会话（drop Vault 内部持有的文件句柄，落盘审计）
-        if let Some(v) = guard.as_mut() {
-            v.close();
-        }
-        drop(guard);
-
-        // 基于已持有句柄完成 DoD 7-pass 擦除 + 删除（全程不按路径重开）
-        vault_core::wipe::dod_erase_handle(file, &vault_path).map_err(|e| e.to_string())
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        // 2.7.1 修复（关键回归）：销毁改为全程使用会话句柄（Vault::destroy），
+        // 不再按路径二次打开 —— 2.6.1 起会话句柄以 FILE_SHARE_READ 独占共享模式
+        // 打开，旧实现按「读+写」重新打开同一文件必然被系统拒绝
+        // （ERROR_SHARING_VIOLATION / os error 32），销毁在 Windows 上从未成功过。
+        // 符号链接 / 重解析点的拒绝已前移到会话打开阶段（vault-core open_vault_rw），
+        // 句柄锚定的 TOCTOU 防护不再削弱。
+        vault.destroy().map_err(|e| e.to_string())
     })
     .await
 }
@@ -727,9 +648,32 @@ pub async fn update_file_content(
 // ───────────────── 辅助函数 ─────────────────
 
 fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
+    const MAX_KEY_FILE_SIZE: u64 = 64 * 1024 * 1024;
     match path {
         Some(p) => {
-            let data = std::fs::read(p).map_err(|e| e.to_string())?;
+            // 2.7.1 修复：旧实现直接 std::fs::read，误选超大文件（或特殊设备路径）
+            // 会无界分配内存直至 OOM。现按元数据预检 + take 限制读取总量，
+            // 与导入路径的句柄化读取（2.7.0）同一策略。
+            use std::io::Read;
+            let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+            let meta = f.metadata().map_err(|e| e.to_string())?;
+            if !meta.is_file() {
+                return Err("密钥文件不可用（不是普通文件）".into());
+            }
+            if meta.len() > MAX_KEY_FILE_SIZE {
+                return Err(format!(
+                    "密钥文件过大（{} 字节），上限 64 MB",
+                    meta.len()
+                ));
+            }
+            let mut data = Vec::with_capacity(meta.len() as usize);
+            if let Err(e) = (&f).take(MAX_KEY_FILE_SIZE + 1).read_to_end(&mut data) {
+                return Err(e.to_string());
+            }
+            if data.len() as u64 > MAX_KEY_FILE_SIZE {
+                vault_core::wipe::secure_wipe_vec(data);
+                return Err("密钥文件过大（读取时超过 64 MB 上限）".into());
+            }
             Ok(Some(data))
         }
         None => Ok(None),

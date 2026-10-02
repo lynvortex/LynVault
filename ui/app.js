@@ -549,12 +549,32 @@ function selectAllItems() {
 }
 
 // ───────────────── 核心操作 ─────────────────
+
+// 2.7.1 修复：路径框输入先按与后端一致的规则归一化再进入列表，
+// state.currentFolder 存储的始终是实际显示的目录（后端 list_folder 已按
+// 归一化目录返回内容，旧实现存原始输入导致状态与显示不一致）
+function normalizeVPath(v) {
+    if (typeof v !== 'string' || v.includes('\\') || v.includes('\0')) return null;
+    const parts = [];
+    for (const seg of v.split('/')) {
+        if (!seg || seg === '.') continue;
+        if (seg === '..') { parts.pop(); continue; }
+        parts.push(seg);
+    }
+    return '/' + parts.join('/');
+}
+
 async function listFolder(folder) {
+    const norm = normalizeVPath(folder);
+    if (!norm) {
+        showError('无效的目录路径');
+        return;
+    }
     try {
-        const raw = await invoke('list_folder', { folder });
+        const raw = await invoke('list_folder', { folder: norm });
         const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        state.currentFolder = folder;
-        $('path-input').value = folder;
+        state.currentFolder = norm;
+        $('path-input').value = norm;
         renderList(data);
         setStatus(`共 ${data.length} 个项目`);
     } catch (e) {
@@ -573,7 +593,12 @@ async function createVault() {
     });
     if (!filePath) return;
     showInput('创建保险柜', '输入主密码：', '', async (pwd) => {
-        if (!pwd) return true;
+        if (!pwd) {
+            // 2.7.1 修复：空密码点确定不再静默关闭对话框 —— 内联提示并保留
+            // 输入框，与启动弹窗路径行为一致
+            showInlineInputError('密码不能为空');
+            return false;
+        }
         try {
             await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null });
             toggleUI(true);
@@ -594,7 +619,11 @@ async function openVault() {
     });
     if (!filePath) return;
     showInput('打开保险柜', '输入主密码：', '', async (pwd) => {
-        if (!pwd) return true;
+        if (!pwd) {
+            // 2.7.1：与创建路径一致，空密码内联提示并保留输入框
+            showInlineInputError('密码不能为空');
+            return false;
+        }
         try {
             await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
             toggleUI(true);
@@ -662,8 +691,12 @@ async function extractSelected() {
     setStatus('正在提取...');
     try {
         const vpaths = state.selectedItems.map(i => i.vpath);
-        await invoke('extract_files', { vpaths, destFolder: dest });
-        setStatus('提取完成: ' + dest);
+        // 2.7.1：后端返回 {ok, fail}，失败数不再被静默丢弃
+        const raw = await invoke('extract_files', { vpaths, destFolder: dest });
+        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        setStatus(res.fail > 0
+            ? `提取完成: 成功 ${res.ok} 个，失败 ${res.fail} 个 → ${dest}`
+            : `提取完成: ${res.ok} 个文件 → ${dest}`);
     } catch (e) {
         showError(String(e));
     }
@@ -1320,8 +1353,24 @@ function openVaultFromExternal(filePath) {
     }
     if (_startupProcessing) return; // 防重入
     _startupProcessing = true;
-    hideStartupModal();
-    openVaultFromStartup(filePath);
+    // 2.7.1 安全修复：先把完整目标路径显示给用户确认，拒绝即不采集口令 ——
+    // 单实例端口接受任意本地进程连接，路径由对端指定；不确认就让用户输入口令，
+    // 恶意进程可用候选口令预建 .lyt 来验证用户口令（口令验证预言机）。
+    tauriAsk(
+        `收到打开保险柜的请求：\n${filePath}\n\n是否打开该保险柜？\n若非您本人的操作，请选择「否」。`,
+        { title: '打开保险柜请求', type: 'warning' }
+    ).then(ok => {
+        if (!ok) {
+            _startupProcessing = false;
+            // 拒绝：回到启动检测弹窗（若此前已隐藏）
+            if ($('startup-dialog').classList.contains('hidden')) {
+                showStartupModal();
+            }
+            return;
+        }
+        hideStartupModal();
+        openVaultFromStartup(filePath);
+    });
 }
 
 // 2.4.1：silent 参数 —— 只填充列表不弹窗。用于「双击 .lyt 启动」场景的

@@ -204,8 +204,37 @@ fn handle_connection(handle: &AppHandle, stream: TcpStream) {
 
     // 3. 校验并处理
     let path = path_line.trim().to_string();
-    if !path.is_empty() && looks_like_vault(&path) {
+    if path.is_empty() {
+        // 2.7.1 修复：双击 exe（不带 .lyt 路径）的转发请求同样把已运行实例
+        // 带到前台 —— 旧实现静默忽略，用户看到「双击后什么都没发生」
+        focus_existing_window(handle);
+        return;
+    }
+    if looks_like_vault(&path) {
         handle_vault_request(handle, path);
+    }
+}
+
+/// 把已运行实例的主窗口带到前台（可能被最小化）。
+/// 2.7.1 新增：单实例转发不再只处理「带 .lyt 路径」的请求 —— 用户直接再次双击
+/// exe（空参数）时同样聚焦已运行实例，旧实现转发完即静默退出，而旧窗口可能
+/// 并不在前台，看上去就是「双击后什么都没发生」。
+/// Windows 下 `SetForegroundWindow` 对非前台进程有限制：先短暂置顶再聚焦后
+/// 取消，避免只闪任务栏图标。
+pub fn focus_existing_window(handle: &AppHandle) {
+    if let Some(win) = handle.get_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        #[cfg(windows)]
+        {
+            let _ = win.set_always_on_top(true);
+            let _ = win.set_focus();
+            let _ = win.set_always_on_top(false);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = win.set_focus();
+        }
     }
 }
 
@@ -220,12 +249,7 @@ fn handle_vault_request(handle: &AppHandle, path: String) {
         eprintln!("[LynVault] 前端 60 秒内未就绪，丢弃打开请求: {}", path);
         return;
     }
-    // 聚焦已运行实例的窗口（可能被最小化）
-    if let Some(win) = handle.get_window("main") {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-    }
+    focus_existing_window(handle);
     if let Err(e) = handle.emit_all("vault-file-requested", path) {
         eprintln!("[LynVault] 发送 vault-file-requested 失败: {}", e);
     }
