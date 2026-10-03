@@ -1028,3 +1028,63 @@ fn move_items_batch_single_pass() {
     assert_eq!(ok2, 0);
     assert_eq!(fail2, 2);
 }
+
+// 2.8.2.1（兼容性回归）：头部签名与当前分区密钥不一致时**不再硬拒** ——
+// 多分区跨签名 / 历史版本遗留 / 部分写入中断都是良性场景，2.8.2 首版的
+// 强制验签硬拒把合法存量柜挡在门外（发布当日实测回归）。现约定：
+// 打开成功 + 审计留痕 + 按当前分区密钥重签迁移。
+#[test]
+fn legacy_signature_mismatch_still_opens_and_resigns() {
+    let dir = tempdir("sig-mismatch");
+    let path = dir.join("sig.lyt");
+    const SIG_PWD: &str = "signature mismatch test";
+
+    // 创建（2.8.2 写入规范形签名）后正常关闭
+    let mut v = Vault::default();
+    v.create(&path, SIG_PWD, None).expect("创建失败");
+    v.close();
+
+    // 模拟历史遗留：签名区（1984..2048）整体覆写为 0xFF
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("打开头部失败");
+        f.seek(SeekFrom::Start(1984)).unwrap();
+        f.write_all(&[0xFFu8; 64]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // 打开：必须成功（不再报「头部签名校验失败」）
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, SIG_PWD, None)
+        .expect("签名不一致的存量柜必须能够打开（验签 + 重签迁移）");
+    let entries = v2.get_audit_entries();
+    assert!(
+        entries.iter().any(|e| e.event.contains("头部签名与当前分区密钥不一致")),
+        "签名不一致必须写入审计留痕"
+    );
+    // 数据可用性：导入新文件并重开校验
+    let src = write_src(&dir, "after.txt", b"after heal");
+    v2.import_file(&src, "/after.txt").expect("迁移后写入失败");
+    v2.close();
+
+    // 重开：头部已按当前分区密钥重签，审计不再出现新的签名提示
+    let mut v3 = Vault::default();
+    v3.open_and_authenticate(&path, SIG_PWD, None)
+        .expect("重签后的保险柜再次打开失败");
+    let idx = v3.load_index().unwrap();
+    assert!(idx.files.contains_key("/after.txt"), "迁移后写入的数据必须可读");
+    let entries3 = v3.get_audit_entries();
+    // 审计为追加式历史：首次打开的那条提示仍在，但重签后再次打开**不得新增**
+    let legacy_notes = |entries: &[vault_core::audit::AuditEntry]| {
+        entries.iter().filter(|e| e.event.contains("头部签名与当前分区密钥不一致")).count()
+    };
+    assert_eq!(
+        legacy_notes(&entries3),
+        legacy_notes(&entries) + 0,
+        "重签后的再次打开不得再新增签名提示"
+    );
+    v3.close();
+}

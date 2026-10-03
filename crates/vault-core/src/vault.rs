@@ -161,22 +161,19 @@ fn open_vault_rw(path: &Path, create: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-/// 2.8.2：句柄级确认「不是任何重解析点」。
+/// 2.8.2.1：句柄级确认「不是符号链接」。
 ///
-/// 旧实现只查 `file_type().is_symlink()`，仅覆盖 IO_REPARSE_TAG_SYMLINK ——
-/// 挂载点、OneDrive 按需占位文件（cloud tag）等其他 reparse tag 全部放行，
-/// 与「重解析点一律拒绝」的文档承诺不符；且以 FILE_FLAG_OPEN_REPARSE_POINT
-/// 打开云占位保险柜可能读到占位元数据而非水合后的数据。现改为直接检查
-/// FILE_ATTRIBUTE_REPARSE_POINT 位，覆盖一切 tag。
+/// 2.8.2 首版曾扩大为「拒绝一切重解析点」（检查 FILE_ATTRIBUTE_REPARSE_POINT
+/// 位），但 OneDrive / 云同步的按需占位文件（IO_REPARSE_TAG_CLOUD 系列）即使
+/// 已水合也保留 reparse 属性 —— 同步目录中的合法保险柜被全部误伤（发布当日
+/// 兼容性回归）。现恢复 2.8.1 行为：仅拒绝符号链接；打开标志
+/// FILE_FLAG_OPEN_REPARSE_POINT 保留（锚定文件本体）。
 #[cfg(windows)]
 fn verify_no_reparse(file: &File) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let md = file.metadata()?;
-    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || md.file_type().is_symlink() {
+    if file.metadata()?.file_type().is_symlink() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "拒绝通过符号链接 / 重解析点打开保险柜文件",
+            "拒绝通过符号链接打开保险柜文件",
         ));
     }
     Ok(())
@@ -1664,17 +1661,15 @@ impl Vault {
         for k in kek_list.iter_mut() { k.zeroize(); }
 
         if let Some((idx, index, keys, data_key)) = matched {
-            // 2.8.2（M1）：认证成功后、使用索引前**强制校验头部签名**（规范形）。
-            // index_offset / index_length 不在 auth_tag AAD、key_wrap AAD、锁区
-            // HMAC 的任何覆盖范围内 —— 此前成功开柜从不验签，文件写攻击者
-            // （云同步版本回滚 / 备份恢复）可以替换这两个字段让受害者用正确
-            // 口令静默加载旧索引（已删除条目复活、审计链回滚）。签名覆盖全部
-            // 头部字段，任何篡改/回滚在这里被拒绝。密钥均为 ZeroizeOnDrop，早退安全。
-            if !verify_header_signature_v5(&header, &keys.sign_key) {
-                return Err(VaultError::Other(
-                    "头部签名校验失败 —— 头部可能被篡改或回滚（文件可能被替换为更早版本的副本）。为避免进一步损坏，请勿向此保险柜写入任何数据".into(),
-                ));
-            }
+            // 2.8.2（M1）→ 2.8.2.1（兼容性修正）：头部签名**校验但不再硬拒**。
+            // index_offset/index_length 不在 auth_tag AAD、key_wrap AAD、锁区
+            // HMAC 的任何覆盖范围内 —— 验签仍执行，但签名不一致时不再拒绝打开：
+            // 多分区保险柜的头部由「最后打开的分区」签名（跨分区打开必然
+            // 不一致）、云同步回写/写入中断/历史版本签名形态差异也会造成
+            // 良性不一致 —— 硬拒把合法存量柜全部挡在门外（发布当日即回归）。
+            // 现改为：写入审计告警 + 下方 update_header 按当前分区密钥重签
+            // （迁移到规范形）。全文件级回滚防护的根治仍需 v6 generation 计数器。
+            let legacy_signature = !verify_header_signature_v5(&header, &keys.sign_key);
             // 过滤出真实分区（伪条目随机数据几乎不可能通过认证）
             let real_partitions: Vec<PartitionInfo> = parsed.iter()
                 .filter(|p| is_plausible_alias(&p.alias))
@@ -1708,6 +1703,11 @@ impl Vault {
             // 2.8.2：恢复时丢弃过尾部条目 → 显式写入告警（不再静默截断）
             if audit.is_truncated() {
                 audit.add("警告：审计链存在无法校验的条目，部分历史记录可能被篡改或损坏");
+            }
+            // 2.8.2.1：签名与当前分区密钥不一致（多分区跨签名/历史遗留/头部曾被改动）
+            // → 审计留痕，随后 update_header 按当前分区密钥重签迁移
+            if legacy_signature {
+                audit.add("提示：头部签名与当前分区密钥不一致（多分区跨签名或历史版本遗留），已重新签名迁移");
             }
             audit.add("保险柜已解锁");
             self.audit = Some(audit);
