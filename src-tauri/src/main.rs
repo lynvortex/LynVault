@@ -15,8 +15,8 @@ mod system_events;
 
 use std::fs::OpenOptions;
 
-/// 2.8.0：窗口标题版本号单一来源
-const APP_VERSION: &str = "2.8.1";
+/// 2.8.0：窗口标题版本号单一来源（2.8.2/I3：与其他三处版本号统一）
+const APP_VERSION: &str = "2.8.2";
 
 /// 2.8.0：防截屏开关（对主窗口应用 SetWindowDisplayAffinity）。
 /// - 开启：WDA_EXCLUDEFROMCAPTURE（Win10 2004+，截屏/录屏/远程共享中窗口直接消失）；
@@ -82,12 +82,18 @@ pub fn apply_anti_screenshot(app: &tauri::AppHandle, enable: bool) -> bool {
 // - 仅记录 Warn 及以上 —— info/debug 不落盘；
 // - **日志内容不得包含用户路径、文件名或虚拟路径**（2.6.1 修复）：
 //   旧实现的告警会写入导入失败的真实路径、批量提取失败的 vpath，而
-//   %TEMP%\LynVault.log 是不加密、跨重启残留、且落在取证工具常规扫描位置上的
+//   日志文件是不加密、跨重启残留、且落在取证工具常规扫描位置上的
 //   文件 —— 对本产品而言「用户拿哪些文件来加密」本身就是最敏感的信息，
 //   这与抗取证承诺直接矛盾。vault-core 内所有 warn/error 现已只记错误本身；
 //   需要逐条追溯的场景请用保险柜内的加密审计日志（AuditLog）；
-// - 写入 %TEMP%\LynVault.log，超过 1 MB 时**先覆写旧内容再截断**，
-//   不再用 set_len(0)（那会在磁盘上留下可恢复的旧日志残留）；
+// - 2.8.2（M5）：日志迁出公开可预测的 `%TEMP%\LynVault.log` —— 该路径可被
+//   预建为指向受害者文件的 NTFS 硬链接（日志内容注入目标文件；1MB 轮转的
+//   清零覆写会直接毁掉目标文件）。现写入 `%LOCALAPPDATA%\LynVault\logs\`
+//   （不可用回退 `%TEMP%\LynVault\logs\`），且每次写入以
+//   `FILE_FLAG_OPEN_REPARSE_POINT` 打开（符号链接不跟随）并经句柄元数据
+//   校验「非重解析点 + 硬链接数为 1」，校验失败放弃本次写入；
+// - 超过 1 MB 时**先覆写旧内容再截断**，不再用 set_len(0)（那会在磁盘上
+//   留下可恢复的旧日志残留）；
 // - 发布版（windows_subsystem="windows"）没有控制台，文件是唯一出口；
 //   debug 构建同时输出到 stderr 便于开发调试。
 
@@ -118,30 +124,53 @@ impl log::Log for FileLogger {
         );
         #[cfg(debug_assertions)]
         eprint!("[LynVault] {}", line);
-        use std::io::{Seek, SeekFrom, Write};
         let _guard = self.lock.lock();
-        if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(false).open(&self.path) {
-            // 2.6.1 安全轮转：先整体覆写再截断。
-            // 旧实现直接 set_len(0)，只是把旧内容标记为可复用，磁盘上仍可恢复 ——
-            // 对一个把「擦除」当卖点的产品，这种残留不能留。
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len > LOG_FILE_MAX {
-                let zeros = [0u8; 8192];
-                if f.seek(SeekFrom::Start(0)).is_ok() {
-                    let mut left = len;
-                    while left > 0 {
-                        let n = std::cmp::min(left, zeros.len() as u64) as usize;
-                        if f.write_all(&zeros[..n]).is_err() {
-                            break;
-                        }
-                        left -= n as u64;
-                    }
-                    let _ = f.sync_all();
+
+        // 2.8.2（M5）：每次写入都以 FILE_FLAG_OPEN_REPARSE_POINT 打开
+        //（符号链接不跟随），并用句柄元数据校验「非重解析点 + 硬链接数 1」
+        // —— 校验失败放弃本次写入（防硬链接注入 / 轮转覆写用户文件）。
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if let Ok(mut f) = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)
+            {
+            // 硬链接数须为 1（std 的 number_of_links 在 stable 不可用，
+            // 走 GetFileInformationByHandle）；重解析点拒绝
+            use std::os::windows::fs::MetadataExt;
+            use std::os::windows::io::AsRawHandle;
+                use windows::Win32::Foundation::HANDLE;
+                use windows::Win32::Storage::FileSystem::{
+                    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                };
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                let links_ok = unsafe {
+                    GetFileInformationByHandle(HANDLE(f.as_raw_handle() as isize), &mut info)
                 }
-                let _ = f.set_len(0);
+                .map(|_| info.nNumberOfLinks == 1)
+                .unwrap_or(false);
+                let attrs = f.metadata().map(|m| m.file_attributes()).unwrap_or(0xFFFF);
+                if !links_ok || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return; // 目标被做了手脚：宁可不写日志也不注入/覆写他人文件
+                }
+                rotate_and_write(&mut f, &line);
             }
-            if f.seek(SeekFrom::End(0)).is_ok() {
-                let _ = f.write_all(line.as_bytes());
+        }
+        #[cfg(not(windows))]
+        {
+            if let Ok(mut f) = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&self.path)
+            {
+                rotate_and_write(&mut f, &line);
             }
         }
     }
@@ -149,8 +178,69 @@ impl log::Log for FileLogger {
     fn flush(&self) {}
 }
 
+/// 2.6.1 安全轮转：先整体覆写再截断（从 FileLogger::log 抽出）。
+#[cfg(windows)]
+fn rotate_and_write(f: &mut std::fs::File, line: &str) {
+    rotate_and_write_inner(f, line)
+}
+
+#[cfg(not(windows))]
+fn rotate_and_write(f: &mut std::fs::File, line: &str) {
+    rotate_and_write_inner(f, line)
+}
+
+fn rotate_and_write_inner(f: &mut std::fs::File, line: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    // 2.6.1 安全轮转：先整体覆写再截断。
+    // 旧实现直接 set_len(0)，只是把旧内容标记为可复用，磁盘上仍可恢复 ——
+    // 对一个把「擦除」当卖点的产品，这种残留不能留。
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > LOG_FILE_MAX {
+        let zeros = [0u8; 8192];
+        if f.seek(SeekFrom::Start(0)).is_ok() {
+            let mut left = len;
+            while left > 0 {
+                let n = std::cmp::min(left, zeros.len() as u64) as usize;
+                if f.write_all(&zeros[..n]).is_err() {
+                    break;
+                }
+                left -= n as u64;
+            }
+            let _ = f.sync_all();
+        }
+        let _ = f.set_len(0);
+    }
+    if f.seek(SeekFrom::End(0)).is_ok() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 2.8.2（M5）：日志目录候选 —— 优先 `%LOCALAPPDATA%\LynVault\logs`，
+/// 不可用回退 `%TEMP%\LynVault\logs`（不再直接落在公开可预测的
+/// `%TEMP%\LynVault.log`）。
+fn log_file_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        let dir = std::path::PathBuf::from(base).join("LynVault").join("logs");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            paths.push(dir.join("LynVault.log"));
+        }
+    }
+    let fallback = std::env::temp_dir().join("LynVault").join("logs");
+    if std::fs::create_dir_all(&fallback).is_ok() {
+        let p = fallback.join("LynVault.log");
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
 fn init_logging() {
-    let path = std::env::temp_dir().join("LynVault.log");
+    let path = log_file_candidates()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::env::temp_dir().join("LynVault.log"));
     let _ = log::set_boxed_logger(Box::new(FileLogger {
         path,
         lock: std::sync::Mutex::new(()),
@@ -247,6 +337,60 @@ fn create_main_window(app: &tauri::App, transparent: bool, width: f64, height: f
         .map_err(|e| e.to_string())
 }
 
+/// 2.8.2：空闲自动锁定的后端兜底（仅 Windows）。
+///
+/// 前端的空闲锁定依赖 JS setTimeout —— WebView2 后台计时器节流（最小化窗口
+/// 的 intensive throttling 下定时器可被拖延数分钟）或渲染进程挂起/崩溃期间，
+/// 保险柜保持解锁。本线程每 5 秒检查一次**系统级**空闲时间
+///（GetLastInputInfo：任何键鼠输入都会重置），超过设置的 autolock_minutes 且
+/// 保险柜处于打开状态时，执行与锁屏相同的关闭流程（system_lock_vault）。
+///
+/// 取值来源：settings::load_active()（未启用持久化时为默认 2 分钟，与前端
+/// 默认一致；用户改了时长但未启用持久化时，前端放宽、后端仍按默认收紧 ——
+/// 偏保守方向，可接受）。
+#[cfg(windows)]
+fn idle_lock_watchdog(app: tauri::AppHandle) {
+    use tauri::Manager;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        {
+            let state = app.state::<commands::AppState>();
+            if !state.vault_open() {
+                continue;
+            }
+        }
+        let minutes = settings::load_active()
+            .map(|(_, s)| s.autolock_minutes)
+            .unwrap_or(2);
+        if minutes == 0 {
+            continue; // 用户显式禁用自动锁定
+        }
+        let idle_ms = last_input_idle_ms();
+        if idle_ms >= minutes as u64 * 60 * 1000 {
+            // 与锁屏同一关闭流程：关柜 + 停剪贴板保护 + 通知前端回启动弹窗
+            let _ = commands::system_lock_vault(&app);
+        }
+    }
+}
+
+/// 系统级空闲毫秒数（距最后一次键鼠输入）
+#[cfg(windows)]
+fn last_input_idle_ms() -> u64 {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    unsafe {
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if GetLastInputInfo(&mut info).as_bool() {
+            GetTickCount().saturating_sub(info.dwTime) as u64
+        } else {
+            0 // 查询失败不触发锁定（前端定时器仍在）
+        }
+    }
+}
+
 fn main() {
     // 2.5.1 修复：必须在一切可能产生告警的逻辑（单实例、命令线程）之前初始化
     init_logging();
@@ -259,7 +403,13 @@ fn main() {
     //        转发给已运行实例后本进程立即退出；已运行实例聚焦窗口并
     //        向前端发 vault-file-requested 事件。
     // 场景 3：把 .lyt 拖到窗口（拖放识别在前端 check_vault_file 完成）。
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // 2.8.2（M6）：改用 args_os —— 旧实现 std::env::args() 遇到无法转 UTF-8
+    // 的参数（如带未配对代理项的 .lyt 文件名）直接 panic，GUI 子系统无控制台，
+    // 表现为「双击后什么都没发生」。
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     commands::set_launch_vault_arg(single_instance::extract_vault_arg(argv.iter().cloned()));
 
     // 单实例竞争：非首实例在此转发参数并退出（不创建窗口，无闪烁）
@@ -284,11 +434,34 @@ fn main() {
             // 2.8.0：启动系统事件监听（锁屏 / 睡眠 / 注销 → 自动关闭保险柜）
             #[cfg(windows)]
             system_events::spawn(app.handle().clone());
+            // 2.8.2：空闲自动锁定的后端兜底（前端 JS 定时器可被 WebView 后台
+            // 节流 / 渲染进程挂起拖住，主防线不能只放在 JS 上）
+            #[cfg(windows)]
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || idle_lock_watchdog(handle));
+            }
             // 2.4.1：后台注册 .lyt 用户级文件关联（best-effort，不阻塞启动；
             // 用户已关联到其他程序时不覆盖）—— 仅 Windows
             #[cfg(windows)]
             std::thread::spawn(file_assoc::register_if_absent);
             Ok(())
+        })
+        // 2.8.2（H2）：记录主进程侧真实拖放载荷 —— 导入命令要求传入路径
+        // 与该载荷完全一致，WebView 伪造的字符串不再被信任。
+        // 全局窗口事件处理器挂在 Builder 上（App/Window 级 API 在 Tauri 1.x
+        // 的形态不同，全局处理器覆盖全部窗口且在窗口创建前生效）。
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::FileDrop(drop_event) = event.event() {
+                // tauri 1.x：tauri::FileDropEvent::Dropped(Vec<PathBuf>)
+                if let tauri::FileDropEvent::Dropped(paths) = drop_event {
+                    let strs: Vec<String> = paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    commands::record_dropped_paths(strs);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::create_vault,
@@ -336,6 +509,11 @@ fn main() {
             commands::enable_persistence,
             commands::disable_persistence,
             commands::save_settings,
+
+            // 2.8.2（H2）新增：对话框令牌化 —— 文件/目录选择改由后端弹出，
+            // 所选路径登记进一次性令牌表，导入/提取命令凭令牌取路径
+            commands::dialog_pick_files,
+            commands::dialog_pick_folder,
         ])
         .build(tauri::generate_context!())
     {

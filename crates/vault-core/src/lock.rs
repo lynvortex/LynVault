@@ -58,8 +58,16 @@ impl LockState {
         now < self.lock_until
     }
 
-    /// 记录一次失败，可能触发锁定
+    /// 记录一次失败，可能触发锁定。
+    ///
+    /// 2.8.2：锁定**到期后**计数归零再累计 —— 旧实现的 lock_count 在锁定到期后
+    /// 不清零（仅认证成功时复位），到期后输错 1 次立即再锁 30 分钟，正常用户
+    /// 等于只有一次试错机会。现在到期后拥有新一轮完整尝试额度（MAX_ERRORS 次）。
     pub fn record_failure(&mut self) {
+        if self.lock_count >= MAX_ERRORS && !self.is_locked() {
+            // 已经历一轮锁定且到期：归零重新累计
+            self.lock_count = 0;
+        }
         self.lock_count = self.lock_count.saturating_add(1);
         if self.lock_count >= MAX_ERRORS {
             self.lock_until = SystemTime::now()

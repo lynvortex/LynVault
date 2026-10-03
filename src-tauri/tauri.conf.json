@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "LynVault",
-    "version": "2.8.1"
+    "version": "2.8.2"
   },
   "tauri": {
     "allowlist": {
@@ -26,7 +26,7 @@
       },
       "shell": {
         "all": false,
-        "open": "https://github.com/lynvortex/LynVault"
+        "open": "^https://github\\.com/lynvortex/LynVault/?$"
       },
       "window": {
         "all": false,
@@ -63,7 +63,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'"
     },
     "windows": []
   }

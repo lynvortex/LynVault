@@ -39,6 +39,12 @@ pub fn register_if_absent() {
         Some(s) => s.to_string(),
         None => return, // 非 UTF-8 路径，极罕见，放弃
     };
+    // 2.8.2（L5）：exe 路径含双引号时拒绝注册 —— 路径会被拼进注册表命令
+    // `"<exe>" "%1"`，未转义的引号可使命令结构被操纵
+    if exe_str.contains('"') {
+        log::warn!("[LynVault] exe 路径包含双引号，拒绝注册 .lyt 文件关联（防命令结构被操纵）");
+        return;
+    }
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let classes = match hkcu.open_subkey_with_flags("Software\\Classes", KEY_READ | KEY_WRITE) {

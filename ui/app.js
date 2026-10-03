@@ -1,4 +1,4 @@
-// LynVault 2.0 - Tauri Frontend
+// LynVault 2.8.2 - Tauri Frontend
 // 等 Tauri 注入完毕再执行
 let invoke, tauriOpen, tauriSave, tauriMessage, tauriAsk;
 
@@ -36,10 +36,11 @@ function initTauri() {
     } catch (e) { console.warn('__TAURI_INTERNALS__ failed:', e); }
 
     // 显示诊断信息在页面上
+    const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
     document.body.innerHTML = '<div style="padding:40px;font-family:monospace">' +
         '<h3>Tauri API 诊断</h3>' +
-        '<p>__TAURI__: ' + hasTauri + ' → [' + tauriKeys + ']</p>' +
-        '<p>__TAURI_INTERNALS__: ' + hasInternals + ' → [' + internalsKeys + ']</p>' +
+        '<p>__TAURI__: ' + hasTauri + ' → [' + esc(tauriKeys) + ']</p>' +
+        '<p>__TAURI_INTERNALS__: ' + hasInternals + ' → [' + esc(internalsKeys) + ']</p>' +
         '<p>请打开 F12 控制台查看详细日志，截图反馈给开发者。</p>' +
         '</div>';
     return false;
@@ -237,18 +238,37 @@ async function getSysIconDataUrl(name) {
 }
 
 // 给文件项图标元素异步替换为系统图标
+// 2.8.2（性能）：缓存命中时同步设置（旧实现即便命中也要 await 微任务后再替换，
+// 2000 行列表一次渲染附带约 2000 次跨微任务 DOM 变更）
+function setSysIcon(spanEl, url, fallbackEmoji) {
+    if (url) {
+        spanEl.innerHTML = '';
+        const img = document.createElement('img');
+        img.src = url;
+        img.className = 'fi-sysicon';
+        img.alt = '';
+        spanEl.appendChild(img);
+    } else {
+        spanEl.textContent = fallbackEmoji;
+    }
+}
+
+function sysIconExtOf(name) {
+    const dot = name.lastIndexOf('.');
+    return dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+}
+
 async function applySysIcon(spanEl, name, fallbackEmoji) {
+    const ext = sysIconExtOf(name);
+    const cached = ext ? _sysIconCache.get(ext) : undefined;
+    if (cached !== undefined) {
+        setSysIcon(spanEl, cached, fallbackEmoji);
+        return;
+    }
     spanEl.textContent = fallbackEmoji;
     try {
         const url = await getSysIconDataUrl(name);
-        if (url) {
-            spanEl.innerHTML = '';
-            const img = document.createElement('img');
-            img.src = url;
-            img.className = 'fi-sysicon';
-            img.alt = '';
-            spanEl.appendChild(img);
-        }
+        setSysIcon(spanEl, url, fallbackEmoji);
     } catch (e) { /* keep emoji */ }
 }
 
@@ -258,8 +278,6 @@ async function applySysIcon(spanEl, name, fallbackEmoji) {
 // Q6 修复：异步 action 执行期间禁用所有按钮，防止重复点击触发多次 invoke
 function showDialog(title, bodyHtml, buttons, wide) {
     const dlg = $('dialog');
-    // M10 修复：打开新对话框前清理上一个对话框的 blob URL，防止内存泄漏
-    cleanupDialogBlobs();
     dlg.style.width = wide ? '80vw' : '';
     dlg.style.maxWidth = wide ? '900px' : '';
     $('dialog-title').textContent = title;
@@ -313,15 +331,6 @@ function showDialog(title, bodyHtml, buttons, wide) {
     $('dialog').classList.remove('hidden');
 }
 
-// M10 修复：追踪并释放 blob URL，避免图片预览内存泄漏
-let _activeBlobUrls = [];
-function cleanupDialogBlobs() {
-    for (const url of _activeBlobUrls) {
-        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
-    }
-    _activeBlobUrls = [];
-}
-
 function hideDialog() {
     const dlg = $('dialog');
     // 2.8.1：清空对话框内容 —— 密码输入框等明文不允许残留在 DOM 中
@@ -347,8 +356,6 @@ function hideDialog() {
         $('overlay').classList.add('hidden');
     }
     dlg.classList.add('hidden');
-    // M10 修复：关闭对话框时释放 blob URL
-    cleanupDialogBlobs();
 }
 
 // ── 四向拖拽调整大小 ──
@@ -409,11 +416,10 @@ function escapeHtml(s) {
     });
 }
 
-// 构造属性值（用双引号包裹，转义 & < > "）
+// 构造属性值（用双引号包裹，转义 & < > " ' —— 2.8.2：补上单引号转义，
+// 消除「差一个单引号属性模板就 XSS」的埋雷；映射与 escapeHtml 完全一致）
 function escapeAttr(s) {
-    return String(s).replace(/[&<>"]/g, function(c) {
-        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] || c;
-    });
+    return escapeHtml(s);
 }
 
 // 2.8.1：当前对话框的取消回调（showInput 注册）。遮罩点击触发的 hideDialog
@@ -432,8 +438,9 @@ function showInput(title, label, defaultValue, callback, isPassword, onCancel) {
     const type = isPassword ? 'password' : 'text';
     // M4 修复：转义 label 和 defaultValue，防止 XSS
     // N3 修复：callback 返回 false 时不关闭对话框（密码错误可重试）
+    const ac = isPassword ? 'new-password' : 'off';
     showDialog(title,
-        `<label>${escapeHtml(label)}</label><input type="${type}" id="dlg-input" value="${escapeAttr(defaultValue || '')}"><div id="dlg-input-error" style="color:#ff6666;font-size:12px;margin-top:4px;min-height:14px;"></div>` +
+        `<label>${escapeHtml(label)}</label><input type="${type}" id="dlg-input" autocomplete="${ac}" value="${escapeAttr(defaultValue || '')}"><div id="dlg-input-error" style="color:#ff6666;font-size:12px;margin-top:4px;min-height:14px;"></div>` +
         // 2.8.0：开锁前提示位（get_lock_info 异步填充失败尝试次数）
         `<div id="dlg-lock-hint" style="color:#8a6d1a;font-size:12px;margin-top:2px;min-height:0;"></div>`,
         [
@@ -449,8 +456,13 @@ function showInput(title, label, defaultValue, callback, isPassword, onCancel) {
 
 // 2.8.0：异步查询保险柜头部锁定区的失败尝试计数，填充到密码框提示位。
 // 让用户在开锁前看到「这个文件已被试错 N 次」—— 察觉有人动过自己的保险柜。
+let _lockHintSeq = 0;
 function fetchLockHint(filePath) {
+    // 2.8.2：对话框代次守卫 —— 用户取消 A 密码框、快速打开 B 后，迟到的
+    // A 结果不再写进 B 的提示位
+    const seq = ++_lockHintSeq;
     invoke('get_lock_info', { path: filePath }).then(info => {
+        if (seq !== _lockHintSeq) return;
         const el = $('dlg-lock-hint');
         if (!el || !info) return;
         if (info.locked) {
@@ -486,6 +498,38 @@ function showError(msg) {
     pre.textContent = msg;
     showDialog('错误', pre.outerHTML, [{ text: '确定', cls: 'btn-ok' }]);
 }
+
+// 2.8.2（P2-20）：密码框回车确认 —— 此前密码框未包 <form> 也未绑 Enter，
+// 必须手点「确定」。在 #dialog 上做统一 Enter 委托：
+// - 单行输入框 Enter 触发主按钮（最后一个 btn-ok）；
+// - 多字段对话框（修改密码/设置）按 DOM 顺序依次跳字段，最后字段提交；
+// - TEXTAREA / 组合键 / 按钮焦点不拦截（textarea 的 Enter 是换行）；
+// - 异步执行期间按钮已禁用，自然防重。
+(function initDialogEnterKey() {
+    document.addEventListener('DOMContentLoaded', () => {
+        const dlg = $('dialog');
+        if (!dlg) return;
+        dlg.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+            const t = e.target;
+            if (!t || t.tagName !== 'INPUT' || t.type === 'textarea') return;
+            const inputs = Array.from(dlg.querySelectorAll('#dialog-body input'));
+            const idx = inputs.indexOf(t);
+            if (idx >= 0 && idx < inputs.length - 1) {
+                // 多字段：跳到下一个输入框
+                e.preventDefault();
+                inputs[idx + 1].focus();
+                return;
+            }
+            // 单字段 / 最后字段：触发第一个未禁用的 btn-ok
+            const okBtn = dlg.querySelector('#dialog-buttons button.btn-ok:not(:disabled)');
+            if (okBtn) {
+                e.preventDefault();
+                okBtn.click();
+            }
+        });
+    });
+})();
 
 // ───────────────── 右键菜单（2.3.0 起动态构建）─────────────────
 // 文件/文件夹右键：打开/查看、提取（支持多选）、重命名、安全删除（支持多选）
@@ -657,6 +701,30 @@ function selectAllItems() {
 
 // ───────────────── 核心操作 ─────────────────
 
+// 2.8.2：工具栏批量操作防重入 —— Q6 修复只覆盖了对话框按钮，
+// 导入/提取/删除/整理的 await 期间按钮不禁用，双击/并发操作会同时打进后端
+let _busyCount = 0;
+function setBusy(on) {
+    _busyCount += on ? 1 : -1;
+    if (_busyCount < 0) _busyCount = 0;
+    const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
+        'btn-import-folder', 'btn-newfolder', 'btn-extract-all', 'btn-defrag', 'btn-destroy'];
+    ids.forEach(id => { const el = $(id); if (el) el.disabled = on || !state.vaultOpen; });
+}
+
+// 非破坏性错误显示：在当前对话框内追加/更新错误条，不整体替换 #dialog-body
+//（saveEdit 等场景下旧 showError 会连用户未保存的编辑一起销毁）
+function showDialogError(msg) {
+    let el = $('dlg-inline-error');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'dlg-inline-error';
+        el.style.cssText = 'color:#ff6666;font-size:12px;margin-top:6px;white-space:pre-wrap;';
+        $('dialog-body').appendChild(el);
+    }
+    el.textContent = String(msg);
+}
+
 // 2.7.1 修复：路径框输入先按与后端一致的规则归一化再进入列表，
 // state.currentFolder 存储的始终是实际显示的目录（后端 list_folder 已按
 // 归一化目录返回内容，旧实现存原始输入导致状态与显示不一致）
@@ -665,32 +733,46 @@ function normalizeVPath(v) {
     const parts = [];
     for (const seg of v.split('/')) {
         if (!seg || seg === '.') continue;
-        if (seg === '..') { parts.pop(); continue; }
+        if (seg === '..') {
+            // 2.8.2：越过根的 '..' 拒绝（与后端 normalize_vpath 收紧一致）
+            if (!parts.pop()) return null;
+            continue;
+        }
         parts.push(seg);
     }
     return '/' + parts.join('/');
 }
 
+let _folderSeq = 0; // 2.8.2：目录请求序号守卫 —— 慢响应晚到不得覆盖新状态
 async function listFolder(folder) {
     const norm = normalizeVPath(folder);
     if (!norm) {
         showError('无效的目录路径');
         return;
     }
-    // 2.8.0：目录导航会覆盖搜索视图
-    state.searchMode = false;
-    const si = $('search-input');
-    if (si && si.value) si.value = '';
+    const seq = ++_folderSeq;
     try {
         const raw = await invoke('list_folder', { folder: norm });
-        const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (seq !== _folderSeq) return; // 已有更新的目录请求，丢弃过期结果
+        // 2.8.0：目录导航会覆盖搜索视图（仅在响应确实被应用时清理，
+        // 陈旧的目录响应不再顶掉用户刚发起的搜索）
+        state.searchMode = false;
+        const si = $('search-input');
+        if (si && si.value) si.value = '';
         state.currentFolder = norm;
         $('path-input').value = norm;
+        const data = data_of(raw);
         renderList(data);
         setStatus(`共 ${data.length} 个项目`);
     } catch (e) {
-        showError(String(e));
+        if (seq === _folderSeq) showError(String(e));
     }
+}
+
+// 2.8.2：统一解包 invoke 返回（typeof raw === 'string' ? JSON.parse(raw) : raw
+// 在全文件重复 11 次且散落各处，收敛为单一入口）
+function data_of(raw) {
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
 }
 
 async function navigateTo(vpath) {
@@ -761,72 +843,104 @@ async function closeVault() {
 }
 
 async function importFiles() {
-    const files = await tauriOpen({ title: '选择要导入的文件', multiple: true });
-    if (!files || files.length === 0) return;
-    const fileList = Array.isArray(files) ? files : [files];
-    setStatus(`正在导入 ${fileList.length} 个文件...`);
+    // 2.8.2（H2）：文件选择改由后端对话框完成，凭一次性令牌调用导入命令
+    const pick = await invoke('dialog_pick_files').catch(e => { showError(String(e)); return null; });
+    if (!pick || !pick.token || !pick.paths.length) return;
+    setBusy(true);
+    setStatus(`正在导入 ${pick.paths.length} 个文件...`);
     try {
-        // 2.4.1：改为后端批量导入（单次索引加密落盘），
-        // 旧版前端循环 import_file 会对每个文件全量重写一次索引
-        const raw = await invoke('import_files_batch', {
-            srcPaths: fileList,
+        // 2.4.1：后端批量导入（单次索引加密落盘）
+        const res = data_of(await invoke('import_files_batch', {
+            token: pick.token,
+            srcPaths: pick.paths,
             destBase: state.currentFolder,
-        });
-        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        }));
         await listFolder(state.currentFolder);
         setStatus(res.fail > 0
             ? `导入完成: 成功 ${res.ok} 个，失败 ${res.fail} 个`
             : `导入完成: ${res.ok} 个文件`);
+        if (res.fail > 0 && res.errors && res.errors.length) {
+            showInlineListError(`以下 ${res.fail} 个文件导入失败：`, res.errors);
+        }
     } catch (e) {
         showError(String(e));
         await listFolder(state.currentFolder);
+    } finally {
+        setBusy(false);
     }
 }
 
+// 2.8.2：批量操作失败明细的展示（转义后进对话框，不再只有干巴巴的计数）
+function showInlineListError(title, lines) {
+    const safe = lines.slice(0, 20).map(l => '<li>' + escapeHtml(l) + '</li>').join('');
+    const more = lines.length > 20 ? `<li>…… 其余 ${lines.length - 20} 项省略</li>` : '';
+    showDialog('操作结果', `<p>${escapeHtml(title)}</p><ul style="max-height:40vh;overflow:auto;">${safe}${more}</ul>`,
+        [{ text: '确定', cls: 'btn-ok' }]);
+}
+
 async function importFolder() {
-    const folder = await tauriOpen({ title: '选择要导入的文件夹', directory: true });
-    if (!folder) return;
+    // 2.8.2（H2）：目录选择改由后端对话框完成
+    const pick = await invoke('dialog_pick_folder').catch(e => { showError(String(e)); return null; });
+    if (!pick || !pick.token || !pick.paths.length) return;
+    const folder = pick.paths[0];
+    setBusy(true);
     setStatus('正在导入文件夹...');
     try {
-        await invoke('import_folder', { srcFolder: folder, destBase: state.currentFolder });
+        const res = data_of(await invoke('import_folder', {
+            token: pick.token,
+            srcFolder: folder,
+            destBase: state.currentFolder,
+        }));
         await listFolder(state.currentFolder);
-        setStatus('文件夹导入完成');
+        setStatus(`文件夹导入完成（成功 ${res.ok}，失败 ${res.fail}` +
+            (res.skippedSymlinks ? `，跳过符号链接 ${res.skippedSymlinks}` : '') + '）');
     } catch (e) {
         showError(String(e));
         await listFolder(state.currentFolder);
+    } finally {
+        setBusy(false);
     }
 }
 
 async function extractSelected() {
     if (!state.selectedItems.length) return;
-    const dest = await tauriOpen({ title: '选择提取目标文件夹', directory: true });
-    if (!dest) return;
+    // 2.8.2（H2/M7）：目标目录改由后端对话框选择（令牌 + 保护目录拒绝）
+    const pick = await invoke('dialog_pick_folder').catch(e => { showError(String(e)); return null; });
+    if (!pick || !pick.token || !pick.paths.length) return;
+    const dest = pick.paths[0];
+    setBusy(true);
     setStatus('正在提取...');
     try {
         const vpaths = state.selectedItems.map(i => i.vpath);
-        // 2.7.1：后端返回 {ok, fail}，失败数不再被静默丢弃
-        const raw = await invoke('extract_files', { vpaths, destFolder: dest });
-        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const res = data_of(await invoke('extract_files', { vpaths, token: pick.token, destFolder: dest }));
         setStatus(res.fail > 0
             ? `提取完成: 成功 ${res.ok} 个，失败 ${res.fail} 个 → ${dest}`
             : `提取完成: ${res.ok} 个文件 → ${dest}`);
+        if (res.fail > 0 && res.errors && res.errors.length) {
+            showInlineListError(`以下 ${res.fail} 个文件提取失败：`, res.errors);
+        }
     } catch (e) {
         showError(String(e));
+    } finally {
+        setBusy(false);
     }
 }
 
 async function extractAllFiles() {
-    // 提取全部：选择父目录，后端会在其下创建与保险柜同名的子文件夹
-    const dest = await tauriOpen({ title: '选择提取目标父目录（将在此创建以保险柜命名的子文件夹）', directory: true });
-    if (!dest) return;
+    // 2.8.2（H2/M7）：目标父目录改由后端对话框选择（令牌两段式：预检不焚、提取焚）
+    const pick = await invoke('dialog_pick_folder').catch(e => { showError(String(e)); return null; });
+    if (!pick || !pick.token || !pick.paths.length) return;
+    const dest = pick.paths[0];
 
     // N8 修复：预检目标子文件夹是否已存在，存在时提示用户确认覆盖
     try {
-        const checkRaw = await invoke('check_extract_all_dest', { destParentFolder: dest });
-        const check = typeof checkRaw === 'string' ? JSON.parse(checkRaw) : checkRaw;
+        const check = data_of(await invoke('check_extract_all_dest', { destParentFolder: dest, token: pick.token }));
         if (check && check.exists) {
             const ok = await tauriAsk(
-                `目标文件夹已存在：\n${check.dest_name}\n\n继续提取将覆盖同名文件。是否继续？`,
+                `目标文件夹已存在：
+${check.dest_name}
+
+继续提取将覆盖同名文件。是否继续？`,
                 { title: '确认覆盖', type: 'warning' }
             );
             if (!ok) return;
@@ -836,17 +950,22 @@ async function extractAllFiles() {
         console.warn('check_extract_all_dest 失败:', e);
     }
 
+    setBusy(true);
     setStatus('正在提取全部文件...');
     try {
-        const raw = await invoke('extract_all_files', { destParentFolder: dest });
-        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const res = data_of(await invoke('extract_all_files', { destParentFolder: dest, token: pick.token }));
         if (res.fail > 0) {
             setStatus(`提取完成：成功 ${res.ok} 个，失败 ${res.fail} 个，输出到 ${res.dest}`);
+            if (res.errors && res.errors.length) {
+                showInlineListError(`以下 ${res.fail} 个文件提取失败：`, res.errors);
+            }
         } else {
             setStatus(`提取完成：共 ${res.ok} 个文件，输出到 ${res.dest}`);
         }
     } catch (e) {
         showError(String(e));
+    } finally {
+        setBusy(false);
     }
 }
 
@@ -855,12 +974,13 @@ async function deleteSelected() {
     const names = state.selectedItems.map(i => i.name).join('\n');
     const ok = await tauriAsk(`确认安全删除以下项目？\n\n${names}\n\n此操作不可撤销（DoD 7-pass 擦除）。`, { title: '确认删除', type: 'warning' });
     if (!ok) return;
+    setBusy(true);
     try {
         const vpaths = state.selectedItems.map(i => i.vpath);
         // N1 修复：delete_files 能同时处理文件和文件夹（后端 secure_delete_files_batch 展开）
         // 2.4.1：返回结构化 { files, folders }，精确反馈删除数量
         const raw = await invoke('delete_files', { vpaths });
-        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const res = data_of(raw);
         await listFolder(state.currentFolder);
         const parts = [];
         if (res.files) parts.push(`${res.files} 个文件`);
@@ -871,14 +991,20 @@ async function deleteSelected() {
         setStatus(status);
     } catch (e) {
         showError(String(e));
+    } finally {
+        setBusy(false);
     }
 }
 
 async function newFolder() {
     showInput('新建文件夹', '文件夹名称：', '', async (name) => {
         if (!name) return;
+        // 2.8.2：客户端先过归一化（与 listFolder 一致），含 '/'、'..' 的输入
+        // 由后端兜底拒绝，客户端不再发送未归一化的裸拼接
+        const norm = normalizeVPath(state.currentFolder);
+        if (norm === null) { showError('当前目录路径无效'); return false; }
         try {
-            await invoke('new_folder', { vpath: state.currentFolder + '/' + name });
+            await invoke('new_folder', { vpath: (norm === '/' ? '' : norm) + '/' + name });
             await listFolder(state.currentFolder);
         } catch (e) {
             showError(String(e));
@@ -910,7 +1036,18 @@ async function promptEncryptedOffice(vpath, fileName) {
     }
 }
 
+let _viewBusy = false; // 2.8.2：文件双击防抖 —— 快速双击触发两次全量 base64 传输
 async function viewFile(vpath, fileName) {
+    if (_viewBusy) return;
+    _viewBusy = true;
+    try {
+        await viewFileInner(vpath, fileName);
+    } finally {
+        _viewBusy = false;
+    }
+}
+
+async function viewFileInner(vpath, fileName) {
     const ext = fileName.split('.').pop().toLowerCase();
     const imgExts = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'tif'];
     const textExts = ['txt', 'md', 'py', 'log', 'json', 'csv', 'xml', 'ini', 'cfg', 'yaml', 'yml', 'rs', 'js', 'go', 'toml', 'html', 'css', 'sh', 'bat', 'ps1'];
@@ -977,6 +1114,17 @@ async function viewFile(vpath, fileName) {
             const bin = atob(b64);
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const EDIT_LIMIT = 4 * 1024 * 1024;
+            // 2.8.2（性能）：>4MB 必然只读 —— 先判门槛再解码，跳过 fatal 探测
+            // 的双重 TextDecoder；≤4MB 时保持 fatal 探测决定「可编辑 or 只读」
+            if (bytes.length > EDIT_LIMIT) {
+                const text = new TextDecoder('utf-8').decode(bytes);
+                const pre = document.createElement('pre');
+                pre.textContent = text;
+                showDialog('📄 ' + fileName + '（超过 4 MB，只读预览）', pre.outerHTML,
+                    [{ text: '关闭', cls: 'btn-ok' }], true);
+                return;
+            }
             // 2.5.1 新增：fatal 解码探测 —— 非 UTF-8 文本（如 GBK）保存会破坏
             // 原编码（替换字符 U+FFFD 固化），这类文件只读预览，不给编辑入口
             let utf8Valid = true;
@@ -991,15 +1139,6 @@ async function viewFile(vpath, fileName) {
                 const pre = document.createElement('pre');
                 pre.textContent = text;
                 showDialog('📄 ' + fileName, pre.outerHTML, [{ text: '关闭', cls: 'btn-ok' }], true);
-                return;
-            }
-            // 2.5.1 新增：文本直接编辑。编辑上限 4 MB —— textarea 渲染超大文本
-            // 会卡死 WebView（后端硬上限 64 MB）；超过则只读预览
-            if (bytes.length > 4 * 1024 * 1024) {
-                const pre = document.createElement('pre');
-                pre.textContent = text;
-                showDialog('📄 ' + fileName + '（超过 4 MB，只读预览）', pre.outerHTML,
-                    [{ text: '关闭', cls: 'btn-ok' }], true);
                 return;
             }
             const taId = 'txt-edit-' + Date.now();
@@ -1043,7 +1182,10 @@ async function viewFile(vpath, fileName) {
                     setStatus('已保存：' + fileName);
                     return true; // 关闭对话框
                 } catch (e) {
-                    showError(String(e));
+                    // 2.8.2：非破坏性错误 —— 旧 showError 会整体替换 #dialog-body，
+                    // textarea 连同用户未保存的编辑一起被清空（注释声称"保留编辑
+                    // 内容"与实际行为相反）。改为对话框内追加错误条。
+                    showDialogError('保存失败：' + e + '\n（编辑内容已保留，可重试或复制后关闭）');
                     return false; // 保留编辑内容让用户重试
                 }
             };
@@ -1082,22 +1224,27 @@ async function renameSelected() {
 }
 
 async function defragmentVault() {
+    setBusy(true);
     try {
         const msg = await invoke('defragment_vault');
         await listFolder(state.currentFolder);
         setStatus(msg);
     } catch (e) {
         showError(String(e));
+    } finally {
+        setBusy(false);
     }
 }
 
 async function addPartition() {
+    // 2.8.2：两个输入框都注册 onCancel —— 用户点遮罩关闭对话框时 resolve
+    // 必须被调用，否则 async 函数永久挂起（闭包与已输入内容泄漏）
     const alias = await new Promise(resolve => {
-        showInput('添加伪装分区', '分区别名：', '', resolve);
+        showInput('添加伪装分区', '分区别名：', '', resolve, false, () => resolve(null));
     });
     if (!alias) return;
     const pwd = await new Promise(resolve => {
-        showInput('分区密码', '输入分区密码：', '', resolve, true);
+        showInput('分区密码', '输入分区密码：', '', resolve, true, () => resolve(null));
     });
     if (!pwd) return;
     try {
@@ -1111,7 +1258,7 @@ async function addPartition() {
 async function removePartition() {
     try {
         const raw = await invoke('list_partitions');
-        const partitions = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const partitions = data_of(raw);
         if (!partitions || partitions.length === 0) {
             showDialog('提示', '<p>暂无伪装分区</p>', [{ text: '确定', cls: 'btn-ok' }]);
             return;
@@ -1247,7 +1394,7 @@ async function moveSelected() {
                 const vpaths = state.selectedItems.map(i => i.vpath);
                 try {
                     const raw = await invoke('move_items', { vpaths, destFolder: dest });
-                    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    const res = data_of(raw);
                     await listFolder(state.currentFolder);
                     setStatus(res.fail > 0
                         ? `移动完成: 成功 ${res.ok} 个，失败 ${res.fail} 个`
@@ -1277,7 +1424,7 @@ async function moveSelected() {
 async function showAuditLog() {
     try {
         const raw = await invoke('get_audit_log', { limit: 500 });
-        const entries = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const entries = data_of(raw);
         let body;
         if (!entries || !entries.length) {
             body = '<p class="audit-note">暂无记录</p>';
@@ -1305,7 +1452,7 @@ async function verifyIntegrity() {
         [{ text: '关闭', cls: 'btn-cancel', action: () => true }]);
     try {
         const raw = await invoke('verify_vault_integrity');
-        const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const res = data_of(raw);
         const box = document.querySelector('#dialog-body .verify-box');
         if (!box) return; // 对话框已被用户关闭
         if (!res.broken || !res.broken.length) {
@@ -1382,8 +1529,8 @@ async function openSettings() {
     showDialog('设置',
         `<div class="settings-path">配置文件：${escapeHtml(data.path)}</div>` +
         `<div class="settings-row"><label>主题：</label><div class="theme-swatches">${themeSwatches}</div></div>` +
-        `<div class="settings-row"><label>自动锁定（分钟，0=禁用）：</label><input type="text" id="cfg-autolock" value="${s.autolock_minutes}"></div>` +
-        `<div class="settings-row"><label>窗口尺寸：</label><span class="win-size"><input type="text" id="cfg-w" value="${Math.round(s.window_width)}"> × <input type="text" id="cfg-h" value="${Math.round(s.window_height)}"></span></div>` +
+        `<div class="settings-row"><label>自动锁定（分钟，0=禁用）：</label><input type="text" id="cfg-autolock" value="${escapeAttr(String(s.autolock_minutes))}"></div>` +
+        `<div class="settings-row"><label>窗口尺寸：</label><span class="win-size"><input type="text" id="cfg-w" value="${escapeAttr(String(Math.round(s.window_width)))}"> × <input type="text" id="cfg-h" value="${escapeAttr(String(Math.round(s.window_height)))}"></span></div>` +
         `<div class="settings-row"><label>防截屏保护：</label><input type="checkbox" id="cfg-anti" ${s.anti_screenshot ? 'checked' : ''}></div>` +
         `<div id="cfg-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>` +
         '<p class="audit-note">防截屏：开启后本窗口不会出现在截屏 / 录屏 / 远程共享画面中（Win10 2004+ 完全隐藏，旧系统显示为黑块；无法阻止物理拍摄）。</p>',
@@ -1505,9 +1652,9 @@ async function autoLockVault() {
         return;
     }
     let savedNote = '';
-    try {
-        const ta = document.querySelector('#dialog-body textarea.txt-editor');
-        if (ta && !ta.readOnly && ta.dataset.vpath && ta.value !== ta.dataset.original) {
+    const ta = document.querySelector('#dialog-body textarea.txt-editor');
+    if (ta && !ta.readOnly && ta.dataset.vpath && ta.value !== ta.dataset.original) {
+        try {
             const enc = new TextEncoder().encode(ta.value);
             let binStr = '';
             const CHUNK = 0x8000;
@@ -1516,9 +1663,13 @@ async function autoLockVault() {
             }
             await invoke('update_file_content', { vpath: ta.dataset.vpath, contentB64: btoa(binStr) });
             savedNote = '（编辑内容已自动保存）';
+        } catch (e) {
+            // 2.8.2：自动保存失败 → 不关柜（旧实现仅状态栏一句话就继续关柜，
+            // 未保存编辑直接丢失）。柜保持打开，60 秒后重试（含保存）。
+            setStatus('空闲自动锁定暂停：编辑内容自动保存失败（' + e + '），60 秒后重试');
+            _idleTimer = setTimeout(autoLockVault, 60 * 1000);
+            return;
         }
-    } catch (e) {
-        savedNote = '（警告：编辑内容自动保存失败）';
     }
     try {
         await invoke('close_vault');
@@ -1529,7 +1680,10 @@ async function autoLockVault() {
         // 回到启动弹窗（快速重新打开）
         detectAndShowStartup();
     } catch (e) {
+        // 2.8.2：关柜失败不再让 _idleTimer 悬空（旧实现失败后无人重建计时器，
+        // 柜保持打开但失去自动锁，直到下一次用户活动才恢复）
         showError(String(e));
+        resetIdleTimer();
     }
 }
 
@@ -1731,7 +1885,7 @@ function bindEvents() {
                         paths,
                         destBase: state.currentFolder,
                     });
-                    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    const res = data_of(raw);
                     await listFolder(state.currentFolder);
 
                     // 2.4.1：后端会把误拖入的保险柜文件分流出来（不导入）
@@ -1889,6 +2043,13 @@ function openVaultFromExternal(filePath) {
         }
         hideStartupModal();
         openVaultFromStartup(filePath);
+    }).catch(e => {
+        // 2.8.2：对话框 invoke 失败必须复位 _startupProcessing（否则启动列表软锁）
+        console.warn('tauriAsk 失败:', e);
+        _startupProcessing = false;
+        if ($('startup-dialog').classList.contains('hidden')) {
+            showStartupModal();
+        }
     });
 }
 
@@ -1962,12 +2123,20 @@ window.addEventListener('DOMContentLoaded', async () => {
         if (_startupProcessing) return;
         _startupProcessing = true;
         hideStartupModal();
-        const filePath = await tauriSave({
-            title: '选择保险柜保存位置',
-            filters: VAULT_FILTERS,
-        });
+        let filePath;
+        try {
+            filePath = await tauriSave({
+                title: '选择保险柜保存位置',
+                filters: VAULT_FILTERS,
+            });
+        } catch (e) {
+            console.warn('tauriSave 失败:', e);
+            filePath = null;
+        }
         if (!filePath) {
-            // 用户取消文件选择，重新显示启动弹窗
+            // 用户取消 / 对话框失败：复位标志并重新显示启动弹窗
+            //（2.8.2：旧实现裸 await，invoke reject 时 _startupProcessing
+            // 永久为 true，启动列表全被守卫拦死 —— 软锁到重启）
             _startupProcessing = false;
             showStartupModal();
             return;
@@ -2002,11 +2171,18 @@ window.addEventListener('DOMContentLoaded', async () => {
         if (_startupProcessing) return;
         _startupProcessing = true;
         hideStartupModal();
-        const filePath = await tauriOpen({
-            title: '选择保险柜文件',
-            filters: VAULT_OPEN_FILTERS,
-        });
+        let filePath;
+        try {
+            filePath = await tauriOpen({
+                title: '选择保险柜文件',
+                filters: VAULT_OPEN_FILTERS,
+            });
+        } catch (e) {
+            console.warn('tauriOpen 失败:', e);
+            filePath = null;
+        }
         if (!filePath) {
+            // 2.8.2：同 sd-create —— 失败也复位标志，避免启动列表软锁
             _startupProcessing = false;
             showStartupModal();
             return;

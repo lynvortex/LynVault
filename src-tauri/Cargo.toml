@@ -1,6 +1,6 @@
 [package]
 name = "LynVault"
-version = "2.8.1"
+version = "2.8.2"
 edition = "2021"
 
 # 2.7.1：包名 lynvault-rs → LynVault —— 裸 `cargo build --release` 直接产出
@@ -32,6 +32,8 @@ zeroize = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = { version = "0.4", features = ["std"] }
+# 2.8.2（L2/H2）：单实例令牌与对话框令牌的随机生成（OsRng）
+rand = "0.8"
 
 # Windows 专属依赖：系统图标读取 + .lyt 文件关联自注册（本应用仅面向 Windows 发布）
 # 2.8.0 新增 feature：
@@ -49,6 +51,8 @@ windows = { version = "0.57", features = [
     "Win32_System_Com",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
     "ApplicationModel_DataTransfer",
     "Foundation",
 ] }

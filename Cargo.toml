@@ -8,3 +8,11 @@ members = [
 
 # wry uses the crates.io release required by Tauri 1.
 # The former local vendor/wry patch was not included in this repository.
+
+# 2.8.2：发布构建优化 —— 2.8.1 时 workspace 无 [profile.release]，二进制 9.9MB
+# 且未做任何链接期优化。thin LTO 跨 crate 内联（vault-core 热路径收益明显），
+# strip 移除符号表（抗取证：减少二进制内可被静态分析的结构信息）。
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

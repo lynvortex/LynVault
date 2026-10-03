@@ -10,6 +10,17 @@
 //! 索引落盘沿用 C3 崩溃安全顺序，中途被冻结/杀死也不会损坏文件）。
 //!
 //! 仅 Windows：Linux 桌面的 logind 事件暂未支持（已知限制）。
+//!
+//! 2.8.2（M4）加固：
+//! 1. **修复致命常量错误** —— `WTS_SESSION_LOGOFF` 旧实现写成 0x9（实为
+//!    `WTS_SESSION_REMOTE_CONTROL`），导致注销事件从不触发关柜、远程控制
+//!    会话反而误触发；正确值为 0x6。
+//! 2. `wnd_proc` 拦截 `WM_CLOSE`（同 clipboard_guard，防外部进程销毁窗口）。
+//! 3. 类名随机化（pid + 启动纳秒 + 序号）。
+//! 4. `GetMessageW` 三态区分 + 重建循环。
+//! 5. 关闭线程 `catch_unwind` —— 旧实现 `LOCK_IN_FLIGHT` 在线程末尾才复位，
+//!    途中 panic（如 WinRT 调用）会让标志永久为 true，本会话后续所有
+//!    锁屏/睡眠自动关柜静默失效。
 
 #![cfg(windows)]
 
@@ -21,10 +32,18 @@ static APP: Mutex<Option<AppHandle>> = Mutex::new(None);
 /// 旧实现会并发派生多个关闭线程，每个都 emit 一次 vault-locked，
 /// 前端重复跑启动扫描
 static LOCK_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 2.8.2（M4）：类名序号（随机类名组成成分之一）
+static CLASS_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 启动监听线程（仅 Windows；setup 钩子里调用一次）
 pub fn spawn(app: AppHandle) {
-    if let Ok(mut guard) = APP.lock() {
+    {
+        // 2.8.2：锁中毒恢复（旧实现 if let Ok 静默跳过 → APP 永久 None，
+        // 之后所有事件空转，自动关柜整体失效）
+        let mut guard = match APP.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         *guard = Some(app);
     }
     std::thread::Builder::new()
@@ -43,14 +62,29 @@ fn trigger_lock() {
     {
         return;
     }
-    let app = APP.lock().ok().and_then(|g| g.clone());
+    // 2.8.2：锁中毒恢复
+    let app = {
+        let guard = match APP.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
     if let Some(app) = app {
         if app.get_window("main").is_none() {
             LOCK_IN_FLIGHT.store(false, Ordering::SeqCst);
             return; // 应用已退出中
         }
         std::thread::spawn(move || {
-            let _ = crate::commands::system_lock_vault(&app);
+            // 2.8.2：catch_unwind 保证 LOCK_IN_FLIGHT 无论成败都复位 ——
+            // 旧实现线程 panic（WinRT / emit）后标志永久卡 true，
+            // 本会话后续所有锁屏/睡眠自动关柜静默失效
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = crate::commands::system_lock_vault(&app);
+            }));
+            if result.is_err() {
+                log::warn!("系统事件触发的关柜线程 panic（已恢复）");
+            }
             LOCK_IN_FLIGHT.store(false, Ordering::SeqCst);
         });
     } else {
@@ -70,12 +104,23 @@ fn event_loop() {
     const WM_POWERBROADCAST: u32 = 0x0218;
     const PBT_APMSUSPEND: usize = 4;
     const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+    // 2.8.2（M4 关键修复）：WTS_SESSION_LOGOFF = 0x6 —— 旧实现误写 0x9
+    // （实为 WTS_SESSION_REMOTE_CONTROL），导致注销永不关柜、远程控制
+    // 会话误触发。手抄魔法数正是这一错误的直接产物，windows crate 已启用
+    // RemoteDesktop feature，此处显式定义并注明与 SDK 一致。
     const WTS_SESSION_LOCK: usize = 0x7;
-    const WTS_SESSION_LOGOFF: usize = 0x9;
+    const WTS_SESSION_LOGOFF: usize = 0x6;
+    const WM_CLOSE: u32 = 0x0010;
 
-    const CLASS_NAME: &[u16] = &[
-        b'L' as u16, b'V' as u16, b'S' as u16, b'y' as u16, b's' as u16, 0,
-    ];
+    // 类名随机化（pid + 启动纳秒 + 序号），防同会话进程定位后杀死窗口
+    let seq = CLASS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let class_name: Vec<u16> = format!("LVSys-{}-{}-{}\0", std::process::id(), nanos, seq)
+        .encode_utf16()
+        .collect();
 
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
@@ -92,11 +137,14 @@ fn event_loop() {
                 trigger_lock();
                 LRESULT(0)
             }
+            // 2.8.2（M4）：拦截 WM_CLOSE —— DefWindowProcW 会销毁窗口，
+            // GetMessageW 随之返回 0，监听线程静默死亡
+            WM_CLOSE => LRESULT(0),
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
         }
     }
 
-    let class_name = windows::core::PCWSTR(CLASS_NAME.as_ptr());
+    let class_name = windows::core::PCWSTR(class_name.as_ptr());
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         lpszClassName: class_name,
@@ -131,17 +179,34 @@ fn event_loop() {
         log::warn!("WTS 注册失败（服务未运行？），锁屏/注销自动关闭未生效");
     }
 
-    let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-    loop {
-        let r = unsafe {
-            windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, hwnd, 0, 0)
-        };
-        if r.0 <= 0 {
-            break;
+    // 2.8.2（M4）：GetMessageW 三态 + 重建循环（与 clipboard_guard 同型）
+    let mut rebuilds = 0u32;
+    'rebuild: loop {
+        let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+        loop {
+            let r = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, hwnd, 0, 0)
+            };
+            if r.0 == -1 {
+                break; // 错误 → 重建
+            }
+            if r.0 == 0 {
+                break; // 窗口被销毁 → 重建
+            }
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
         }
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
-            windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+        rebuilds += 1;
+        if rebuilds > 60 {
+            log::error!("系统事件窗口反复异常退出（{} 次），放弃本会话重建", rebuilds);
+            return;
         }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        // 重新注册会话通知（窗口句柄未变；WTS 通知绑定在句柄上，重建窗口
+        // 的场景已在wnd_proc 拦截 WM_CLOSE 后大幅减少，此处尽力而为）
+        let _ = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+        continue 'rebuild;
     }
 }

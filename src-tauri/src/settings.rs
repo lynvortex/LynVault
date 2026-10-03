@@ -146,12 +146,28 @@ pub fn save_to(location: ConfigLocation, settings: &Settings) -> Result<PathBuf,
 }
 
 /// 把配置写到指定路径（save_settings 更新现有配置时使用）
+/// 2.8.2：原子写入（临时文件 + rename）—— 旧实现 fs::write 非原子且无 fsync，
+/// 写入中途掉电/被杀会留下截断的 settings.json，load_active 解析失败静默回
+/// 默认值，用户设置无提示丢失。
 pub fn save_at(path: &std::path::Path, settings: &Settings) -> Result<(), String> {
+    use std::io::Write;
     let sanitized = settings.clone().sanitized();
     let json = serde_json::to_string_pretty(&sanitized)
         .map_err(|e| format!("序列化配置失败: {}", e))?;
-    std::fs::write(path, json.as_bytes())
-        .map_err(|e| format!("配置目录不可写（{}）。便携模式请把程序放到可写位置，或改用用户目录", e))
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("配置目录不可写（{}）。便携模式请把程序放到可写位置，或改用用户目录", e))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("配置写入失败: {}", e))?;
+        f.sync_all()
+            .map_err(|e| format!("配置落盘失败: {}", e))?;
+    }
+    // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖已存在目标
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("配置写入失败（{}）。便携模式请把程序放到可写位置，或改用用户目录", e)
+    })
 }
 
 /// 删除当前生效的配置文件（关闭持久化）。返回被删除的路径。

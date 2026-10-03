@@ -1,5 +1,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
@@ -12,6 +14,94 @@ use zeroize::Zeroize;
 pub struct AppState {
     vault: Mutex<Option<Vault>>,
     last_auth_attempt: Mutex<Option<Instant>>,
+}
+
+/// 2.8.2（H2）：对话框令牌表 —— dialog_pick_files / dialog_pick_folder 弹出
+/// 原生对话框后，把所选路径登记进该表并签发一次性 128 位随机令牌。
+/// 导入/提取命令必须凭令牌取路径，且要求 IPC 传入路径与登记**逐条完全一致**，
+/// 令牌用后即焚 —— 被攻陷的 WebView 无法再直接 `invoke('import_files_batch',
+/// { src_paths: [...] })` 读取任意用户文件（渲染层任意文件读取等价物）。
+/// 用 Vec<(token, paths)> 而非 HashMap（static 初始化须为 const，条目数 ≤ 64）。
+static DIALOG_TOKENS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+
+/// 2.8.2（H2）：主进程侧记录的真实拖放载荷（main.rs 的 on_window_event 写入）。
+/// 拖放导入不再信任 WebView 字符串 —— 命令要求传入路径与该载荷排序后完全一致。
+static DROPPED_PATHS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// main.rs 的 on_window_event 调用：记录真实拖放载荷（覆盖式 —— 每次新的
+/// drop 事件刷新；消费后清空）
+pub fn record_dropped_paths(paths: Vec<String>) {
+    if let Ok(mut guard) = DROPPED_PATHS.lock() {
+        *guard = Some(paths);
+    }
+}
+
+/// 消费拖放载荷：与传入路径做「排序后完全一致」比较，不符或缺失即拒绝
+fn take_dropped_paths_matches(paths: &[String]) -> Result<(), String> {
+    let mut guard = match DROPPED_PATHS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let recorded = guard
+        .take()
+        .ok_or_else(|| "没有已记录的拖放操作（请通过窗口拖放触发导入）".to_string())?;
+    let mut a = recorded.clone();
+    let mut b = paths.to_vec();
+    a.sort();
+    b.sort();
+    if a != b {
+        return Err("拖放路径与主进程记录不一致（请求可能被伪造）".to_string());
+    }
+    Ok(())
+}
+
+/// 登记路径并签发一次性令牌
+fn register_dialog_paths(paths: Vec<String>) -> Result<String, String> {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    let token: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    let mut guard = match DIALOG_TOKENS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // 防御：令牌表无限膨胀（恶意高频调用对话框命令），超限时最旧条目淘汰
+    if guard.len() > 64 {
+        guard.remove(0);
+    }
+    guard.push((token.clone(), paths));
+    Ok(token)
+}
+
+/// 核验令牌并要求传入路径与登记逐条完全一致（消费式 —— 用后即焚）
+fn verify_dialog_paths(token: &str, paths: &[String]) -> Result<(), String> {
+    let mut guard = match DIALOG_TOKENS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let pos = guard
+        .iter()
+        .position(|(t, _)| t == token)
+        .ok_or_else(|| "对话框令牌无效或已使用".to_string())?;
+    let (_, registered) = guard.remove(pos);
+    if registered.len() != paths.len() || registered.iter().zip(paths.iter()).any(|(a, b)| a != b) {
+        return Err("传入路径与对话框登记不一致（请求可能被伪造）".to_string());
+    }
+    Ok(())
+}
+
+/// 核验令牌但**不消费**（两段式流程的预检用 —— check_extract_all_dest
+/// 预检不焚令牌，最终提取才焚）
+fn peek_dialog_paths(token: &str) -> Result<Vec<String>, String> {
+    let guard = match DIALOG_TOKENS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard
+        .iter()
+        .find(|(t, _)| t == token)
+        .map(|(_, paths)| paths.clone())
+        .ok_or_else(|| "对话框令牌无效或已使用".to_string())
 }
 
 /// 2.4.1 新增：通过启动参数 / 文件关联传入的保险柜路径。
@@ -50,6 +140,16 @@ impl AppState {
         }
     }
 
+    /// 2.8.2：轻量查询保险柜是否打开（空闲锁看门狗用，锁中毒可恢复）
+    ///（空闲锁看门狗目前仅 Windows；非 Windows 平台允许 dead_code）
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn vault_open(&self) -> bool {
+        match self.vault.lock() {
+            Ok(g) => g.is_some(),
+            Err(p) => p.into_inner().is_some(),
+        }
+    }
+
     /// 检查认证冷却（防止暴力破解绕过 per-instance 限制）
     fn check_auth_cooldown(&self) -> Result<(), String> {
         let mut guard = lock_cooldown(self)?;
@@ -75,8 +175,10 @@ fn catch<R, F: FnOnce() -> Result<R, String>>(label: &str, f: F) -> Result<R, St
             } else {
                 format!("{:?}", e)
             };
-            eprintln!("[LynVault] PANIC in {}: {}", label, msg);
-            Err(format!("内部错误 ({}): {}", label, msg))
+            // 2.8.2（I1）：panic 载荷只写日志（落文件日志），不回传 WebView ——
+            // 内部路径等细节不再直达渲染层
+            log::error!("[LynVault] PANIC in {}: {}", label, msg);
+            Err(format!("内部错误 ({}): 操作失败，详情已记录日志", label))
         }
     }
 }
@@ -265,22 +367,79 @@ pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<ListItem>
 // 2.7.1：移除死命令 `import_file` / `extract_file` —— 自 2.4.1 批量路径上线后
 // 无前端调用方，且后者硬编码 overwrite=true（静默覆盖语义），留着是无调用方
 // 约束的危险默认值。批量入口：import_files_batch / extract_files。
+//
+// 2.8.2（H2）：导入类命令的路径必须来自后端对话框令牌 —— 命令同时接收
+// `token` 与路径列表，核验「令牌有效 + 逐条一致」后消费令牌。被 XSS 攻陷的
+// WebView 直接 invoke 导入命令并把任意用户可读文件（.ssh、浏览器 Cookies）
+// 灌进已解锁保险柜的路径已被封死。
+
+/// 2.8.2（H2）：弹出原生多选文件对话框，所选路径登记为一次性令牌。
+/// 对话框在 spawn_blocking 线程弹出（Tauri 1.x 的 blocking builder 不能在主线程用）。
+#[tauri::command]
+pub async fn dialog_pick_files() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("dialog_pick_files", || {
+            let picked = tauri::api::dialog::blocking::FileDialogBuilder::new()
+                .add_filter("所有文件", &["*"])
+                .pick_files();
+            match picked {
+                Some(paths) if !paths.is_empty() => {
+                    let strs: Vec<String> = paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    let token = register_dialog_paths(strs.clone())?;
+                    Ok(serde_json::json!({ "token": token, "paths": strs }))
+                }
+                _ => Ok(serde_json::json!({ "token": serde_json::Value::Null, "paths": [] })),
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
+}
+
+/// 2.8.2（H2）：弹出原生目录对话框，所选目录登记为一次性令牌
+#[tauri::command]
+pub async fn dialog_pick_folder() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("dialog_pick_folder", || {
+            let picked = tauri::api::dialog::blocking::FileDialogBuilder::new()
+                .set_title("选择文件夹")
+                .pick_folder();
+            match picked {
+                Some(p) => {
+                    let s = p.to_string_lossy().into_owned();
+                    let token = register_dialog_paths(vec![s.clone()])?;
+                    Ok(serde_json::json!({ "token": token, "paths": [s] }))
+                }
+                None => Ok(serde_json::json!({ "token": serde_json::Value::Null, "paths": [] })),
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
+}
 
 /// 2.4.1 新增（P0-2）：批量导入文件。
 /// 单次索引加密落盘替代 N 次（旧版前端循环 import_file 时每个文件都全量重写索引 + 10 次 fsync）。
-/// 返回 { ok, fail } 供前端展示结果。
+/// 返回 { ok, fail, errors } 供前端展示结果（2.8.2：失败明细真实可达）。
 #[tauri::command]
 pub async fn import_files_batch(
     app: AppHandle,
+    token: Option<String>,
     src_paths: Vec<String>,
     dest_base: String,
 ) -> Result<serde_json::Value, String> {
     run_blocking(&app, "import_files_batch", move |state| {
+        // 2.8.2（H2）：令牌核验（消费式）
+        let token = token.ok_or("缺少对话框令牌（请通过「导入文件」对话框选择）")?;
+        verify_dialog_paths(&token, &src_paths)?;
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        let (ok, fail) = vault.import_files_batch(&src_paths, &dest_base)
+        let (ok, fail, errors) = vault.import_files_batch(&src_paths, &dest_base)
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "ok": ok, "fail": fail }))
+        Ok(serde_json::json!({ "ok": ok, "fail": fail, "errors": errors }))
     })
     .await
 }
@@ -288,19 +447,27 @@ pub async fn import_files_batch(
 #[tauri::command]
 pub async fn import_folder(
     app: AppHandle,
+    token: Option<String>,
     src_folder: String,
     dest_base: String,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     run_blocking(&app, "import_folder", move |state| {
+        let token = token.ok_or("缺少对话框令牌（请通过「导入文件夹」对话框选择）")?;
+        verify_dialog_paths(&token, &[src_folder.clone()])?;
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        vault.import_folder(Path::new(&src_folder), &dest_base).map_err(|e| e.to_string())
+        let (ok, fail, skipped) = vault
+            .import_folder(Path::new(&src_folder), &dest_base)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "ok": ok, "fail": fail, "skippedSymlinks": skipped }))
     })
     .await
 }
 
 /// 拖放导入：自动判断路径是文件还是文件夹，批量导入到 dest_base 下
 /// 2.4.1（P1-16）：返回结构化对象 { summary, files, folders, errors? } 供前端提示安全删除源文件
+/// 2.8.2（H2）：路径必须与主进程 on_window_event 记录的真实拖放载荷排序后
+/// 完全一致 —— WebView 伪造的字符串不再被信任。
 #[tauri::command]
 pub async fn import_dropped_paths(
     app: AppHandle,
@@ -308,6 +475,8 @@ pub async fn import_dropped_paths(
     dest_base: String,
 ) -> Result<serde_json::Value, String> {
     run_blocking(&app, "import_dropped_paths", move |state| {
+        // 2.8.2（H2）：先核验拖放载荷
+        take_dropped_paths_matches(&paths)?;
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
 
@@ -319,6 +488,7 @@ pub async fn import_dropped_paths(
 
         // 2.4.1 新功能：拖入的 .lyt/.vault 是保险柜文件而非待加密文件 —— 分流处理，
         // 由前端走「打开保险柜」流程，这里直接跳过（不导入、不报错）。
+        // 2.8.2（M8 补充）：magic 探测本身即文件打开，远程/设备路径先被守卫拦截。
         let (vault_files, normal_paths): (Vec<String>, Vec<String>) = paths
             .into_iter()
             .partition(|p| {
@@ -327,7 +497,9 @@ pub async fn import_dropped_paths(
                     .and_then(|e| e.to_str())
                     .map(|s| s.eq_ignore_ascii_case("lyt") || s.eq_ignore_ascii_case("vault"))
                     .unwrap_or(false);
-                ext && vault_core::is_vault_file(path)
+                ext
+                    && !crate::single_instance::is_remote_or_device_path(p)
+                    && vault_core::is_vault_file(path)
             });
 
         for p in &normal_paths {
@@ -346,13 +518,29 @@ pub async fn import_dropped_paths(
         // 文件 ≈ 450 次 fsync；批量后只有 1 次保存。
         if !file_paths.is_empty() {
             match vault.import_files_batch(&file_paths, &dest_base) {
-                Ok((ok, fail)) => {
+                Ok((ok, fail, batch_errors)) => {
                     if fail == 0 {
                         imported_files = file_paths;
                     } else {
-                        // 批量路径不返回逐文件结果；失败明细由批量接口记入前端可见的计数
+                        // 部分失败：成功的文件名单保留（可安全删除源文件的仅限
+                        // 成功项），失败明细进 errors —— 旧实现整体置空导致
+                        // 用户一个源文件都不敢删
+                        imported_files = file_paths
+                            .iter()
+                            .filter(|p| {
+                                let name = Path::new(p)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let prefix = name + ":";
+                                !batch_errors.iter().any(|e| e.starts_with(&prefix))
+                            })
+                            .cloned()
+                            .collect();
                         errors.push(format!("文件批量导入：成功 {} 个，失败 {} 个", ok, fail));
-                        // 批量路径不返回逐文件结果，失败项无法定位 —— 置空避免误报
+                        for e in &batch_errors {
+                            errors.push(format!("  {}", e));
+                        }
                     }
                 }
                 Err(e) => errors.push(format!("文件批量导入失败: {}", e)),
@@ -360,7 +548,15 @@ pub async fn import_dropped_paths(
         }
         for p in &dir_paths {
             match vault.import_folder(Path::new(p), &dest_base) {
-                Ok(_) => imported_folders.push(p.clone()),
+                Ok((ok, fail, skipped)) => {
+                    imported_folders.push(p.clone());
+                    if fail > 0 {
+                        errors.push(format!("文件夹 '{}'：{} 个文件导入失败", p, fail));
+                    }
+                    if skipped > 0 {
+                        errors.push(format!("文件夹 '{}'：跳过 {} 个符号链接（成功 {} 个）", p, skipped, ok));
+                    }
+                }
                 Err(e) => errors.push(format!("文件夹 '{}': {}", p, e)),
             }
         }
@@ -393,22 +589,96 @@ pub async fn import_dropped_paths(
 
 // ───────────────── 文件提取 ─────────────────
 
+/// 2.8.2（M7）：提取目标目录保护 —— 拒绝 Windows 目录、Program Files、
+/// ProgramData、开始菜单子树（覆盖「启动文件夹持久化」原语）。
+/// 目标先 canonicalize（剥 `\\?\`），再做大小写不敏感的带分隔符边界比较。
+#[cfg(windows)]
+fn reject_protected_dest(dest_folder: &Path) -> Result<(), String> {
+    let canon = std::fs::canonicalize(dest_folder)
+        .map_err(|_| "目标目录无法访问".to_string())?;
+    let s = canon.to_string_lossy().trim_start_matches(r"\\?\").to_ascii_lowercase();
+
+    // 系统级保护目录（含环境变量解析出的实际位置，避免系统盘非 C: 时漏判）
+    let mut protected: Vec<String> = vec![r"c:\windows".to_string()];
+    for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+        if let Ok(v) = std::env::var(var) {
+            protected.push(v.trim_end_matches('\\').to_ascii_lowercase());
+        }
+    }
+    // 开始菜单（当前用户 + 全用户）—— 覆盖「往启动文件夹放东西」的持久化原语
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        protected.push(
+            PathBuf::from(appdata)
+                .join(r"Microsoft\Windows\Start Menu")
+                .to_string_lossy()
+                .trim_end_matches('\\')
+                .to_ascii_lowercase(),
+        );
+    }
+    if let Ok(pd) = std::env::var("ProgramData") {
+        protected.push(
+            PathBuf::from(pd)
+                .join(r"Microsoft\Windows\Start Menu")
+                .to_string_lossy()
+                .trim_end_matches('\\')
+                .to_ascii_lowercase(),
+        );
+    }
+
+    let within = |base: &str| s == base || s.starts_with(&format!("{}\\", base));
+    for p in &protected {
+        if within(p) {
+            return Err(format!("目标目录位于受保护的系统位置（{}），已拒绝提取", p));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_protected_dest(_dest_folder: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// 2.8.2：与保险柜同名的导出根目录名（check_extract_all_dest / extract_all_files
+/// 共用，消除逐行复制的清洗逻辑）
+fn export_stem(vault_path: &Path) -> String {
+    let stem = vault_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("LynVault_Export")
+        .to_string();
+    let safe_stem: String = stem
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect();
+    if safe_stem.trim().is_empty() {
+        "LynVault_Export".to_string()
+    } else {
+        safe_stem
+    }
+}
+
 #[tauri::command]
 pub async fn extract_files(
     app: AppHandle,
     vpaths: Vec<String>,
+    token: Option<String>,
     dest_folder: String,
 ) -> Result<serde_json::Value, String> {
     run_blocking(&app, "extract_files", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        // 2.8.2（H2/M7）：目标目录必须来自后端对话框令牌 + 保护目录拒绝
+        let token = token.ok_or("缺少对话框令牌（请通过「提取」对话框选择目标）")?;
+        verify_dialog_paths(&token, &[dest_folder.clone()])?;
+        reject_protected_dest(Path::new(&dest_folder))?;
         // 2.3.0 修复：委托给 vault-core 批量提取（单次 load_index + extract_file_inner，
         // 避免对每个文件重复 load_index 的 O(n²) 退化）
         // 2.7.1 修复：失败数不再被静默丢弃 —— 旧实现只回传成功数且前端连它都
         // 不用，默认拒绝覆盖同名文件时整批失败也报「提取完成」
-        let (ok, fail) = vault.extract_files_batch(&vpaths, Path::new(&dest_folder))
+        let (ok, fail, errors) = vault.extract_files_batch(&vpaths, Path::new(&dest_folder))
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "ok": ok, "fail": fail }))
+        Ok(serde_json::json!({ "ok": ok, "fail": fail, "errors": errors }))
     })
     .await
 }
@@ -578,7 +848,8 @@ pub async fn get_file_info(app: AppHandle, vpath: String) -> Result<serde_json::
     run_blocking(&app, "get_file_info", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        let index = vault.load_index().map_err(|e| e.to_string())?;
+        // 2.8.2：走只读借用（index_ref），免去整索引深拷贝
+        let index = vault.index_ref().map_err(|e| e.to_string())?;
         if let Some(meta) = index.files.get(&vpath) {
             Ok(serde_json::json!({
                 "name": meta.name, "size": meta.size, "vpath": vpath,
@@ -632,6 +903,12 @@ pub async fn preview_office_file(
     mut password: Option<String>,
 ) -> Result<String, String> {
     run_blocking(&app, "preview_office_file", move |state| {
+        // 2.8.2：带口令的尝试走认证冷却（3 秒）—— 旧实现文档口令可全速暴力
+        // 尝试，与开柜口令的限速不对称。无口令（OFFICE_ENCRYPTED 哨兵探测）
+        // 不消耗冷却。
+        if password.is_some() {
+            state.check_auth_cooldown()?;
+        }
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         // 2.5.1 修复（OOM）：旧实现直接 load_file_data（内部上限 256 MiB），
@@ -676,6 +953,11 @@ pub async fn update_file_content(
 ) -> Result<(), String> {
     run_blocking(&app, "update_file_content", move |state| {
         use base64::Engine;
+        // 2.8.2（L7）：解码**前**按 base64 长度估算解码后大小并拒绝 ——
+        // 旧实现先解码后限长，超大参数在解码期就完成 OOM 式分配
+        if content_b64.len() / 4 * 3 > MAX_PREVIEW_SIZE as usize {
+            return Err("内容过大：文本编辑上限 64 MB".into());
+        }
         let data = base64::engine::general_purpose::STANDARD
             .decode(content_b64.as_bytes())
             .map_err(|e| format!("内容编码无效: {}", e))?;
@@ -732,21 +1014,30 @@ fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
 /// 检查一个路径是否为 LynVault 保险柜文件（扩展名 + magic bytes 双重校验）。
 /// 供前端拖放 .lyt 到窗口时自动识别并直接进入密码输入流程，
 /// 避免把保险柜文件本身误当作待加密文件导入另一个保险柜。
+/// 2.8.2：async 化（Tauri 1.x 同步命令在主线程执行，网络盘路径会冻结 UI）；
+/// 2.8.2（M8）：远程/设备路径直接返回 false，magic 探测本身即文件打开。
 #[tauri::command]
-pub fn check_vault_file(path: String) -> Result<bool, String> {
-    catch("check_vault_file", || {
-        let p = Path::new(&path);
-        let ext = p.extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.eq_ignore_ascii_case("lyt") || s.eq_ignore_ascii_case("vault"))
-            .unwrap_or(false);
-        if !ext {
-            return Ok(false);
-        }
-        // N6：magic bytes 校验，避免把其他工具的同后缀文件（HashiCorp Vault 等）
-        // 误识别为 LynVault 保险柜
-        Ok(vault_core::is_vault_file(p))
+pub async fn check_vault_file(path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("check_vault_file", || {
+            if crate::single_instance::is_remote_or_device_path(&path) {
+                return Ok(false);
+            }
+            let p = Path::new(&path);
+            let ext = p.extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.eq_ignore_ascii_case("lyt") || s.eq_ignore_ascii_case("vault"))
+                .unwrap_or(false);
+            if !ext {
+                return Ok(false);
+            }
+            // N6：magic bytes 校验，避免把其他工具的同后缀文件（HashiCorp Vault 等）
+            // 误识别为 LynVault 保险柜
+            Ok(vault_core::is_vault_file(p))
+        })
     })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
 }
 
 /// 读取启动参数中传入的保险柜路径（文件关联双击 .lyt 启动时由 main.rs 写入）。
@@ -853,6 +1144,11 @@ pub async fn search_files(
     limit: Option<u32>,
 ) -> Result<Vec<vault_core::SearchHit>, String> {
     run_blocking(&app, "search_files", move |state| {
+        // 2.8.2（L11）：查询长度上限 —— 无界查询随每次击键对全索引做
+        // 大小写折叠扫描，超长串白白消耗 CPU
+        if query.chars().count() > 256 {
+            return Err("搜索词过长（上限 256 字符）".into());
+        }
         // 2.8.1：search_files 改为 &self 借用缓存（免 clone），只读守卫即可
         let guard = lock_vault(state)?;
         let vault = guard.as_ref().ok_or("保险柜未打开")?;
@@ -912,62 +1208,82 @@ pub async fn verify_vault_integrity(app: AppHandle) -> Result<serde_json::Value,
 }
 
 /// 2.8.0：读取保险柜头部锁定区的失败尝试计数（开锁前提示用，无需密码）。
+/// 2.8.2：async 化（同 check_vault_file —— 文件 I/O 不进主线程）。
 #[tauri::command]
-pub fn get_lock_info(path: String) -> Result<serde_json::Value, String> {
-    catch("get_lock_info", || {
-        let info = vault_core::read_lock_info(Path::new(&path)).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({
-            "failedCount": info.failed_count,
-            "locked": info.locked,
-            "lockUntilEpoch": info.lock_until_epoch,
-        }))
+pub async fn get_lock_info(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("get_lock_info", || {
+            let info = vault_core::read_lock_info(Path::new(&path)).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({
+                "failedCount": info.failed_count,
+                "locked": info.locked,
+                "lockUntilEpoch": info.lock_until_epoch,
+            }))
+        })
     })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
 }
 
 /// 2.8.0：读取当前设置（enabled=false 表示未启用持久化，settings 字段为默认值）。
+/// 2.8.2：async 化（文件 I/O 不进主线程）。
 #[tauri::command]
-pub fn get_settings() -> Result<serde_json::Value, String> {
-    catch("get_settings", || {
-        match crate::settings::load_active() {
-            Some((path, s)) => Ok(serde_json::json!({
-                "enabled": true,
-                "path": path.to_string_lossy(),
-                "settings": serde_json::to_value(&s).map_err(|e| e.to_string())?,
-            })),
-            None => Ok(serde_json::json!({
-                "enabled": false,
-                "path": serde_json::Value::Null,
-                "settings": serde_json::to_value(crate::settings::Settings::default())
-                    .map_err(|e| e.to_string())?,
-            })),
-        }
+pub async fn get_settings() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("get_settings", || {
+            match crate::settings::load_active() {
+                Some((path, s)) => Ok(serde_json::json!({
+                    "enabled": true,
+                    "path": path.to_string_lossy(),
+                    "settings": serde_json::to_value(&s).map_err(|e| e.to_string())?,
+                })),
+                None => Ok(serde_json::json!({
+                    "enabled": false,
+                    "path": serde_json::Value::Null,
+                    "settings": serde_json::to_value(crate::settings::Settings::default())
+                        .map_err(|e| e.to_string())?,
+                })),
+            }
+        })
     })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
 }
 
 /// 2.8.0：启用设置持久化（写入用户选择的位置；已启用时保留现有值迁移到新位置）。
+/// 2.8.2：async 化。
 #[tauri::command]
-pub fn enable_persistence(location: String) -> Result<String, String> {
-    catch("enable_persistence", || {
-        let loc = match location.as_str() {
-            "portable" => crate::settings::ConfigLocation::Portable,
-            "appdata" => crate::settings::ConfigLocation::AppData,
-            _ => return Err("未知的配置位置".into()),
-        };
-        let s = crate::settings::load_active()
-            .map(|(_, s)| s)
-            .unwrap_or_default();
-        let path = crate::settings::save_to(loc, &s)?;
-        Ok(path.to_string_lossy().to_string())
+pub async fn enable_persistence(location: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("enable_persistence", || {
+            let loc = match location.as_str() {
+                "portable" => crate::settings::ConfigLocation::Portable,
+                "appdata" => crate::settings::ConfigLocation::AppData,
+                _ => return Err("未知的配置位置".into()),
+            };
+            let s = crate::settings::load_active()
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+            let path = crate::settings::save_to(loc, &s)?;
+            Ok(path.to_string_lossy().to_string())
+        })
     })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
 }
 
 /// 2.8.0：关闭持久化（删除当前生效的配置文件）。
+/// 2.8.2：async 化。
 #[tauri::command]
-pub fn disable_persistence() -> Result<String, String> {
-    catch("disable_persistence", || {
-        let path = crate::settings::delete_active()?;
-        Ok(path.to_string_lossy().to_string())
+pub async fn disable_persistence() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catch("disable_persistence", || {
+            let path = crate::settings::delete_active()?;
+            Ok(path.to_string_lossy().to_string())
+        })
     })
+    .await
+    .map_err(|e| format!("后台任务失败: {}", e))?
 }
 
 /// 2.8.0：保存设置（要求已启用持久化）。防截屏开关即时生效。
@@ -1085,23 +1401,23 @@ pub async fn scan_vault_files(dir: String) -> Result<Vec<serde_json::Value>, Str
 
 /// 检查提取全部文件时目标子文件夹是否已存在（供前端预检覆盖提示）。
 /// 2.4.1（P1-16）：返回结构化对象 { exists, dest_name, dest_path }
+/// 2.8.2（H2）：两段式流程的预检 —— 核验令牌但**不消费**（最终提取才焚）。
 #[tauri::command]
 pub async fn check_extract_all_dest(
     app: AppHandle,
     dest_parent_folder: String,
+    token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     run_blocking(&app, "check_extract_all_dest", move |state| {
         let guard = lock_vault(state)?;
         let vault = guard.as_ref().ok_or("保险柜未打开")?;
         let vault_path = vault.get_path().ok_or("保险柜未打开或路径不可用")?;
-        let stem = vault_path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("LynVault_Export")
-            .to_string();
-        let safe_stem: String = stem.chars()
-            .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-            .collect();
-        let safe_stem = if safe_stem.trim().is_empty() { "LynVault_Export".to_string() } else { safe_stem };
+        let safe_stem = export_stem(vault_path);
+
+        // 2.8.2（H2）：预检不焚令牌（peek）；2.8.2（M7）：保护目录拒绝
+        let token = token.ok_or("缺少对话框令牌（请通过「提取全部」对话框选择目标）")?;
+        peek_dialog_paths(&token)?;
+        reject_protected_dest(Path::new(&dest_parent_folder))?;
 
         let dest_parent = Path::new(&dest_parent_folder);
         let dest_root = dest_parent.join(&safe_stem);
@@ -1118,27 +1434,24 @@ pub async fn check_extract_all_dest(
 /// 提取保险柜内所有文件到指定父目录下。
 /// 会自动创建一个与保险柜文件同名（去掉 .lyt/.vault 后缀）的子文件夹作为容器。
 /// 2.4.1（P1-16）：返回结构化对象 { ok, fail, dest } 供前端显示结果。
+/// 2.8.2（H2/M7）：目标目录必须来自后端对话框令牌 + 保护目录拒绝。
 #[tauri::command]
 pub async fn extract_all_files(
     app: AppHandle,
     dest_parent_folder: String,
+    token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     run_blocking(&app, "extract_all_files", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
 
-        // 解析保险柜文件名（去掉后缀）作为根文件夹名
         let vault_path = vault.get_path().ok_or("保险柜未打开或路径不可用")?;
-        let stem = vault_path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("LynVault_Export")
-            .to_string();
+        let safe_stem = export_stem(vault_path);
 
-        // 安全化文件夹名：禁止路径分隔符与控制字符
-        let safe_stem: String = stem.chars()
-            .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-            .collect();
-        let safe_stem = if safe_stem.trim().is_empty() { "LynVault_Export".to_string() } else { safe_stem };
+        // 2.8.2（H2）：最终提取消费令牌；2.8.2（M7）：保护目录拒绝
+        let token = token.ok_or("缺少对话框令牌（请通过「提取全部」对话框选择目标）")?;
+        verify_dialog_paths(&token, &[dest_parent_folder.clone()])?;
+        reject_protected_dest(Path::new(&dest_parent_folder))?;
 
         let dest_parent = Path::new(&dest_parent_folder);
         std::fs::create_dir_all(dest_parent).map_err(|e| e.to_string())?;
@@ -1155,11 +1468,12 @@ pub async fn extract_all_files(
         // 委托给 vault-core：单次 load_index，避免 O(n²) 重复加载
         // 2.4.1（P0-5）：overwrite=true —— 前端已通过 check_extract_all_dest 预检
         // 并向用户确认覆盖；旧实现确认「覆盖」后仍用 create_new 拒绝，大批失败
-        let (ok, fail) = vault.extract_all_files(&dest_root, true).map_err(|e| e.to_string())?;
+        let (ok, fail, errors) = vault.extract_all_files(&dest_root, true).map_err(|e| e.to_string())?;
         Ok(serde_json::json!({
             "ok": ok,
             "fail": fail,
             "dest": dest_root.to_string_lossy(),
+            "errors": errors,
         }))
     })
     .await
@@ -1187,11 +1501,11 @@ pub async fn get_file_icon(ext: String) -> Result<String, String> {
         match tauri::async_runtime::spawn_blocking(move || read_windows_file_icon(&ext_clone)).await {
             Ok(Ok(b64)) => Ok(b64),
             Ok(Err(e)) => {
-                eprintln!("[LynVault] get_file_icon 失败 ({}): {}", ext, e);
+                log::warn!("get_file_icon 失败 ({}): {}", ext, e);
                 Ok(String::new())
             }
             Err(e) => {
-                eprintln!("[LynVault] get_file_icon 任务失败: {}", e);
+                log::warn!("get_file_icon 任务失败: {}", e);
                 Ok(String::new())
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "vault-core"
-version = "2.8.1"
+version = "2.8.2"
 edition = "2021"
 
 [dependencies]
@@ -32,7 +32,9 @@ cfb = "0.7"
 libc = "0.2"
 # 2.7.0：加密 Office 预览(Agile Encryption 解密)
 # aes 已在依赖树中(aes-gcm 0.10 的底层),base64 同理;sha1 为新增小依赖
-aes = "0.8"
+# 2.8.2（L1）：开启 aes 的 zeroize feature —— 解密得到的 Office 文档密钥
+# （Aes128/192/256 内部的 round keys）drop 时清零，不再以明文残留堆内存
+aes = { version = "0.8", features = ["zeroize"] }
 base64 = "0.22"
 sha1 = "0.10"
 

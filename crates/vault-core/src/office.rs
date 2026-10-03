@@ -211,6 +211,8 @@ fn derive_key(h_digest: &[u8], block_key: &[u8], alg: HashAlg, key_bits: usize) 
     buf.extend_from_slice(h_digest);
     buf.extend_from_slice(block_key);
     let out = hash_bytes(alg, &buf);
+    // 2.8.2（L1）：拼接缓冲含密钥派生材料，用后即清零
+    buf.zeroize();
     out[..key_bits / 8].to_vec()
 }
 
@@ -388,7 +390,7 @@ fn password_ok(p: &AgileParams, password_key: &dyn Fn(&[u8]) -> Vec<u8>) -> bool
         }
     };
     let key2 = password_key(&BLK_KEY_VERIFIER_HASH_VALUE);
-    let expected = match aes_cbc_decrypt(&key2, &p.enc_salt, &p.verifier_hash_value) {
+    let mut expected = match aes_cbc_decrypt(&key2, &p.enc_salt, &p.verifier_hash_value) {
         Some(v) => v,
         None => {
             secure_wipe_vec(key1);
@@ -400,11 +402,16 @@ fn password_ok(p: &AgileParams, password_key: &dyn Fn(&[u8]) -> Vec<u8>) -> bool
     // 2.7.1：两把临时密钥与 verifier_input 用后即清零
     secure_wipe_vec(key1);
     secure_wipe_vec(key2);
-    let actual = hash_bytes(p.enc_hash, &verifier_input);
+    let mut actual = hash_bytes(p.enc_hash, &verifier_input);
     secure_wipe_vec(verifier_input);
     // Office 对非块对齐的散列会零填充到块大小，只比较 digest 长度的前缀；
     // 2.7.1：比较改为恒定时间（与 vault 侧认证纪律一致，防止计时侧信道）
-    expected.len() >= actual.len() && bool::from(expected[..actual.len()].ct_eq(&actual[..]))
+    let ok = expected.len() >= actual.len()
+        && bool::from(expected[..actual.len()].ct_eq(&actual[..]));
+    // 2.8.2（L1）：expected（解密出的校验散列）与 actual 用后清零
+    expected.zeroize();
+    actual.zeroize();
+    ok
 }
 
 /// 解密 Agile Encryption 载荷，返回原始 OOXML ZIP 字节
@@ -443,11 +450,14 @@ fn decrypt_agile_package(info: &[u8], package: &[u8], password: &str) -> Result<
         secret.zeroize();
         return Err("文档已损坏".into());
     }
-    let total_size = u64::from_le_bytes(package[..8].try_into().unwrap()) as usize;
-    if total_size > MAX_OFFICE_TEXT {
+    let total_size_u64 = u64::from_le_bytes(package[..8].try_into().unwrap());
+    // 2.8.2（I8）：先做上限检查再转 usize —— 32 位目标上 u64→usize 会回绕，
+    // 旧实现 `as usize` 在前会绕过 MAX_OFFICE_TEXT 检查
+    if total_size_u64 > MAX_OFFICE_TEXT as u64 {
         secret.zeroize();
         return Err(format!("文档解密后超过预览上限（{} 字节）", MAX_OFFICE_TEXT));
     }
+    let total_size = total_size_u64 as usize;
     let mut plain: Vec<u8> = Vec::with_capacity(total_size);
     let mut remaining = total_size;
     for (i, chunk) in package[8..].chunks(4096).enumerate() {
@@ -470,6 +480,12 @@ fn decrypt_agile_package(info: &[u8], package: &[u8], password: &str) -> Result<
         remaining -= take;
     }
     secret.zeroize();
+    // 2.8.2（I8）：截断包拒绝 —— 声明的明文长度未消费完说明载荷被截断，
+    // 旧实现会带着残缺 ZIP 继续解析
+    if remaining != 0 {
+        plain.zeroize();
+        return Err("文档已损坏（载荷被截断）".into());
+    }
 
     if plain.starts_with(b"PK") {
         Ok(plain)
@@ -636,6 +652,11 @@ fn decrypt_standard_package(
                 .ct_eq(&expected[..]),
         );
     verifier.zeroize();
+    // 2.8.2（L1）：expected / verifier_hash 含校验材料，比较后清零
+    let mut expected = expected;
+    expected.zeroize();
+    let mut verifier_hash = verifier_hash;
+    verifier_hash.zeroize();
     if !ok {
         let mut key = key;
         key.zeroize();
@@ -875,6 +896,415 @@ fn is_word_text_char(ch: u16) -> bool {
     }
 }
 
+// ───────────────── 2.8.2（H3/H4/H5/M2/M3）：解析前预扫描 ─────────────────
+//
+// 根因在 calamine 0.36.1 上游 —— Range::from_sparse 按单元格坐标包围盒一次性
+// 稠密分配 cols×rows（~32B/格）；sharedStrings 的 uniqueCount 直接 reserve(n)；
+// xls 的 BIFF 0x0200 Dimensions 记录同样无界 reserve 且 end < start 时 u32 下溢。
+// 几 KB 的恶意文件即可要求数百 GiB 分配，Rust 分配失败走 handle_alloc_error →
+// **abort**，catch_unwind 无法拦截，整个进程静默死亡。原有限制
+// （MAX_ROWS_PER_SHEET 等）都在物化之后检查，形同虚设。
+//
+// 预扫描在交给 calamine 之前按普通错误拒绝一切资源耗尽向量：
+// - xlsx：ZIP 条目数 / 逐条目实测解压尺寸 / 全部条目解压总量（M3 压缩炸弹）；
+//   sharedStrings 的 uniqueCount 与实际 <si> 计数（H4）；worksheet 的 dimension
+//   与每个单元格坐标解析 + 包围盒面积（H3）。
+// - xls：OLE 打开 /Workbook（或 /Book）流 → 逐条 BIFF 记录扫描 Dimensions
+//   （H5 下溢 / 行列极限）与真实单元格记录的包围盒（M2）。
+// 上限取 400 万格（而非审计建议的 100 万），为真实大型表格留兼容余量
+// （≈128 MB 稠密内存，仍远低于 abort 阈值）。
+
+/// worksheet 包围盒面积上限（4,000,000 格 ≈ 128 MB 稠密内存）
+const MAX_CELLS_BBOX: u64 = 4_000_000;
+/// Excel 规格极限：行 ≤ 1,048,576 / 列 ≤ 16,384，坐标越界直接拒绝
+const MAX_EXCEL_ROWS: u32 = 1_048_576;
+const MAX_EXCEL_COLS: u32 = 16_384;
+/// sharedStrings 的 uniqueCount / 实际 <si> 计数上限（H4）
+const MAX_SHARED_STRING_COUNT: usize = 2_000_000;
+/// xlsx ZIP 条目数上限（与 docx 路径的 MAX_ZIP_ENTRIES 同值）
+const MAX_XLSX_ZIP_ENTRIES: usize = 10_000;
+/// xlsx 单条目实测解压尺寸上限（M3）
+const MAX_XLSX_ENTRY_UNCOMPRESSED: u64 = 64 * 1024 * 1024;
+/// xlsx 全部条目解压总量上限（M3）
+const MAX_XLSX_TOTAL_UNCOMPRESSED: u64 = 256 * 1024 * 1024;
+/// xls 的 Workbook/Book 流读取上限（防 OLE 流声明无界）
+const MAX_XLS_WORKBOOK_STREAM: u64 = 256 * 1024 * 1024;
+
+/// 解析 xlsx 单元格坐标（"A1" / "XFD1048576"）→ (row, col)，均 1-based。
+/// 非法形式返回 None。列段最多 3 个字母（XFD 已是 Excel 极限）。
+fn parse_cell_ref(s: &str) -> Option<(u32, u32)> {
+    if s.is_empty() {
+        return None;
+    }
+    let split = s.char_indices().find(|(_, c)| c.is_ascii_digit())?;
+    let (col_part, row_part) = s.split_at(split.0);
+    if col_part.is_empty() || col_part.len() > 3 {
+        return None;
+    }
+    if !col_part.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    if row_part.is_empty() || !row_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut col: u32 = 0;
+    for b in col_part.bytes() {
+        let v = (b.to_ascii_uppercase() - b'A') as u32 + 1;
+        col = col.checked_mul(26)?.checked_add(v)?;
+    }
+    let row: u32 = row_part.parse().ok()?;
+    Some((row, col))
+}
+
+/// 包围盒追踪器（预扫描共用）：维护坐标包围盒 + 单元格计数，
+/// 超过 Excel 规格极限或包围盒面积上限即报错。坐标一律 1-based。
+struct BboxTracker {
+    min_r: u32,
+    min_c: u32,
+    max_r: u32,
+    max_c: u32,
+    cells: u64,
+}
+
+impl BboxTracker {
+    fn new() -> Self {
+        Self { min_r: u32::MAX, min_c: u32::MAX, max_r: 0, max_c: 0, cells: 0 }
+    }
+
+    /// 记录一个坐标（1-based，已做 Excel 规格极限校验）
+    fn track(&mut self, r: u32, c: u32) -> Result<(), String> {
+        if r == 0 || r > MAX_EXCEL_ROWS || c == 0 || c > MAX_EXCEL_COLS {
+            return Err(format!(
+                "单元格坐标超出 Excel 规格极限（row={}, col={}）", r, c
+            ));
+        }
+        self.merge(r, c);
+        self.cells += 1;
+        if self.cells > MAX_CELLS_BBOX {
+            return Err(format!(
+                "工作表单元格数量超过安全上限（{}）", MAX_CELLS_BBOX
+            ));
+        }
+        Ok(())
+    }
+
+    /// 合并一个已通过外部校验的坐标（不计数，供 Dimensions 声明并入包围盒）
+    fn merge(&mut self, r: u32, c: u32) {
+        self.min_r = self.min_r.min(r);
+        self.min_c = self.min_c.min(c);
+        self.max_r = self.max_r.max(r);
+        self.max_c = self.max_c.max(c);
+    }
+
+    /// 包围盒面积超限检查（空表直接通过）
+    fn check_area(&self) -> Result<(), String> {
+        if self.cells == 0 && self.max_r == 0 {
+            return Ok(());
+        }
+        let rows = (self.max_r.saturating_sub(self.min_r) + 1) as u64;
+        let cols = (self.max_c.saturating_sub(self.min_c) + 1) as u64;
+        let area = rows.checked_mul(cols).unwrap_or(u64::MAX);
+        if area > MAX_CELLS_BBOX {
+            return Err(format!(
+                "工作表包围盒（{}×{} = {} 格）超过安全上限（{} 格）",
+                rows, cols, area, MAX_CELLS_BBOX
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// H4：sharedStrings 预扫描 —— uniqueCount 声明与实际 <si> 计数同限。
+/// calamine 对 uniqueCount 直接 reserve(n)，几 KB 文件即可要求 TB 级分配。
+fn count_shared_strings(xml: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(xml)
+        .map_err(|_| "sharedStrings.xml 不是有效 UTF-8".to_string())?;
+    let mut reader = Reader::from_str(text);
+    let mut buf = Vec::new();
+    let mut si_count: usize = 0;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                let local = name.as_ref();
+                if local == b"si" {
+                    si_count += 1;
+                    if si_count > MAX_SHARED_STRING_COUNT {
+                        return Err(format!(
+                            "sharedStrings 条目数超过安全上限（{}）",
+                            MAX_SHARED_STRING_COUNT
+                        ));
+                    }
+                } else if local == b"sst" {
+                    for attr in e.attributes().with_checks(false) {
+                        let attr = attr.map_err(|_| "sharedStrings 属性解析失败".to_string())?;
+                        if attr.key.as_ref() == b"uniqueCount" {
+                            if let Ok(v) = std::str::from_utf8(&attr.value) {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    if n > MAX_SHARED_STRING_COUNT {
+                                        return Err(format!(
+                                            "sharedStrings uniqueCount={} 超过安全上限（{}）",
+                                            n, MAX_SHARED_STRING_COUNT
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("sharedStrings.xml 解析失败: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(())
+}
+
+/// H3：worksheet 预扫描 —— 解析 <dimension ref> 与每个 <c r> 坐标，
+/// 坐标超出 Excel 规格极限直接拒绝；包围盒（dimension 与实际单元格的并集）
+/// 面积超限拒绝。
+fn prescan_worksheet_xml(xml: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(xml)
+        .map_err(|_| "worksheet XML 不是有效 UTF-8".to_string())?;
+    let mut reader = Reader::from_str(text);
+    let mut buf = Vec::new();
+    let mut bbox = BboxTracker::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                let local = name.as_ref();
+                if local == b"dimension" {
+                    for attr in e.attributes().with_checks(false) {
+                        let attr = attr.map_err(|_| "worksheet 属性解析失败".to_string())?;
+                        if attr.key.as_ref() == b"ref" {
+                            if let Ok(v) = std::str::from_utf8(&attr.value) {
+                                // 可能是范围 "A1:C5" 或单格 "A1"；两端都参与包围盒
+                                for part in v.split(':') {
+                                    let (r, c) = parse_cell_ref(part).ok_or_else(|| {
+                                        format!("dimension 引用坐标非法: {}", part)
+                                    })?;
+                                    bbox.track(r, c)?;
+                                }
+                            }
+                        }
+                    }
+                } else if local == b"c" {
+                    for attr in e.attributes().with_checks(false) {
+                        let attr = attr.map_err(|_| "worksheet 属性解析失败".to_string())?;
+                        if attr.key.as_ref() == b"r" {
+                            let v = std::str::from_utf8(&attr.value)
+                                .map_err(|_| "单元格坐标非 UTF-8".to_string())?;
+                            let (r, c) = parse_cell_ref(v)
+                                .ok_or_else(|| format!("单元格坐标非法: {}", v))?;
+                            bbox.track(r, c)?;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("worksheet XML 解析失败: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+    bbox.check_area()
+}
+
+/// xlsx 预扫描入口：交给 calamine 之前拒绝一切资源耗尽向量。
+fn prescan_xlsx(data: &[u8]) -> Result<(), String> {
+    let cursor = Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| format!("ZIP 解析失败: {}", e))?;
+    if archive.len() > MAX_XLSX_ZIP_ENTRIES {
+        return Err(format!(
+            "ZIP 条目数量过多（{} 个，上限 {}）", archive.len(), MAX_XLSX_ZIP_ENTRIES
+        ));
+    }
+    let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+
+    // 第一遍：逐条目**实测**解压尺寸（中央目录声明可撒谎，必须真解压计量）
+    let mut total_uncompressed: u64 = 0;
+    for name in &names {
+        let mut f = archive.by_name(name)
+            .map_err(|e| format!("ZIP 条目读取失败（{}）: {}", name, e))?;
+        let mut entry_total: u64 = 0;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = f.read(&mut buf)
+                .map_err(|e| format!("ZIP 条目解压失败（{}）: {}", name, e))?;
+            if n == 0 {
+                break;
+            }
+            entry_total += n as u64;
+            if entry_total > MAX_XLSX_ENTRY_UNCOMPRESSED {
+                return Err(format!(
+                    "ZIP 条目 '{}' 解压尺寸超过上限（64 MiB）—— 可能为压缩炸弹", name
+                ));
+            }
+        }
+        total_uncompressed += entry_total;
+        if total_uncompressed > MAX_XLSX_TOTAL_UNCOMPRESSED {
+            return Err("ZIP 解压总量超过上限（256 MiB）—— 可能为压缩炸弹".to_string());
+        }
+    }
+
+    // 第二遍：sharedStrings（H4）与各 worksheet（H3）
+    if names.iter().any(|n| n == "xl/sharedStrings.xml") {
+        let mut f = archive.by_name("xl/sharedStrings.xml")
+            .map_err(|e| format!("读取 sharedStrings.xml 失败: {}", e))?;
+        let mut xml = Vec::with_capacity(f.size().min(MAX_XLSX_ENTRY_UNCOMPRESSED) as usize);
+        f.read_to_end(&mut xml)
+            .map_err(|e| format!("读取 sharedStrings.xml 失败: {}", e))?;
+        count_shared_strings(&xml)?;
+    }
+    for name in &names {
+        if !name.starts_with("xl/worksheets/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let mut f = archive.by_name(name)
+            .map_err(|e| format!("读取工作表（{}）失败: {}", name, e))?;
+        let mut xml = Vec::with_capacity(f.size().min(MAX_XLSX_ENTRY_UNCOMPRESSED) as usize);
+        f.read_to_end(&mut xml)
+            .map_err(|e| format!("读取工作表（{}）失败: {}", name, e))?;
+        prescan_worksheet_xml(&xml)
+            .map_err(|e| format!("工作表 {} 预扫描失败: {}", name, e))?;
+    }
+    Ok(())
+}
+
+/// H5/M2：xls BIFF 记录预扫描 —— Dimensions（0x0200）的下溢与行列极限 +
+/// 真实单元格记录统计包围盒。
+///
+/// Dimensions 布局按记录长度区分：≥16 字节 = BIFF3/4（4×u32），10 字节 =
+/// BIFF5/8（4×u16，rwMac/colMac 为 0-based 闭区间端点）。行 ≤ 65536、
+/// 列 ≤ 256（BIFF8 极限）。单元格记录：row/col 位于载荷头部 u16×2；
+/// MULRK(0x00BD)/MULBLANK(0x00BE) 的列区间为 colFirst（头部）与 colLast（尾部）。
+fn prescan_biff_records(workbook: &[u8]) -> Result<(), String> {
+    let rd16 = |p: &[u8], off: usize| -> u32 {
+        u16::from_le_bytes([p[off], p[off + 1]]) as u32
+    };
+    let rd32 = |p: &[u8], off: usize| -> u32 {
+        u32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]])
+    };
+    let mut bbox = BboxTracker::new();
+
+    let mut off = 0usize;
+    while off + 4 <= workbook.len() {
+        let opcode = u16::from_le_bytes([workbook[off], workbook[off + 1]]);
+        let len = u16::from_le_bytes([workbook[off + 2], workbook[off + 3]]) as usize;
+        let payload_start = off + 4;
+        if payload_start + len > workbook.len() {
+            // 截断流：结构问题交由 calamine 报具体错误
+            break;
+        }
+        let p = &workbook[payload_start..payload_start + len];
+        match opcode {
+            0x0200 if len >= 16 => {
+                // BIFF3/4：4×u32
+                let (sr, er, sc, ec) = (rd32(p, 0), rd32(p, 4), rd32(p, 8), rd32(p, 12));
+                if er < sr || ec < sc {
+                    return Err("Dimensions 记录 end < start（下溢攻击）".to_string());
+                }
+                if (er.saturating_sub(sr) as u64) + 1 > 65536 || (ec.saturating_sub(sc) as u64) + 1 > 256 {
+                    return Err(format!(
+                        "Dimensions 包围盒超出 BIFF 极限（{} 行 × {} 列）",
+                        (er - sr) as u64 + 1, (ec - sc) as u64 + 1
+                    ));
+                }
+                // 0-based 闭区间端点 → 1-based 并入包围盒（不经 track 计数）
+                bbox.merge(er.saturating_add(1), ec.saturating_add(1));
+                bbox.merge(sr.saturating_add(1), sc.saturating_add(1));
+            }
+            0x0200 if len >= 8 => {
+                // BIFF5/8：4×u16（闭区间端点，0-based）
+                let (sr, er, sc, ec) = (rd16(p, 0), rd16(p, 2), rd16(p, 4), rd16(p, 6));
+                if er < sr || ec < sc {
+                    return Err("Dimensions 记录 end < start（下溢攻击）".to_string());
+                }
+                if (er as u32 - sr as u32) + 1 > 65536 || (ec as u32 - sc as u32) + 1 > 256 {
+                    return Err(format!(
+                        "Dimensions 包围盒超出 BIFF 极限（{} 行 × {} 列）",
+                        (er - sr) as u64 + 1, (ec - sc) as u64 + 1
+                    ));
+                }
+                bbox.merge(er as u32 + 1, ec as u32 + 1);
+                bbox.merge(sr as u32 + 1, sc as u32 + 1);
+            }
+            // 单元格记录：FORMULA / LABELSST / NUMBER / LABEL / BOOLERR / RK / RSTRING / BLANK
+            0x0006 | 0x00FD | 0x0201 | 0x0203 | 0x0204 | 0x0205 | 0x027E | 0x00D6
+                if len >= 4 =>
+            {
+                let (r, c) = (rd16(p, 0), rd16(p, 2));
+                if r >= 65536 || c >= 256 {
+                    return Err(format!(
+                        "单元格坐标超出 BIFF 极限（row={}, col={}）", r, c
+                    ));
+                }
+                bbox.track(r + 1, c + 1)?;
+            }
+            // MULRK / MULBLANK：row(2) colFirst(2) ... colLast(2)
+            0x00BD | 0x00BE if len >= 6 => {
+                let r = rd16(p, 0);
+                let cf = rd16(p, 2);
+                let cl = rd16(p, len - 2);
+                if cl < cf {
+                    return Err("MULRK/MULBLANK 列区间 end < start".to_string());
+                }
+                if r >= 65536 || cl >= 256 {
+                    return Err(format!(
+                        "单元格坐标超出 BIFF 极限（row={}, col={}）", r, cl
+                    ));
+                }
+                for c in cf..=cl {
+                    bbox.track(r + 1, c + 1)?;
+                }
+            }
+            _ => {}
+        }
+        off = payload_start + len;
+    }
+
+    bbox.check_area()
+}
+
+/// xls 预扫描入口：OLE 打开 Workbook/Book 流 → BIFF 记录扫描 → 再交 calamine。
+/// 流缺失/截断等结构问题不拦截（交由 calamine 报具体错误），
+/// 只拦截确定的资源耗尽向量。
+fn prescan_xls_ole(data: &[u8]) -> Result<(), String> {
+    use cfb::CompoundFile;
+    let cursor = Cursor::new(data);
+    let mut cfb = CompoundFile::open(cursor)
+        .map_err(|e| format!("OLE 解析失败: {}", e))?;
+    let stream_name = if cfb.exists("/Workbook") {
+        "/Workbook"
+    } else if cfb.exists("/Book") {
+        "/Book"
+    } else {
+        return Ok(()); // 交由 calamine 报错
+    };
+    let mut workbook = Vec::new();
+    {
+        let s = cfb.open_stream(stream_name)
+            .map_err(|e| format!("读取 {} 流失败: {}", stream_name, e))?;
+        let claimed = s.len();
+        if claimed > MAX_XLS_WORKBOOK_STREAM {
+            return Err(format!(
+                "{} 流超过安全上限（256 MiB）", stream_name
+            ));
+        }
+        s.take(MAX_XLS_WORKBOOK_STREAM + 1)
+            .read_to_end(&mut workbook)
+            .map_err(|e| format!("读取 {} 流失败: {}", stream_name, e))?;
+    }
+    if workbook.len() as u64 > MAX_XLS_WORKBOOK_STREAM {
+        return Err(format!("{} 流超过安全上限（256 MiB）", stream_name));
+    }
+    prescan_biff_records(&workbook)
+}
+
 // ───────────────── XLS / XLSX 通用提取 ─────────────────
 
 /// 通用 calamine 工作表提取（消除 Xlsx 和 Xls 的重复逻辑）
@@ -931,8 +1361,11 @@ where
 }
 
 /// 从 OLE 复合文档中提取 .xls 文本（旧版 Excel）
+/// 2.8.2：入口顺序为 OLE 解析 → BIFF 预扫描 → Xls::new（资源耗尽向量在
+/// 交给 calamine 之前拒绝）
 fn extract_xls_ole_text(data: &[u8]) -> io::Result<String> {
     use calamine::Xls;
+    prescan_xls_ole(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let cursor = Cursor::new(data);
     let mut workbook: Xls<Cursor<&[u8]>> = Xls::new(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1025,6 +1458,9 @@ fn parse_docx_xml(xml: &str) -> io::Result<String> {
 
 fn extract_xlsx_text(data: &[u8]) -> io::Result<String> {
     use calamine::Xlsx;
+    // 2.8.2（H3/H4/M3）：解析前预扫描 —— 压缩炸弹 / uniqueCount / 包围盒
+    // 攻击在交给 calamine 之前按普通错误拒绝（加密 xlsx 解密后同样覆盖）
+    prescan_xlsx(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let cursor = Cursor::new(data);
     let mut workbook: Xlsx<Cursor<&[u8]>> = Xlsx::new(cursor)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1071,6 +1507,167 @@ mod tests {
     // BlockEncrypt 仅测试内的加密辅助（aes_cbc_encrypt）使用：
     // 留在顶层会在非测试构建报 unused import，收进测试模块
     use aes::cipher::BlockEncrypt;
+
+    // ───────── 2.8.2（H3/H4/H5/M2/M3）：预扫描测试 ─────────
+
+    #[test]
+    fn cell_ref_parsing() {
+        assert_eq!(parse_cell_ref("A1"), Some((1, 1)));
+        assert_eq!(parse_cell_ref("XFD1048576"), Some((1_048_576, 16_384)));
+        assert_eq!(parse_cell_ref("a5"), Some((5, 1)));
+        assert!(parse_cell_ref("1A").is_none());
+        assert!(parse_cell_ref("A").is_none());
+        assert!(parse_cell_ref("").is_none());
+        assert!(parse_cell_ref("XFE1").is_some()); // 列数本身合法，越界判定交给上限
+        assert_eq!(parse_cell_ref("XFE1").map(|(_, c)| c), Some(16_385));
+    }
+
+    fn worksheet_xml(dim: &str, cells: &[&str]) -> Vec<u8> {
+        let cell_xml: String = cells.iter().map(|c| format!(r#"<c r="{}"/>"#, c)).collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet><dimension ref="{}"/><sheetData><row>{}</row></sheetData></worksheet>"#,
+            dim, cell_xml
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn prescan_worksheet_rejects_attacks() {
+        // dimension 全范围引用 A1:XFD1048576 → 包围盒 171 亿格，拒绝
+        assert!(prescan_worksheet_xml(&worksheet_xml("A1:XFD1048576", &[])).is_err());
+        // 稀疏单元格包围盒：A1 与 XFD1048576 两个格 → 包围盒超限，拒绝
+        assert!(prescan_worksheet_xml(&worksheet_xml("", &["A1", "XFD1048576"])).is_err());
+        // 越界坐标（行 > 1,048,576）
+        assert!(prescan_worksheet_xml(&worksheet_xml("", &["A1048577"])).is_err());
+        // 越界坐标（列 > 16,384）
+        assert!(prescan_worksheet_xml(&worksheet_xml("", &["XFE1"])).is_err());
+        // 非法坐标
+        assert!(prescan_worksheet_xml(&worksheet_xml("", &["1A"])).is_err());
+    }
+
+    #[test]
+    fn prescan_worksheet_allows_legal_sheet() {
+        // 完整最小合法 worksheet 照常通过（防误伤回归）
+        assert!(prescan_worksheet_xml(&worksheet_xml("A1:C3", &["A1", "B2", "C3"])).is_ok());
+        // 大但合法：400 万格恰好在上限内（dimension 2000×2000）
+        // 2000×2000 = 4,000,000 格恰好在上限内（列 2000 = BXX）
+        assert!(prescan_worksheet_xml(&worksheet_xml("A1:BXX2000", &["A1"])).is_ok());
+        // 超过 400 万格的 dimension（2000×2001）拒绝
+        // 2000×2001 = 4,002,000 格超过上限
+        assert!(prescan_worksheet_xml(&worksheet_xml("A1:BXX2001", &["A1"])).is_err());
+    }
+
+    #[test]
+    fn prescan_xlsx_rejects_huge_unique_count() {
+        // H4：uniqueCount 声明超大 → 拒绝（calamine 会按它 reserve）
+        let xml = br#"<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" uniqueCount="99999999"><si><t>a</t></si></sst>"#;
+        assert!(count_shared_strings(xml).is_err());
+        // 合法声明 + 合法实际计数 → 通过
+        let ok = br#"<?xml version="1.0"?><sst uniqueCount="1"><si><t>a</t></si></sst>"#;
+        assert!(count_shared_strings(ok).is_ok());
+        // 声明合法但实际 <si> 计数超限 → 拒绝（声明可撒谎，实测为准）
+        let mut lying = String::from("<?xml version=\"1.0\"?><sst uniqueCount=\"1\">");
+        for _ in 0..(MAX_SHARED_STRING_COUNT as usize + 1) {
+            lying.push_str("<si><t>x</t></si>");
+        }
+        lying.push_str("</sst>");
+        assert!(count_shared_strings(lying.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn prescan_xlsx_allows_minimal_legal_xlsx() {
+        // 完整最小合法 xlsx 照常通过预扫描（防误伤回归）
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zw.start_file("xl/worksheets/sheet1.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(&worksheet_xml("A1:B2", &["A1", "B2"])).unwrap();
+        zw.start_file("xl/sharedStrings.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(br#"<?xml version="1.0"?><sst uniqueCount="1"><si><t>ok</t></si></sst>"#).unwrap();
+        let data = zw.finish().unwrap().into_inner();
+        assert!(prescan_xlsx(&data).is_ok());
+    }
+
+    #[test]
+    fn prescan_biff_rejects_attacks() {
+        let le = |v: u32| v.to_le_bytes();
+        // H5：伪造 Dimensions（0xFFFFFFFF 行，u32 布局）→ 拒绝
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0200u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(&le(0));
+        data.extend_from_slice(&le(0xFFFFFFFF));
+        data.extend_from_slice(&le(0));
+        data.extend_from_slice(&le(255));
+        assert!(prescan_biff_records(&data).is_err());
+        // H5：end < start 下溢 → 拒绝
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0200u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(&le(100));
+        data.extend_from_slice(&le(99));
+        data.extend_from_slice(&le(0));
+        data.extend_from_slice(&le(255));
+        assert!(prescan_biff_records(&data).is_err());
+        // M2：稀疏单元格包围盒（row 0 col 0 与 row 65535 col 255）→ 65536×256 超限
+        let rec = |op: u16, payload: &[u8]| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&op.to_le_bytes());
+            d.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            d.extend_from_slice(payload);
+            d
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&rec(0x027E, &{
+            let mut p = Vec::new();
+            p.extend_from_slice(&0u16.to_le_bytes());
+            p.extend_from_slice(&0u16.to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes());
+            p
+        }));
+        data.extend_from_slice(&rec(0x027E, &{
+            let mut p = Vec::new();
+            p.extend_from_slice(&65535u16.to_le_bytes());
+            p.extend_from_slice(&255u16.to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes());
+            p
+        }));
+        assert!(prescan_biff_records(&data).is_err());
+        // MULRK 列区间 end < start → 拒绝
+        let mut data = Vec::new();
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&5u16.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&rec(0x00BD, &p));
+        assert!(prescan_biff_records(&data).is_err());
+    }
+
+    #[test]
+    fn prescan_biff_allows_legal_dimensions() {
+        // BIFF8 布局（4×u16）小表 + 若干单元格照常通过（防误伤回归）
+        let rec = |op: u16, payload: &[u8]| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&op.to_le_bytes());
+            d.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            d.extend_from_slice(payload);
+            d
+        };
+        let mut data = Vec::new();
+        let mut dims = Vec::new();
+        dims.extend_from_slice(&0u16.to_le_bytes());
+        dims.extend_from_slice(&99u16.to_le_bytes());
+        dims.extend_from_slice(&0u16.to_le_bytes());
+        dims.extend_from_slice(&20u16.to_le_bytes());
+        dims.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        data.extend_from_slice(&rec(0x0200, &dims));
+        let mut cell = Vec::new();
+        cell.extend_from_slice(&0u16.to_le_bytes());
+        cell.extend_from_slice(&0u16.to_le_bytes());
+        cell.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&rec(0x027E, &cell));
+        assert!(prescan_biff_records(&data).is_ok());
+    }
 
     // 规范向量一（与 msoffcrypto-tool 6.0.0 doctest 一致，源自 Word 实际生成的文件）：
     // 口令派生 + encryptedKeyValue 解密必须得到固定的中间密钥

@@ -42,6 +42,18 @@ pub fn secure_wipe_vec(mut v: Vec<u8>) {
 ///
 /// 区间为 [offset, offset+length)，不会截断文件。
 pub fn dod_overwrite_range(file: &mut File, offset: u64, length: u64) -> io::Result<()> {
+    dod_overwrite_range_progress(file, offset, length, None)
+}
+
+/// 2.8.2：带进度的覆写实现 —— 每 pass 完成并落盘后回调一次（0→100 真实递进）。
+/// 旧实现 dod_erase 在 7 个 pass 全部写完后才把进度连发 7 次，大文件擦除期间
+/// 进度条全程 0%，用户以为卡死。
+pub(crate) fn dod_overwrite_range_progress(
+    file: &mut File,
+    offset: u64,
+    length: u64,
+    progress: Option<&dyn Fn(usize)>,
+) -> io::Result<()> {
     if length == 0 {
         return Ok(());
     }
@@ -56,7 +68,7 @@ pub fn dod_overwrite_range(file: &mut File, offset: u64, length: u64) -> io::Res
     // 旧实现每个 1MB 块都走系统熵源（慢 1-2 个数量级），大文件擦除耗时大幅下降；
     // 覆写随机数据的安全语义不变（攻击者无法预测覆写内容与原数据的关系）
     let mut rng = ChaCha20Rng::from_entropy();
-    for pass in DOD_PASSES.iter() {
+    for (i, pass) in DOD_PASSES.iter().enumerate() {
         let mut written = 0usize;
         while written < length {
             let chunk = std::cmp::min(CHUNK_SIZE, length - written);
@@ -71,6 +83,9 @@ pub fn dod_overwrite_range(file: &mut File, offset: u64, length: u64) -> io::Res
             written += chunk;
         }
         file.sync_all()?;
+        if let Some(cb) = progress {
+            cb((i + 1) * 100 / DOD_PASSES.len());
+        }
     }
     Ok(())
 }
@@ -117,14 +132,9 @@ pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::
     #[cfg(not(any(unix, windows)))]
     let mut file = OpenOptions::new().write(true).truncate(false).open(path)?;
 
-    // 复用统一的 7-pass 覆写逻辑（C7 修复）
-    dod_overwrite_range(&mut file, 0, length)?;
-
-    for (i, _) in DOD_PASSES.iter().enumerate() {
-        if let Some(cb) = progress_callback {
-            cb((i + 1) * 100 / DOD_PASSES.len());
-        }
-    }
+    // 复用统一的 7-pass 覆写逻辑（C7 修复）；
+    // 2.8.2：进度随每个 pass 完成真实上报（旧实现在全部写完后连发 7 次）
+    dod_overwrite_range_progress(&mut file, 0, length, progress_callback)?;
 
     drop(file);
     fs::remove_file(path)?;
@@ -146,11 +156,11 @@ pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::
 /// 删除，不经路径，失败时回退 `remove_file`）；非 Windows 回退
 /// `remove_file`（此时数据已被覆写，残余风险仅为删除目标被替换，
 /// 无法造成保险柜内容泄露）。
-pub fn dod_erase_handle(file: File, path: &Path) -> io::Result<()> {
+pub fn dod_erase_handle(file: File, path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::Result<()> {
     let length = file.metadata()?.len();
     let mut file = file;
     if length > 0 {
-        dod_overwrite_range(&mut file, 0, length)?;
+        dod_overwrite_range_progress(&mut file, 0, length, progress_callback)?;
     }
     #[cfg(windows)]
     {
@@ -196,25 +206,4 @@ fn mark_delete_on_close(file: &File) -> bool {
         )
     };
     ok.is_ok()
-}
-
-/// 安全删除多个文件（DoD 7-pass）
-#[allow(clippy::type_complexity)] // 2.8.1：回调签名与公开 API 兼容性优先
-pub fn dod_erase_files(paths: &[&Path], progress_callback: Option<&dyn Fn(usize, &str)>) -> io::Result<()> {
-    for (i, path) in paths.iter().enumerate() {
-        let name = path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let file_progress = |pct: usize| {
-            if let Some(cb) = &progress_callback {
-                // 当前文件进度映射到总体进度
-                let base = i * 100 / paths.len();
-                let range = 100 / paths.len();
-                let overall = base + pct * range / 100;
-                cb(overall, &name);
-            }
-        };
-        dod_erase(path, Some(&file_progress))?;
-    }
-    Ok(())
 }

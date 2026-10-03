@@ -321,7 +321,8 @@ pub fn encrypt_into(
 /// 2.6.1 起新保险柜改用 [`create_auth_tag_bound`]（绑定头部）；本函数仅用于
 /// 兼容打开 2.6.1 之前创建的保险柜，并在首次成功打开时自动迁移。
 pub fn create_auth_tag(auth_key: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key).unwrap();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key)
+            .expect("HMAC-SHA256 接受任意长度密钥，构造不可失败");
     mac.update(b"AUTH_OK");
     mac.finalize().into_bytes().into()
 }
@@ -360,7 +361,8 @@ pub fn create_auth_tag_bound(
     entry_alias: &[u8],
     entry_salt: &[u8],
 ) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key).unwrap();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key)
+            .expect("HMAC-SHA256 接受任意长度密钥，构造不可失败");
     mac.update(DOMAIN_AUTH_TAG_BOUND);
     mac.update(header_prefix);
     mac.update(entry_alias);
@@ -390,7 +392,8 @@ pub fn verify_auth_tag_bound(
 
 /// 计算头部签名（HMAC-SHA512 over first 887 bytes of header）
 pub fn compute_header_signature(payload: &[u8], sign_key: &[u8]) -> [u8; 64] {
-    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(sign_key).unwrap();
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(sign_key)
+        .expect("HMAC-SHA512 接受任意长度密钥，构造不可失败");
     mac.update(payload);
     mac.finalize().into_bytes().into()
 }

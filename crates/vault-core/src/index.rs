@@ -1,5 +1,6 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use crate::audit::AuditEntry;
 use crate::VaultError;
 
@@ -80,7 +81,9 @@ impl Index {
     }
 
     /// 归一化虚拟路径：去掉多余的 '/'、结尾 '/'、'.' 段。
-    /// 不允许 '..' 段（直接返回 None）。
+    /// 不允许 '..' 段：**越过根的 '..'（如 "/../a"）直接返回 None 而非静默
+    /// 重定向到根内路径**（2.8.2 收紧 —— 旧行为把遍历尝试悄悄变成合法路径，
+    /// 语义出人意料；段内的 ".."（如 "/foo/../bar"）仍正常折叠）。
     pub fn normalize_vpath(vpath: &str) -> Option<String> {
         if vpath.contains('\\') || vpath.contains('\0') {
             return None;
@@ -91,8 +94,10 @@ impl Index {
                 continue;
             }
             if seg == ".." {
-                // 不允许跳出根
-                parts.pop();
+                // 不允许跳出根：越界即拒绝（2.8.2 收紧）
+                if parts.pop().is_none() {
+                    return None;
+                }
                 continue;
             }
             if seg.chars().any(|c| (c as u32) < 0x20) {
@@ -104,6 +109,12 @@ impl Index {
             return Some("/".to_string());
         }
         Some(format!("/{}", parts.join("/")))
+    }
+
+    /// 2.8.2：归一化 + 校验一步完成（vault.rs 各入口的
+    /// `normalize_vpath(..).filter(validate_vpath)` 组合的单一来源）。
+    pub fn clean_vpath(vpath: &str) -> Option<String> {
+        Self::normalize_vpath(vpath).filter(|p| Self::validate_vpath(p))
     }
 }
 
@@ -163,9 +174,20 @@ impl<'a> IndexManager<'a> {
 
     pub fn remove_file(&mut self, vpath: &str) -> Result<(), VaultError> {
         let mut index = self.vault.load_index()?;
-        if index.files.remove(vpath).is_some() {
+        if let Some(meta) = index.files.remove(vpath) {
+            let (off, len) = (meta.offset, meta.length);
             self.vault.log_event(&format!("删除文件 '{}'", vpath));
             self.vault.save_index(index)?;
+            // 2.8.2：与 secure_delete_file 同一安全顺序 —— 索引落盘后再 DoD
+            // 覆写密文。旧实现只动索引不擦密文，库级调用方会拿到一套
+            // 「不擦除的删除」语义（与命令层的宣传承诺不一致）。
+            if let Some(file) = self.vault.file.as_mut() {
+                if let Err(e) = crate::wipe::dod_overwrite_range(file, off, len) {
+                    log::warn!("覆写密文失败（残留无害）: {}", e);
+                }
+                let _ = file.flush();
+                let _ = file.sync_all();
+            }
         }
         Ok(())
     }
@@ -201,8 +223,12 @@ impl<'a> IndexManager<'a> {
             .filter(|f| f.starts_with(&prefix))
             .cloned()
             .collect();
-        for f in files_to_remove {
-            index.files.remove(&f);
+        // 2.8.2：先收集密文区间（save_index 会消耗 index）
+        let mut wiped_ranges: Vec<(u64, u64)> = Vec::with_capacity(files_to_remove.len());
+        for f in &files_to_remove {
+            if let Some(meta) = index.files.remove(f) {
+                wiped_ranges.push((meta.offset, meta.length));
+            }
         }
         let dirs_to_remove: Vec<String> = index.folders.keys()
             .filter(|d| d.starts_with(&prefix))
@@ -215,6 +241,19 @@ impl<'a> IndexManager<'a> {
 
         self.vault.log_event(&format!("删除文件夹 '{}'", vpath));
         self.vault.save_index(index)?;
+
+        // 2.8.2：索引落盘后覆写密文（与 remove_file 同一收口）
+        if !wiped_ranges.is_empty() {
+            if let Some(file) = self.vault.file.as_mut() {
+                for (off, len) in &wiped_ranges {
+                    if let Err(e) = crate::wipe::dod_overwrite_range(file, *off, *len) {
+                        log::warn!("覆写密文失败（残留无害）: {}", e);
+                    }
+                }
+                let _ = file.flush();
+                let _ = file.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -247,7 +286,10 @@ impl<'a> IndexManager<'a> {
             return Err(VaultError::Other("新路径非法".into()));
         }
         // C5 修复：目标已存在时拒绝覆盖
-        if index.files.contains_key(&new_vpath) {
+        // 2.8.2：同时检查文件夹命名空间（与 add_file / rename_folder 对称）——
+        // 旧实现只查 files，把文件改名成已有文件夹的名字会制造 file/folder
+        // 同键碰撞（两套删除实现对同一 vpath 行为不同）
+        if index.files.contains_key(&new_vpath) || index.folders.contains_key(&new_vpath) {
             index.files.insert(old_vpath.to_string(), meta);
             return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
         }
@@ -285,41 +327,9 @@ impl<'a> IndexManager<'a> {
             return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
         }
 
-        // 移动所有子文件和子文件夹
-        let mut new_files = HashMap::new();
-        let mut new_folders = HashMap::new();
-        let old_prefix = format!("{}/", old_vpath);
-        let new_prefix = format!("{}/", new_vpath);
-
-        for (k, v) in &index.files {
-            if k.starts_with(&old_prefix) || k == old_vpath {
-                // AAD 冻结：密文用「重命名前的 vpath」做 AAD，必须在改 key 之前
-                // 逐个固定下来，否则整个子树改完 key 后密文全部失配（内容永久不可读）
-                let mut meta = v.clone();
-                if meta.aad_tag.is_none() {
-                    meta.aad_tag = Some(k.clone());
-                }
-                let new_key = if k == old_vpath {
-                    new_vpath.clone()
-                } else {
-                    new_prefix.to_string() + &k[old_prefix.len()..]
-                };
-                new_files.insert(new_key, meta);
-            } else {
-                new_files.insert(k.clone(), v.clone());
-            }
-        }
-        for k in index.folders.keys() {
-            if k.starts_with(&old_prefix) {
-                let new_key = new_prefix.to_string() + &k[old_prefix.len()..];
-                new_folders.insert(new_key, true);
-            } else if k == old_vpath {
-                new_folders.insert(new_vpath.clone(), true);
-            } else {
-                new_folders.insert(k.clone(), true);
-            }
-        }
-
+        // 2.8.2：子树改写收敛到共享纯函数（含子树键冲突检测）
+        let (new_files, new_folders) =
+            rewrite_folder_keys(&index.files, &index.folders, old_vpath, &new_vpath)?;
         index.files = new_files;
         index.folders = new_folders;
 
@@ -435,9 +445,17 @@ fn move_file_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Res
     if meta.aad_tag.is_none() {
         meta.aad_tag = Some(old_vpath.to_string());
     }
-    if index.files.contains_key(&new_vpath) {
+    if index.folders.contains_key(&new_vpath) || index.files.contains_key(&new_vpath) {
         index.files.insert(old_vpath.to_string(), meta);
         return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
+    }
+    // 2.8.2：同时检查文件夹命名空间（与 move_folder 对称）—— 旧实现只查 files，
+    // 把文件移动成已有文件夹的名字会制造 file/folder 同键碰撞
+    if index.folders.contains_key(&new_vpath) {
+        index.files.insert(old_vpath.to_string(), meta);
+        return Err(VaultError::Other(format!(
+            "目标路径已存在同名文件夹，无法移动为文件: {}", new_vpath
+        )));
     }
     index.files.insert(new_vpath, meta);
     Ok(())
@@ -478,20 +496,41 @@ fn move_folder_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> R
         return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
     }
 
+    // 2.8.2：子树改写收敛到共享纯函数（含子树键冲突检测）
+    let (new_files, new_folders) =
+        rewrite_folder_keys(&index.files, &index.folders, old_vpath, &new_vpath)?;
+    index.files = new_files;
+    index.folders = new_folders;
+    Ok(())
+}
+
+/// 2.8.2：文件夹子树键改写的共享纯函数（rename_folder 与 move_folder_in_index
+/// 原本各自复制一份，现收敛到此处），内含**子树键冲突检测** ——
+/// 顶层 new_vpath 的存在性检查由调用方负责，子项改写后的键仍可能撞上既有键
+/// （folders 记录缺失的遗留索引状态）。HashMap 的 insert 会**静默覆盖**旧元数据
+/// （原文件密文变孤儿、内容丢失），因此用「键数量不变」作为冲突锚点：
+/// 任何一次碰撞都会让 map 变小。
+fn rewrite_folder_keys(
+    files: &HashMap<String, FileMeta>,
+    folders: &HashMap<String, bool>,
+    old_vpath: &str,
+    new_vpath: &str,
+) -> Result<(HashMap<String, FileMeta>, HashMap<String, bool>), VaultError> {
     let mut new_files = HashMap::new();
     let mut new_folders = HashMap::new();
     let old_prefix = format!("{}/", old_vpath);
     let new_prefix = format!("{}/", new_vpath);
 
-    for (k, v) in &index.files {
+    for (k, v) in files {
         if k.starts_with(&old_prefix) || k == old_vpath {
-            // AAD 冻结（与 rename_folder 相同）
+            // AAD 冻结：密文用「重命名前的 vpath」做 AAD，必须在改 key 之前
+            // 逐个固定下来，否则整个子树改完 key 后密文全部失配（内容永久不可读）
             let mut meta = v.clone();
             if meta.aad_tag.is_none() {
                 meta.aad_tag = Some(k.clone());
             }
             let new_key = if k == old_vpath {
-                new_vpath.clone()
+                new_vpath.to_string()
             } else {
                 new_prefix.to_string() + &k[old_prefix.len()..]
             };
@@ -500,18 +539,22 @@ fn move_folder_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> R
             new_files.insert(k.clone(), v.clone());
         }
     }
-    for k in index.folders.keys() {
+    for k in folders.keys() {
         if k.starts_with(&old_prefix) {
             new_folders.insert(new_prefix.to_string() + &k[old_prefix.len()..], true);
         } else if k == old_vpath {
-            new_folders.insert(new_vpath.clone(), true);
+            new_folders.insert(new_vpath.to_string(), true);
         } else {
             new_folders.insert(k.clone(), true);
         }
     }
-    index.files = new_files;
-    index.folders = new_folders;
-    Ok(())
+
+    if new_files.len() != files.len() || new_folders.len() != folders.len() {
+        return Err(VaultError::Other(
+            "目标路径与现有文件/文件夹冲突（子项重名），已中止操作".into(),
+        ));
+    }
+    Ok((new_files, new_folders))
 }
 
 #[cfg(test)]
@@ -539,5 +582,65 @@ mod tests {
         assert_eq!(Index::normalize_vpath("/foo/bar/").as_deref(), Some("/foo/bar"));
         assert_eq!(Index::normalize_vpath("/").as_deref(), Some("/"));
         assert_eq!(Index::normalize_vpath("///").as_deref(), Some("/"));
+        // 2.8.2：越过根的 '..' 拒绝而非静默重定向到根内路径
+        assert_eq!(Index::normalize_vpath("/../evil.txt"), None);
+        assert_eq!(Index::normalize_vpath("/../.."), None);
+        // 段内的 '..' 仍正常折叠
+        assert_eq!(Index::normalize_vpath("/foo/../bar").as_deref(), Some("/bar"));
     }
+
+    // 2.8.2：clean_vpath 组合语义
+    #[test]
+    fn test_clean_vpath() {
+        assert_eq!(Index::clean_vpath("/foo//bar/").as_deref(), Some("/foo/bar"));
+        assert_eq!(Index::clean_vpath("/foo/../.."), None);
+        // 归一化补全前导斜杠是历史行为（"plain.txt" → "/plain.txt"，导入路径兼容）
+        assert_eq!(Index::clean_vpath("foo").as_deref(), Some("/foo"));
+    }
+
+    // 2.8.2：文件移动的文件夹命名空间碰撞检查（move_file_in_index 纯函数）
+    #[test]
+    fn test_move_file_rejects_folder_collision() {
+        let mut idx = Index::new();
+        idx.folders.insert("/x/notes".into(), true);
+        idx.files.insert("/notes".into(), FileMeta {
+            name: "notes".into(), size: 1, offset: 0, length: 10, aad_tag: None,
+        });
+        // 把文件 /notes 移入 /x：目标 /x/notes 已是文件夹 → 必须拒绝，
+        // 且源条目保持原位（回滚）
+        let r = super::move_file_in_index(&mut idx, "/notes", "/x");
+        assert!(r.is_err(), "移动成已有文件夹的名字必须被拒绝");
+        assert!(idx.files.contains_key("/notes"), "拒绝后源文件不得丢失");
+        assert!(!idx.files.contains_key("/x/notes"), "不得产生 file/folder 同键碰撞");
+    }
+
+    // 2.8.2：文件夹改名的子树键冲突检测（键数量锚点）
+    #[test]
+    fn test_rename_folder_subtree_collision_is_rejected() {
+        // 构造「folders 缺少 /b 记录」的遗留形态索引：/b/c.txt 存在但没有 /b 文件夹
+        let mut idx = Index::new();
+        idx.files.insert("/b/c.txt".into(), FileMeta {
+            name: "c.txt".into(), size: 1, offset: 0, length: 10, aad_tag: None,
+        });
+        idx.folders.insert("/a".into(), true);
+        idx.files.insert("/a/d.txt".into(), FileMeta {
+            name: "d.txt".into(), size: 1, offset: 5, length: 10, aad_tag: None,
+        });
+        idx.folders.insert("/a/sub".into(), true);
+        // /a 改名为 /b：/a/d.txt → /b/d.txt 不冲突，但 /a/sub → /b/sub 与
+        // 隐含的 /b 子树无冲突，而 /b/c.txt 保持 —— 顶层 /b 未被 folders 记录，
+        // 旧实现顶层检查放行；子树改写键数不变则允许（无碰撞）
+        // 这里验证的是「有碰撞时拒绝」：让 /a 下有 /a/c.txt 与既有 /b/c.txt 相撞
+        idx.files.insert("/a/c.txt".into(), FileMeta {
+            name: "c.txt".into(), size: 2, offset: 99, length: 10, aad_tag: None,
+        });
+        // 改名 /a → /b：/a/c.txt → /b/c.txt 与既有 /b/c.txt 相撞 → 必须拒绝
+        let r = super::rewrite_folder_keys(&idx.files, &idx.folders, "/a", "/b");
+        assert!(r.is_err(), "子树键碰撞必须被拒绝（否则静默覆盖丢数据）");
+        assert_eq!(idx.files.get("/b/c.txt").unwrap().offset, 0, "既有 /b/c.txt 不得被覆盖");
+        assert!(idx.files.contains_key("/a/c.txt"), "源子树保持原状");
+        // 无碰撞的改名照常通过
+        assert!(super::rewrite_folder_keys(&idx.files, &idx.folders, "/a", "/c").is_ok());
+    }
+
 }

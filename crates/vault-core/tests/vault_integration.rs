@@ -145,16 +145,17 @@ fn import_files_batch_counts_and_persists() {
                 .to_string()
         })
         .collect();
-    let (ok, fail) = v.import_files_batch(&srcs, "/").expect("批量导入失败");
+    let (ok, fail, _errors) = v.import_files_batch(&srcs, "/").expect("批量导入失败");
     assert_eq!((ok, fail), (5, 0));
 
     // 不存在的文件计入失败，不影响其余导入
     let mut with_bad = srcs.clone();
     with_bad.push(dir.join("no_such_file.bin").to_string_lossy().to_string());
-    let (ok2, fail2) = v
+    let (ok2, fail2, errors2) = v
         .import_files_batch(&with_bad, "/dir2")
         .expect("批量导入（含失败项）不应整体失败");
     assert_eq!((ok2, fail2), (5, 1));
+    assert_eq!(errors2.len(), 1, "失败明细应随返回值给出");
 
     // 重新打开验证持久化（同时验证索引缓存路径与磁盘一致）
     drop(v);
@@ -388,7 +389,7 @@ fn extract_all_files_counts() {
     v.import_files_batch(&srcs, "/x/y").unwrap();
 
     let out = dir.join("export");
-    let (ok, fail) = v.extract_all_files(&out, true).unwrap();
+    let (ok, fail, _errors) = v.extract_all_files(&out, true).unwrap();
     assert_eq!((ok, fail), (4, 0));
     // vault-name 根目录由 Tauri 命令层负责创建；核心 API 只保留虚拟路径层级
     assert!(out.join("x/y/e0.txt").exists(), "应保留虚拟路径层级 x/y/");
@@ -498,10 +499,13 @@ fn vpath_validation_neutralizes_traversal() {
         assert!(r.is_err(), "非法 vpath 应被拒绝: {:?}", bad);
     }
 
-    // 「..」段被归一化中和到根内（不可能逃逸），落在 /evil.txt
-    v.import_file(&src, "/../evil.txt").expect("遍历段应被归一化而非报错");
+    // 2.8.2：越过根的「..」直接拒绝（旧行为是静默中和到根内路径，语义出人意料）
+    let r = v.import_file(&src, "/../evil.txt");
+    assert!(r.is_err(), "越过根的 .. 应被拒绝而非静默重定向");
+    // 段内的「..」仍正常中和到根内
+    v.import_file(&src, "/docs/../evil.txt").expect("段内 .. 应被中和");
     let idx = v.load_index().unwrap();
-    assert!(idx.files.contains_key("/evil.txt"), ".. 应被中和为根内路径");
+    assert!(idx.files.contains_key("/evil.txt"), "段内 .. 应被中和为根内路径");
     assert!(
         idx.files.keys().all(|k| k.starts_with('/')),
         "所有 vpath 必须以 / 开头"

@@ -156,14 +156,30 @@ fn open_vault_rw(path: &Path, create: bool) -> std::io::Result<File> {
     // 句柄级确认：重解析点（含符号链接）一律拒绝 —— 打开必然锚定文件本体
     #[cfg(windows)]
     {
-        if file.metadata()?.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "拒绝通过符号链接 / 重解析点打开保险柜文件",
-            ));
-        }
+        verify_no_reparse(&file)?;
     }
     Ok(file)
+}
+
+/// 2.8.2：句柄级确认「不是任何重解析点」。
+///
+/// 旧实现只查 `file_type().is_symlink()`，仅覆盖 IO_REPARSE_TAG_SYMLINK ——
+/// 挂载点、OneDrive 按需占位文件（cloud tag）等其他 reparse tag 全部放行，
+/// 与「重解析点一律拒绝」的文档承诺不符；且以 FILE_FLAG_OPEN_REPARSE_POINT
+/// 打开云占位保险柜可能读到占位元数据而非水合后的数据。现改为直接检查
+/// FILE_ATTRIBUTE_REPARSE_POINT 位，覆盖一切 tag。
+#[cfg(windows)]
+fn verify_no_reparse(file: &File) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let md = file.metadata()?;
+    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || md.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "拒绝通过符号链接 / 重解析点打开保险柜文件",
+        ));
+    }
+    Ok(())
 }
 
 /// 2.7.1 新增：以 create_new 语义独占创建保险柜文件（目标已存在时失败，
@@ -592,7 +608,14 @@ fn write_header_v5(
     let hmac = lock_state.compute_hmac(&mac_key);
     header[LOCK_OFFSET_V5 + 9..LOCK_OFFSET_V5 + 9 + 32].copy_from_slice(&hmac);
 
-    let sig = compute_header_signature(&header[..SIGNED_LENGTH_V5], sign_key);
+    // 2.8.2（M1）：签名按「锁区置零的规范形」计算 —— 锁区字节本身仍按
+    // lock_state 写入文件，但签名只覆盖规范形（见 canonical_signed_bytes_v5）。
+    // 会话内写入时锁区恒为零，规范形与实际字节一致；签名因此对失败尝试
+    // 写锁区免疫，且任何其他字段的篡改/回滚都会破坏签名。
+    let sig = {
+        let canonical = canonical_signed_bytes_v5(&header);
+        compute_header_signature(&canonical, sign_key)
+    };
     header[SIGNATURE_OFFSET_V5..SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE].copy_from_slice(&sig);
 
     file.seek(SeekFrom::Start(0))?;
@@ -638,7 +661,9 @@ fn read_decrypt_file_data(
     file.seek(SeekFrom::Start(offset))?;
     let mut enc_data = vec![0u8; length as usize];
     file.read_exact(&mut enc_data)?;
-    decrypt_gcm(enc_key, &enc_data, aad).ok_or(VaultError::DecryptFailed)
+    // 2.8.2：改用就地解密（decrypt_into 缓冲复用）—— 热路径（读文件/预览/
+    // 提取/体检）省一份全尺寸分配；解密失败时缓冲随 drop 释放（密文非敏感）。
+    decrypt_into(enc_key, enc_data, aad).ok_or(VaultError::DecryptFailed)
 }
 
 /// 安全文件名清理
@@ -846,10 +871,26 @@ fn key_wrap_aad(header_prefix: &[u8; 105], entry_alias: &[u8], entry_salt: &[u8;
     aad
 }
 
+/// 2.8.2（M1）：v5 头部签名的**规范形** —— 计算签名前把锁定区字节（1642..1683）
+/// 置零。锁定区位于签名范围（..1984）内，但创建时与会话内锁定区恒为零（失败
+/// 尝试只发生在打开阶段，成功打开即重置锁区并全量重签），因此历史上所有合法
+/// 签名都等于「锁区置零的规范形」签名。写入与校验共用此规范形：
+/// - 失败尝试写锁区不再使签名失真（L4 的根治）；
+/// - 签名范围内任何字段被篡改/回滚（含 index_offset/index_length —— 它们不在
+///   auth_tag AAD、key_wrap AAD、锁区 HMAC 的任何覆盖范围内）都会破坏签名。
+fn canonical_signed_bytes_v5(header: &[u8; HEADER_SIZE_V5]) -> Vec<u8> {
+    let mut canonical = header.clone();
+    canonical[LOCK_OFFSET_V5..LOCK_OFFSET_V5 + 41].fill(0);
+    canonical[..SIGNED_LENGTH_V5].to_vec()
+}
+
 /// 2.8.0（v5）：恒定时间校验 v5 头部签名（覆盖 header[..1984]，签名在 1984..2048）。
-/// 仅用于「分区密码正确但索引校验失败」时的诊断取证（与 v4 的 verify_header_signature 同角色）。
+/// 2.8.2（M1）：按「锁区置零的规范形」校验 —— 与 write_header_v5 的签名计算
+/// 严格一致；仅用于「分区密码正确但索引校验失败」时的诊断取证，以及成功开柜
+/// 路径的强制验签。
 fn verify_header_signature_v5(header: &[u8; HEADER_SIZE_V5], sign_key: &[u8; 32]) -> bool {
-    let computed = compute_header_signature(&header[..SIGNED_LENGTH_V5], sign_key);
+    let canonical = canonical_signed_bytes_v5(header);
+    let computed = compute_header_signature(&canonical, sign_key);
     use subtle::ConstantTimeEq;
     computed
         .ct_eq(&header[SIGNATURE_OFFSET_V5..SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE])
@@ -913,9 +954,19 @@ impl Vault {
     /// 2.4.1 新增：写审计并置脏标记（统一入口）。
     /// 旧实现审计在各处手动 add，close() 无条件全量重写索引以持久化审计；
     /// 现在只有 audit_dirty=true 时 close() 才补一次 save_index。
+    /// 2.8.2（L13）：审计消息可能含攻击者可控的 vpath —— 入库前把控制字符
+    /// 替换为 '?' 并截断到 200 字符，防止伪造审计条目结构 / 超长条目膨胀索引。
     pub(crate) fn log_event(&mut self, msg: &str) {
+        let sanitized: String = msg
+            .chars()
+            .map(|c| {
+                let cu = c as u32;
+                if cu < 0x20 || cu == 0x7f { '?' } else { c }
+            })
+            .take(200)
+            .collect();
         if let Some(ref mut audit) = self.audit {
-            audit.add(msg);
+            audit.add(&sanitized);
         }
         self.audit_dirty = true;
     }
@@ -999,6 +1050,33 @@ impl Vault {
                 if &magic == MAGIC {
                     return Err(VaultError::Other(
                         "目标路径已存在一个保险柜文件，拒绝覆盖（请选择其他位置或先手动删除）".into(),
+                    ));
+                }
+            }
+            // 2.8.2：硬链接别名防护 —— 句柄锚定防住了「确认后被换成保险柜」，
+            // 但防不住「普通文件是受害者文件的硬链接」：set_len(0) + 后续写入
+            // 作用在共享 inode 上，会把用户从未同意覆盖的另一个链接目标清零。
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows::Win32::Foundation::HANDLE;
+                use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                let ok = unsafe {
+                    GetFileInformationByHandle(HANDLE(file.as_raw_handle() as isize), &mut info)
+                };
+                if ok.is_ok() && info.nNumberOfLinks > 1 {
+                    return Err(VaultError::Other(
+                        "目标文件存在多个硬链接，拒绝覆盖（请先删除其他链接或选择其他位置）".into(),
+                    ));
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if file.metadata()?.nlink() > 1 {
+                    return Err(VaultError::Other(
+                        "目标文件存在多个硬链接，拒绝覆盖（请先删除其他链接或选择其他位置）".into(),
                     ));
                 }
             }
@@ -1367,7 +1445,9 @@ impl Vault {
                     use subtle::ConstantTimeEq;
                     bool::from(p.salt.ct_eq(&matched_salt) & p.auth_tag.ct_eq(&matched_tag))
                 })
-                .ok_or_else(|| VaultError::Other("内部错误：匹配分区丢失".into()))?;
+                .ok_or_else(|| VaultError::Other(
+                    "头部与数据不匹配：找不到对应的分区（文件可能被篡改、损坏或与其他保险柜混用）".into(),
+                ))?;
 
             lock_state.reset();
             self.lock_state = lock_state;
@@ -1397,6 +1477,10 @@ impl Vault {
             self.sign_key = Some(sign_key);
 
             let mut audit = AuditLog::from_entries(index.audit.clone(), auth_key);
+            // 2.8.2：恢复时丢弃过尾部条目 → 显式写入告警（不再静默截断）
+            if audit.is_truncated() {
+                audit.add("警告：审计链存在无法校验的条目，部分历史记录可能被篡改或损坏");
+            }
             audit.add("保险柜已解锁");
             self.audit = Some(audit);
 
@@ -1504,9 +1588,26 @@ impl Vault {
                     })
                     .collect()
             });
+            // 2.8.2：`?` 早退时 results 中尚未 push 的 KEK 是裸 [u8;32] 数组
+            // （Copy，drop 是空操作），会以明文残留堆内存 —— 改为先全部收进
+            // Zeroizing 容器再决定成败，任何路径 drop 即清零。
+            let mut chunk_keks: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(results.len());
+            let mut first_err: Option<VaultError> = None;
             for r in results {
-                kek_list.push(Zeroizing::new(r?));
+                match r {
+                    Ok(k) => chunk_keks.push(Zeroizing::new(k)),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
             }
+            if let Some(e) = first_err {
+                // chunk_keks 是 Zeroizing，drop 即清零
+                return Err(e);
+            }
+            kek_list.extend(chunk_keks);
         }
 
         // 阶段 2：逐条目解包 + 认证标签校验（轻量，全部尝试保持恒定时间语义）。
@@ -1563,6 +1664,17 @@ impl Vault {
         for k in kek_list.iter_mut() { k.zeroize(); }
 
         if let Some((idx, index, keys, data_key)) = matched {
+            // 2.8.2（M1）：认证成功后、使用索引前**强制校验头部签名**（规范形）。
+            // index_offset / index_length 不在 auth_tag AAD、key_wrap AAD、锁区
+            // HMAC 的任何覆盖范围内 —— 此前成功开柜从不验签，文件写攻击者
+            // （云同步版本回滚 / 备份恢复）可以替换这两个字段让受害者用正确
+            // 口令静默加载旧索引（已删除条目复活、审计链回滚）。签名覆盖全部
+            // 头部字段，任何篡改/回滚在这里被拒绝。密钥均为 ZeroizeOnDrop，早退安全。
+            if !verify_header_signature_v5(&header, &keys.sign_key) {
+                return Err(VaultError::Other(
+                    "头部签名校验失败 —— 头部可能被篡改或回滚（文件可能被替换为更早版本的副本）。为避免进一步损坏，请勿向此保险柜写入任何数据".into(),
+                ));
+            }
             // 过滤出真实分区（伪条目随机数据几乎不可能通过认证）
             let real_partitions: Vec<PartitionInfo> = parsed.iter()
                 .filter(|p| is_plausible_alias(&p.alias))
@@ -1576,7 +1688,9 @@ impl Vault {
                     use subtle::ConstantTimeEq;
                     bool::from(p.salt.ct_eq(&matched_salt) & p.auth_tag.ct_eq(&matched_tag))
                 })
-                .ok_or_else(|| VaultError::Other("内部错误：匹配分区丢失".into()))?;
+                .ok_or_else(|| VaultError::Other(
+                    "头部与数据不匹配：找不到对应的分区（文件可能被篡改、损坏或与其他保险柜混用）".into(),
+                ))?;
 
             lock_state.reset();
             self.lock_state = lock_state;
@@ -1591,6 +1705,10 @@ impl Vault {
             self.data_key = Some(*data_key); // Zeroizing 解包存入会话
 
             let mut audit = AuditLog::from_entries(index.audit.clone(), keys.auth_key);
+            // 2.8.2：恢复时丢弃过尾部条目 → 显式写入告警（不再静默截断）
+            if audit.is_truncated() {
+                audit.add("警告：审计链存在无法校验的条目，部分历史记录可能被篡改或损坏");
+            }
             audit.add("保险柜已解锁");
             self.audit = Some(audit);
 
@@ -1822,23 +1940,41 @@ impl Vault {
         let plain = serde_json::to_vec(&empty_index)?;
         let enc = encrypt_gcm(&keys.enc_key, &plain, b"index", None)?;
 
-        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&enc)?;
-        file.flush()?;
-        file.sync_all()?;
+        // 新分区的空索引先追加到文件尾（获得偏移量）；此步之后头部写入若失败，
+        // 这段密文成为无害死空间（头部仍指向旧布局，碎片整理可回收）
+        let (offset, enc_len) = {
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            let offset = file.seek(SeekFrom::End(0))?;
+            file.write_all(&enc)?;
+            file.flush()?;
+            file.sync_all()?;
+            (offset, enc.len() as u64)
+        };
 
-        self.partitions.push(PartitionInfo {
+        // 2.8.2（崩溃一致性）：先写头部、成功后才提交内存 —— 旧实现先
+        // partitions.push 再 update_header，头部写入失败时内存与磁盘分叉，
+        // 后续任意一次 save_index/update_header 都会把「失败的添加」持久化。
+        let new_entry = PartitionInfo {
             alias: alias.into(),
             salt: part_salt,
             auth_tag,
             index_offset: offset,
-            index_length: enc.len() as u64,
+            index_length: enc_len,
             wrapped_key,
-        });
+        };
+        {
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
+            let mut new_partitions = self.partitions.clone();
+            new_partitions.push(new_entry.clone());
+            write_header_to_file(
+                file, self.format_version, &self.lock_state, &self.salt,
+                &new_partitions, sign_key,
+            )?;
+            self.partitions = new_partitions;
+        }
 
-        self.log_event(&format!("添加伪装分区 '{}'", alias));
-        self.update_header()?;
+        self.log_event(&format!("添加伪装分区 '{}'", new_entry.alias));
         keys.zeroize();
         secure_wipe_vec(plain);
         Ok(())
@@ -1855,16 +1991,27 @@ impl Vault {
 
         // 2.3.0 顺序修正：先持久化「分区已删除」（update_header），再擦除旧索引区。
         // 旧实现先擦后更新头部，擦除后崩溃会让头部仍指向已被覆盖的索引 → 永久损坏。
+        // 2.8.2（崩溃一致性）：先写头部、成功后才提交内存 —— 旧实现先改
+        // partitions/active_partition 再 update_header，写入失败时内存与磁盘分叉。
         let p = self.partitions[pos].clone();
-        self.partitions.remove(pos);
+        let mut new_partitions = self.partitions.clone();
+        new_partitions.remove(pos);
         // 调整活跃分区索引：如果删除的位置在当前活跃分区之前，活跃索引需要减 1
-        if let Some(active) = self.active_partition {
-            if pos < active {
-                self.active_partition = Some(active - 1);
-            }
+        let new_active = match self.active_partition {
+            Some(active) if pos < active => Some(active - 1),
+            other => other,
+        };
+        {
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
+            write_header_to_file(
+                file, self.format_version, &self.lock_state, &self.salt,
+                &new_partitions, sign_key,
+            )?;
         }
+        self.partitions = new_partitions;
+        self.active_partition = new_active;
         self.log_event(&format!("删除分区 '{}'", alias));
-        self.update_header()?;
 
         // 擦除旧索引区（尽力而为）。已知限制：该分区的文件密文因无分区密码无法定位，
         // 无法一并擦除（README「已知限制」已说明）；保险柜整体销毁时会一并擦除。
@@ -2255,11 +2402,16 @@ impl Vault {
         if !self.is_open() {
             return Err(VaultError::NotOpen);
         }
-        let index = self.load_index()?;
-        let mut items: Vec<(String, u64, u64, Option<String>)> = index.files.iter()
-            .map(|(k, m)| (k.clone(), m.offset, m.length, m.aad_tag.clone()))
-            .collect();
-        items.sort_by(|a, b| a.0.cmp(&b.0));
+        // 2.8.2：走只读借用（index_ref），免去整索引深拷贝
+        let mut items: Vec<(String, u64, u64, Option<String>)> = {
+            let index = self.index_ref()?;
+            index.files.iter()
+                .map(|(k, m)| (k.clone(), m.offset, m.length, m.aad_tag.clone()))
+                .collect()
+        };
+        // 2.8.2：按物理偏移排序 —— 逐文件解密时对保险柜文件顺序读
+        //（HDD / 网络盘收益明显），旧实现按路径排序导致随机跳转
+        items.sort_by_key(|x| x.1);
         let total = items.len();
         let enc_key = *self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
         let mut broken: Vec<IntegrityIssue> = Vec::new();
@@ -2291,9 +2443,11 @@ impl Vault {
             return Vec::new();
         }
         let q_lower = q.to_lowercase();
-        // 先做零分配的大小写敏感匹配（小写名/中文命中绝大多数查询），
-        // 未命中再对候选做原地 ASCII 折叠后匹配 —— 语义与旧 to_lowercase
-        // 全折叠相比仅收窄「非 ASCII 大小写变形」（如 ß↔SS）这一罕见情形。
+        // 大小写不敏感匹配（2.8.2 修正 2.8.1 的回归）：先做零分配的
+        // 大小写敏感匹配（小写名/中文命中绝大多数查询），未命中再做原地
+        // ASCII 折叠；2.8.1 只做了 ASCII 折叠，导致 É↔é、К↔к 等非 ASCII
+        // 大小写变形不再命中 —— 现对含大写非 ASCII 字符的候选补一次完整的
+        // Unicode 折叠（这类候选是少数，均摊成本可控）。
         fn contains_ci(buf: &mut String, haystack: &str, needle: &str, needle_lower: &str) -> bool {
             if haystack.contains(needle) {
                 return true;
@@ -2301,7 +2455,16 @@ impl Vault {
             buf.clear();
             buf.push_str(haystack);
             buf.as_mut_str().make_ascii_lowercase();
-            buf.contains(needle_lower)
+            if buf.contains(needle_lower) {
+                return true;
+            }
+            // 存在非 ASCII 大写字符 → ASCII 折叠不够，完整 Unicode 折叠后再试
+            if haystack.chars().any(|c| c.is_uppercase()) {
+                buf.clear();
+                buf.push_str(&haystack.to_lowercase());
+                return buf.contains(needle_lower);
+            }
+            false
         }
         let mut fold_buf = String::new();
         let mut hits: Vec<SearchHit> = Vec::new();
@@ -2326,8 +2489,9 @@ impl Vault {
     }
 
     /// 2.8.0：列出当前分区全部文件夹 vpath（移动选择器用，已排序）。
-    pub fn list_all_folders(&mut self) -> Result<Vec<String>, VaultError> {
-        let index = self.load_index()?;
+    /// 2.8.2：走只读借用（index_ref），免去整索引深拷贝。
+    pub fn list_all_folders(&self) -> Result<Vec<String>, VaultError> {
+        let index = self.index_ref()?;
         let mut v: Vec<String> = index.folders.keys().cloned().collect();
         v.sort();
         Ok(v)
@@ -2338,7 +2502,7 @@ impl Vault {
     /// 导入单个文件（独立命令路径：加载缓存索引 → 写入 → 单次 save_index）。
     pub fn import_file(&mut self, src_path: &Path, vpath: &str) -> Result<(), VaultError> {
         let mut index = self.load_index()?;
-        self.import_file_into_index(&mut index, src_path, vpath)?;
+        self.import_file_into_index(&mut index, src_path, vpath, true)?;
         self.save_index(index)
     }
 
@@ -2347,27 +2511,37 @@ impl Vault {
     /// 旧实现（前端循环调用 import_file）N 个文件 = N 次全量索引重写
     /// + N×10 次 fsync；现在批量路径只有 1 次。
     ///
-    /// 返回 (成功数, 失败数)。单个文件失败记录日志后继续。
+    /// 返回 (成功数, 失败数, 失败明细)。单个文件失败记录日志后继续。
+    /// 2.8.2：新增条目数上限与失败明细返回 —— 旧实现只返回计数，注释声称
+    /// 「明细已反馈前端」但根本没有明细出口。
     pub fn import_files_batch(
         &mut self,
         src_paths: &[String],
         dest_base: &str,
-    ) -> Result<(usize, usize), VaultError> {
+    ) -> Result<(usize, usize, Vec<String>), VaultError> {
+        if src_paths.len() > MAX_IMPORT_ENTRIES {
+            return Err(VaultError::Other(format!(
+                "单次导入条目数超过安全上限（{}）",
+                MAX_IMPORT_ENTRIES
+            )));
+        }
         let mut index = self.load_index()?;
         let base_clean = dest_base.trim_end_matches('/');
         let mut ok = 0usize;
         let mut fail = 0usize;
+        let mut errors: Vec<String> = Vec::new();
         for p in src_paths {
             let src = std::path::Path::new(p);
             let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
             let vpath = format!("{}/{}", base_clean, name);
-            match self.import_file_into_index(&mut index, src, &vpath) {
+            match self.import_file_into_index(&mut index, src, &vpath, false) {
                 Ok(()) => ok += 1,
-                Err(_) => {
+                Err(e) => {
                     fail += 1;
+                    errors.push(format!("{}: {}", name, e));
                     // 2.8.1：不再把含 vpath 的错误写入明文日志（违反 2.6.1 自定规则），
-                    // 失败明细只反馈给前端逐项展示
-                    log::warn!("批量导入有失败项（明细已反馈前端）");
+                    // 失败明细经返回值反馈给前端逐项展示
+                    log::warn!("批量导入有失败项（明细已随返回值反馈）");
                 }
             }
         }
@@ -2376,23 +2550,28 @@ impl Vault {
             self.log_event(&format!("批量导入：成功 {} 个，失败 {} 个", ok, fail));
         }
         if ok > 0 {
+            // 2.8.2：批量路径的密文写入省掉了逐文件 fsync —— save_index 的
+            // sync_all 作用于同一句柄，会连带刷出全部已写密文，崩溃安全不变
             self.save_index(index)?;
         }
-        Ok((ok, fail))
+        Ok((ok, fail, errors))
     }
 
     /// 2.4.1 新增（从 import_file 抽取）：把一个文件加密追加到保险柜并更新**内存中的**索引。
     /// 不写盘、不审计 —— 由调用方决定单文件（import_file：逐次落盘）
     /// 或批量（import_files_batch / import_folder：最后一次落盘）策略。
+    /// 2.8.2：`sync_each` 控制是否逐文件 fsync —— 批量路径传 false，由调用方在
+    /// save_index 时统一 sync_all（同句柄 sync_all 会连带刷出全部已写密文），
+    /// 千文件批量导入从 N 次 fsync 降为 1 次。
     fn import_file_into_index(
         &mut self,
         index: &mut Index,
         src_path: &Path,
         vpath: &str,
+        sync_each: bool,
     ) -> Result<(), VaultError> {
-        // M5 修复：归一化 + 校验虚拟路径
-        let vpath = Index::normalize_vpath(vpath)
-            .filter(|p| Index::validate_vpath(p))
+        // M5 修复：归一化 + 校验虚拟路径（2.8.2：收敛到 clean_vpath 单一来源）
+        let vpath = Index::clean_vpath(vpath)
             .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
 
         // C5 修复：检查重名，避免静默覆盖
@@ -2448,8 +2627,10 @@ impl Vault {
         let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         let offset = file.seek(SeekFrom::End(0))?;
         file.write_all(&encrypted)?;
-        file.flush()?;
-        file.sync_all()?;
+        if sync_each {
+            file.flush()?;
+            file.sync_all()?;
+        }
 
         // 直接更新内存索引（与 IndexManager::add_file 相同语义），
         // 由调用方统一 save_index
@@ -2545,7 +2726,11 @@ impl Vault {
     /// 阶段 2 用**单份内存索引**逐文件加密追加，最后一次性 save_index。
     /// 旧实现每导入一个文件都 load_index ×2 + save_index 全量重写一次，
     /// 1000 个文件 ≈ 2000 次解密加载 + 1000 次全量索引写 + 7000+ 次 fsync。
-    pub fn import_folder(&mut self, src: &Path, base: &str) -> Result<(), VaultError> {
+    /// 返回 (成功数, 失败数, 跳过的符号链接数)。
+    /// 2.8.2 修复两点：① 空目录（或全部内容都是符号链接）也会登记文件夹
+    /// 条目 —— 旧实现静默丢弃，用户以为导入成功却什么都没有；② 符号链接
+    /// 跳过数真实计入返回值（旧日志谎称「已计入失败计数」）。
+    pub fn import_folder(&mut self, src: &Path, base: &str) -> Result<(usize, usize, usize), VaultError> {
         let source_meta = fs::symlink_metadata(src)?;
         if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
             return Err(VaultError::Other("导入源必须是非链接目录".into()));
@@ -2557,49 +2742,83 @@ impl Vault {
         // 阶段 1：收集（无 self 借用，纯遍历）
         let mut collected: Vec<(PathBuf, String)> = Vec::new();
         let mut entries_seen = 0usize;
+        let mut skipped_symlinks = 0usize;
         Self::collect_import_files(
             src,
             &format!("{}/{}", base_clean, base_name),
             0,
             &mut entries_seen,
             &mut collected,
+            &mut skipped_symlinks,
         )?;
-        if collected.is_empty() {
-            return Ok(());
-        }
 
         // 阶段 2：单份索引逐文件导入，最后一次落盘
         let mut index = self.load_index()?;
+
+        // 2.8.2：根文件夹条目先登记（空目录也要有）；若同名**文件**已存在
+        // 则是命名空间碰撞，明确拒绝
+        let root_vpath = Index::clean_vpath(&format!("{}/{}", base_clean, base_name))
+            .ok_or_else(|| VaultError::Other("无效的目标路径".into()))?;
+        if index.files.contains_key(&root_vpath) {
+            return Err(VaultError::Other(format!(
+                "目标路径已存在同名文件，无法导入为文件夹: {}", root_vpath
+            )));
+        }
+        let root_folder_new = !index.folders.contains_key(&root_vpath);
+        if root_folder_new {
+            index.folders.insert(root_vpath, true);
+        }
+
+        if collected.is_empty() {
+            // 空目录：仅登记文件夹本身
+            self.log_event(&format!(
+                "导入空文件夹 '{}'（含 0 个文件，跳过 {} 个符号链接）",
+                base_name, skipped_symlinks
+            ));
+            self.save_index(index)?;
+            return Ok((0, 0, skipped_symlinks));
+        }
+
         let mut ok = 0usize;
         let mut fail = 0usize;
+        let mut errors: Vec<String> = Vec::new();
         for (src_path, dest_vpath) in collected {
-            match self.import_file_into_index(&mut index, &src_path, &dest_vpath) {
+            match self.import_file_into_index(&mut index, &src_path, &dest_vpath, false) {
                 Ok(()) => ok += 1,
-                Err(_) => {
+                Err(e) => {
                     fail += 1;
+                    errors.push(format!("{}: {}", dest_vpath.rsplit('/').next().unwrap_or(""), e));
                     // 2.8.1：不再把含 vpath 的错误写入明文日志（违反 2.6.1 自定规则），
-                    // 失败明细只反馈给前端逐项展示
-                    log::warn!("批量导入有失败项（明细已反馈前端）");
+                    // 失败明细经返回值反馈给前端逐项展示
+                    log::warn!("批量导入有失败项（明细已随返回值反馈）");
                 }
             }
         }
         self.log_event(&format!(
-            "导入文件夹 '{}'：成功 {} 个文件，失败 {} 个",
-            base_name, ok, fail
+            "导入文件夹 '{}'：成功 {} 个文件，失败 {} 个，跳过 {} 个符号链接",
+            base_name, ok, fail, skipped_symlinks
         ));
-        if ok > 0 {
+        // 2.8.2：失败但根文件夹是新登记时也要落盘（保持「文件夹已导入」语义）
+        if ok > 0 || root_folder_new {
+            if ok > 0 {
+                let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+                file.flush()?;
+                file.sync_all()?;
+            }
             self.save_index(index)?;
         }
-        Ok(())
+        Ok((ok, fail, skipped_symlinks))
     }
 
     /// 2.4.1 新增：递归收集待导入文件（原 walk_import 的遍历部分，去掉了 self 依赖）。
+    /// 2.8.2：`skipped_symlinks` 真实统计跳过的符号链接数。
     fn collect_import_files(
         current: &Path,
         dest_root: &str,
         depth: usize,
         entries_seen: &mut usize,
         out: &mut Vec<(PathBuf, String)>,
+        skipped_symlinks: &mut usize,
     ) -> Result<(), VaultError> {
         if depth > MAX_IMPORT_DEPTH {
             return Err(VaultError::Other("导入目录层级超过安全上限".into()));
@@ -2613,14 +2832,15 @@ impl Vault {
             let path = entry.path();
             let meta = fs::symlink_metadata(&path)?;
             if meta.file_type().is_symlink() {
-                log::warn!("跳过符号链接（不支持导入符号链接，已计入失败计数）");
+                *skipped_symlinks += 1;
+                log::warn!("跳过符号链接（未计入失败项，已随返回值反馈）");
                 continue;
             }
             let name = path.file_name()
                 .unwrap_or_default().to_string_lossy().to_string();
             let dest_path = format!("{}/{}", dest_root, name);
             if meta.is_dir() {
-                Self::collect_import_files(&path, &dest_path, depth + 1, entries_seen, out)?;
+                Self::collect_import_files(&path, &dest_path, depth + 1, entries_seen, out, skipped_symlinks)?;
             } else if meta.is_file() {
                 out.push((path, dest_path));
             }
@@ -2737,9 +2957,11 @@ impl Vault {
 
         // C8 修复（强化）：使用 O_NOFOLLOW 打开目标文件，防止 TOCTOU 符号链接竞态。
         // 旧实现在 Windows 上仅检查-再-write，存在时间窗口。
-        // 现在两端都使用 NO_FOLLOW 等价标志打开，并写入后验证仍是普通文件。
+        // 现在两端都使用 NO_FOLLOW 等价标志打开。
         // 2.4.1（P0-5）：overwrite=true 时用 create+truncate（仍带 NO_FOLLOW），
         // 让「提取全部」的覆盖确认框名副其实。
+        // 2.8.2：删除「写入后验证仍是普通文件」的不实注释 —— 实现从未做该验证，
+        // 防护依赖打开标志本身（重解析点在打开时即被拒绝或以本体形式打开）。
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -3038,7 +3260,10 @@ impl Vault {
             (meta.offset, meta.length, meta.aad_tag.clone())
         };
         // M1 修复：超大文件拒绝全量加载（避免 OOM + Tauri IPC 膨胀）
-        if length as usize > MAX_INMEM_BUFFER {
+        // 2.8.2：改用 u64 比较 —— 旧写法 `length as usize` 在 32 位目标上会
+        // 回绕（大 u64 变小 usize）使该检查失效（真正的防线在
+        // read_decrypt_file_data 内，这里属于纵深防御，因此修正而非删除）
+        if length > MAX_INMEM_BUFFER as u64 {
             return Err(VaultError::Other(format!(
                 "文件过大（{} 字节），超过单次加载上限 {} 字节，请使用提取功能导出后查看",
                 length, MAX_INMEM_BUFFER
@@ -3188,11 +3413,12 @@ impl Vault {
             drop(src_file);
 
             // 步骤 4：写入活跃分区的新索引
-            let mut idx_for_write = index.clone();
+            // 2.8.2：去掉整索引深拷贝 —— 先注入审计再直接序列化 index，
+            // 成功路径把 index 本身作为最终缓存返回（10k 文件索引省一次数 MB 分配）
             if let Some(ref audit) = self.audit {
-                idx_for_write.audit = audit.to_vec();
+                index.audit = audit.to_vec();
             }
-            let idx_json = serde_json::to_vec(&idx_for_write)?;
+            let idx_json = serde_json::to_vec(&index)?;
             let enc_idx = encrypt_gcm(&active_enc_key, &idx_json, b"index", None)?;
             tmp_file.seek(SeekFrom::Start(write_cursor))?;
             tmp_file.write_all(&enc_idx)?;
@@ -3243,7 +3469,7 @@ impl Vault {
                 log::warn!("擦除碎片整理备份失败（保险柜同目录可能残留 .defrag_backup 文件）: {}", e);
             }
             secure_wipe_vec(idx_json);
-            Ok(idx_for_write)
+            Ok(index)
         })();
 
         match result {
@@ -3251,10 +3477,36 @@ impl Vault {
                 // 2.6.1：先释放旧句柄（同时释放 flock），再以独占方式重开，
                 // 避免同进程两次 flock 冲突，并保证整理后仍持有独占锁。
                 self.file = None;
-                let file = open_vault_rw(&vault_path, false)?;
-                lock_vault_exclusive(&file)
-                    .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
-                self.file = Some(file);
+                // 2.8.2（诚实报错）：整理已提交（磁盘已是新布局）—— 旧实现重开
+                // 失败时 `?` 直接上抛「整理失败」，用户会误以为失败而重试（再整理
+                // 一整轮），而会话停在 file=None 的半死状态。现在先把内存缓存
+                // 对齐新布局，短重试重开；仍失败则明确告知「已完成，请重开」。
+                self.cached_index = Some(final_index);
+                let mut reopened: Option<File> = None;
+                let mut last_err: Option<String> = None;
+                for _ in 0..3 {
+                    match open_vault_rw(&vault_path, false) {
+                        Ok(f) => match lock_vault_exclusive(&f) {
+                            Ok(()) => {
+                                reopened = Some(f);
+                                break;
+                            }
+                            Err(e) => {
+                                drop(f);
+                                last_err = Some(e.to_string());
+                            }
+                        },
+                        Err(e) => last_err = Some(e.to_string()),
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                match reopened {
+                    Some(file) => self.file = Some(file),
+                    None => return Err(VaultError::Other(format!(
+                        "碎片整理已完成（磁盘布局已更新），但恢复会话失败（{}）。请用密码重新打开保险柜",
+                        last_err.unwrap_or_default()
+                    ))),
+                }
                 // P0-3：擦除活跃分区旧数据区与旧索引（逻辑空间回收）。
                 // 仅多分区路径需要：新文件是原文件的完整副本，旧区仍在新文件内。
                 // 单分区紧凑整理的新文件从未包含旧数据区，此处擦除反而会毁掉
@@ -3293,8 +3545,8 @@ impl Vault {
                         let _ = file.sync_all();
                     }
                 }
-                // 2.4.1：刷新索引缓存到整理后的布局（偏移已全部更新）
-                self.cached_index = Some(final_index);
+                // 2.4.1：缓存已在重开前对齐新布局（偏移已全部更新）——
+                // 2.8.2 重构后此处不再重复赋值（final_index 已被移动）
                 self.log_event("执行保险柜碎片整理");
                 if let Some(ref cb) = progress {
                     cb(100);
@@ -3349,16 +3601,16 @@ impl Vault {
     /// R3 修复：真正单次 load_index，循环调用 extract_file_inner（不再重复 load）。
     /// 2.4.1 变更：目标目录只校验/规范化一次（P1-12）；新增 overwrite 参数（P0-5，
     /// 由前端确认框传入 —— 旧实现确认「覆盖」后实际用 create_new 拒绝覆盖，大批失败）。
-    /// 返回 (成功数, 失败数)。
+    /// 返回 (成功数, 失败数, 失败明细)。
     pub fn extract_all_files(
         &mut self,
         dest_folder: &Path,
         overwrite: bool,
-    ) -> Result<(usize, usize), VaultError> {
+    ) -> Result<(usize, usize, Vec<String>), VaultError> {
         let dest_abs = Self::prepare_dest_root(dest_folder)?;
         // 单次 load_index，收集所有文件的元数据
         let file_infos: Vec<(String, String, String, u64, u64, Option<String>)> = {
-            let index = self.load_index()?;
+            let index = self.index_ref()?;
             index.files.iter().map(|(vpath, meta)| {
                 let vpath_trimmed = vpath.trim_matches('/');
                 let rel_dir = match vpath_trimmed.rfind('/') {
@@ -3370,14 +3622,16 @@ impl Vault {
         };
         let mut ok = 0usize;
         let mut fail = 0usize;
+        let mut errors: Vec<String> = Vec::new();
         for (vpath, rel_dir, file_name, offset, length, aad_tag) in &file_infos {
             let aad = aad_bytes(aad_tag.as_deref(), vpath);
             match self.extract_file_inner(vpath, rel_dir, file_name, *offset, *length, aad, &dest_abs, overwrite) {
                 Ok(_) => ok += 1,
-                Err(_) => {
+                Err(e) => {
                     fail += 1;
-                    // 2.8.1：错误串含 vpath，不再落明文日志
-                    log::warn!("提取全部有失败项（明细已反馈前端）");
+                    errors.push(format!("{}: {}", vpath, e));
+                    // 2.8.1：错误串含 vpath，不再落明文日志（明细经返回值反馈前端）
+                    log::warn!("提取全部有失败项（明细已随返回值反馈）");
                 }
             }
         }
@@ -3387,63 +3641,68 @@ impl Vault {
             "提取全部文件（成功 {}，失败 {}）",
             ok, fail
         ));
-        Ok((ok, fail))
+        Ok((ok, fail, errors))
     }
 
     /// 批量提取指定文件/文件夹到目标目录（单次 load_index，避免 O(n²) 重复加载）。
-    /// 文件夹自动展开为其下所有文件；返回 (成功数, 失败数)。
+    /// 文件夹自动展开为其下所有文件；返回 (成功数, 失败数, 失败明细)。
     /// 2.3.0 修复：`extract_files` 命令原先对每个文件重复 load_index，大数据量下退化 O(n²)。
     /// 2.4.1：目标目录只校验一次（P1-12）+ 摘要审计（P1-14）。
-    pub fn extract_files_batch(&mut self, vpaths: &[String], dest_folder: &Path) -> Result<(usize, usize), VaultError> {
+    pub fn extract_files_batch(&mut self, vpaths: &[String], dest_folder: &Path) -> Result<(usize, usize, Vec<String>), VaultError> {
         let dest_abs = Self::prepare_dest_root(dest_folder)?;
-        let index = self.load_index()?;
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut targets: Vec<(String, String, String, u64, u64, Option<String>)> = Vec::new();
-        for vp in vpaths {
-            let vp_norm = vp.trim_end_matches('/');
-            if vp_norm.is_empty() || vp_norm == "/" {
-                continue;
-            }
-            if index.files.contains_key(vp_norm) {
-                if seen.insert(vp_norm.to_string()) {
-                    let m = index.files.get(vp_norm).unwrap();
-                    let vpath_trimmed = vp_norm.trim_matches('/');
-                    let rel_dir = match vpath_trimmed.rfind('/') {
-                        Some(pos) => vpath_trimmed[..pos].to_string(),
-                        None => String::new(),
-                    };
-                    targets.push((vp_norm.to_string(), rel_dir, m.name.clone(), m.offset, m.length, m.aad_tag.clone()));
+        let targets: Vec<(String, String, String, u64, u64, Option<String>)> = {
+            let index = self.index_ref()?;
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut targets: Vec<(String, String, String, u64, u64, Option<String>)> = Vec::new();
+            for vp in vpaths {
+                let vp_norm = vp.trim_end_matches('/');
+                if vp_norm.is_empty() || vp_norm == "/" {
+                    continue;
                 }
-            } else if index.folders.contains_key(vp_norm) {
-                let prefix = format!("{}/", vp_norm);
-                for (fv, m) in &index.files {
-                    if (fv.starts_with(&prefix) || fv == vp_norm) && seen.insert(fv.clone()) {
-                        let vpath_trimmed = fv.trim_matches('/');
+                if index.files.contains_key(vp_norm) {
+                    if seen.insert(vp_norm.to_string()) {
+                        let m = index.files.get(vp_norm).unwrap();
+                        let vpath_trimmed = vp_norm.trim_matches('/');
                         let rel_dir = match vpath_trimmed.rfind('/') {
                             Some(pos) => vpath_trimmed[..pos].to_string(),
                             None => String::new(),
                         };
-                        targets.push((fv.clone(), rel_dir, m.name.clone(), m.offset, m.length, m.aad_tag.clone()));
+                        targets.push((vp_norm.to_string(), rel_dir, m.name.clone(), m.offset, m.length, m.aad_tag.clone()));
+                    }
+                } else if index.folders.contains_key(vp_norm) {
+                    let prefix = format!("{}/", vp_norm);
+                    for (fv, m) in &index.files {
+                        if (fv.starts_with(&prefix) || fv == vp_norm) && seen.insert(fv.clone()) {
+                            let vpath_trimmed = fv.trim_matches('/');
+                            let rel_dir = match vpath_trimmed.rfind('/') {
+                                Some(pos) => vpath_trimmed[..pos].to_string(),
+                                None => String::new(),
+                            };
+                            targets.push((fv.clone(), rel_dir, m.name.clone(), m.offset, m.length, m.aad_tag.clone()));
+                        }
                     }
                 }
             }
-        }
+            targets
+        };
 
         let mut ok = 0usize;
         let mut fail = 0usize;
+        let mut errors: Vec<String> = Vec::new();
         for (vpath, rel_dir, file_name, offset, length, aad_tag) in &targets {
             let aad = aad_bytes(aad_tag.as_deref(), vpath);
             // 批量提取保持「拒绝覆盖」的安全默认；需要覆盖语义时走提取全部（P0-5）
             match self.extract_file_inner(vpath, rel_dir, file_name, *offset, *length, aad, &dest_abs, false) {
                 Ok(_) => ok += 1,
-                Err(_) => {
+                Err(e) => {
                     fail += 1;
-                    log::warn!("批量提取有失败项（明细已反馈前端）");
+                    errors.push(format!("{}: {}", vpath, e));
+                    log::warn!("批量提取有失败项（明细已随返回值反馈）");
                 }
             }
         }
         self.log_event(&format!("批量提取：成功 {} 个文件，失败 {} 个", ok, fail));
-        Ok((ok, fail))
+        Ok((ok, fail, errors))
     }
 
     /// 追加一条审计日志。如果审计日志未初始化则什么都不做。
@@ -3520,7 +3779,7 @@ impl Vault {
         self.audit_dirty = false;
 
         // 基于已持有的句柄完成 DoD 7-pass 擦除 + 删除（全程不按路径重开）
-        Ok(crate::wipe::dod_erase_handle(file, &path)?)
+        Ok(crate::wipe::dod_erase_handle(file, &path, None)?)
     }
 
     // ═══════════════ 关闭 ═══════════════
