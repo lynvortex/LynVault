@@ -17,6 +17,10 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 static APP: Mutex<Option<AppHandle>> = Mutex::new(None);
+/// 2.8.1：in-flight 合并标志 —— 快速锁屏/解锁、事件风暴（多个事件排队）时
+/// 旧实现会并发派生多个关闭线程，每个都 emit 一次 vault-locked，
+/// 前端重复跑启动扫描
+static LOCK_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 启动监听线程（仅 Windows；setup 钩子里调用一次）
 pub fn spawn(app: AppHandle) {
@@ -31,14 +35,26 @@ pub fn spawn(app: AppHandle) {
 }
 
 fn trigger_lock() {
+    use std::sync::atomic::Ordering;
+    // 已有关闭流程在跑则合并（锁屏期间不会有新的解锁操作产生竞态）
+    if LOCK_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
     let app = APP.lock().ok().and_then(|g| g.clone());
     if let Some(app) = app {
         if app.get_window("main").is_none() {
+            LOCK_IN_FLIGHT.store(false, Ordering::SeqCst);
             return; // 应用已退出中
         }
         std::thread::spawn(move || {
             let _ = crate::commands::system_lock_vault(&app);
+            LOCK_IN_FLIGHT.store(false, Ordering::SeqCst);
         });
+    } else {
+        LOCK_IN_FLIGHT.store(false, Ordering::SeqCst);
     }
 }
 

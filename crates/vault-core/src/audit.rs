@@ -80,7 +80,7 @@ impl AuditLog {
             let expected = mac.finalize().into_bytes();
             let entry_hmac = hex::decode(&entry.hmac).unwrap_or_default();
             if entry_hmac.len() != 32
-                || !bool::from(expected.as_slice().ct_eq(&entry_hmac.as_slice()))
+                || !bool::from(expected.as_slice().ct_eq(entry_hmac.as_slice()))
             {
                 return Err(VaultError::Other(
                     "审计链验证失败（历史记录可能被篡改），已中止本次密码修改".into(),

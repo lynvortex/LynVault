@@ -16,44 +16,53 @@ mod system_events;
 use std::fs::OpenOptions;
 
 /// 2.8.0：窗口标题版本号单一来源
-const APP_VERSION: &str = "2.8.0";
+const APP_VERSION: &str = "2.8.1";
 
 /// 2.8.0：防截屏开关（对主窗口应用 SetWindowDisplayAffinity）。
 /// - 开启：WDA_EXCLUDEFROMCAPTURE（Win10 2004+，截屏/录屏/远程共享中窗口直接消失）；
 ///   该值不被支持时（旧系统）退化为 WDA_MONITOR（截屏中变黑块）；
 /// - 关闭：WDA_NONE。
-/// 返回是否成功作用于窗口。注意：只能防软件抓屏，防不了物理拍摄。
+///
+/// 2.8.1 修复返回值语义：返回「请求的保护状态是否实际生效」——
+/// 旧实现成功时返回 true 而调用方拿它当「失败」告警，恰好写反。
 pub fn apply_anti_screenshot(app: &tauri::AppHandle, enable: bool) -> bool {
     #[cfg(windows)]
     {
         use tauri::Manager;
         use windows::Win32::Foundation::HWND;
-        let affinity = if enable {
+        let want = if enable {
             windows::Win32::UI::WindowsAndMessaging::WDA_EXCLUDEFROMCAPTURE
         } else {
             windows::Win32::UI::WindowsAndMessaging::WDA_NONE
         };
-        if let Some(win) = app.get_window("main") {
-            if let Ok(h) = win.hwnd() {
-                // tauri 1.x 的 hwnd() 返回其内部 windows 版本的 HWND（isize 语义），
-                // 按数值转换到本 crate 的 windows 0.57 HWND
-                let hwnd = HWND(h.0 as isize);
-                let r = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(hwnd, affinity)
-                };
-                if r.is_err() && enable {
-                    // WDA_EXCLUDEFROMCAPTURE 需 Win10 2004+；退化 WDA_MONITOR（截屏中变黑块）
-                    let _ = unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(
-                            hwnd,
-                            windows::Win32::UI::WindowsAndMessaging::WDA_MONITOR,
-                        )
-                    };
-                }
-                return r.is_ok();
-            }
+        let Some(win) = app.get_window("main") else {
+            return false;
+        };
+        let Ok(h) = win.hwnd() else {
+            return false;
+        };
+        // tauri 1.x 的 hwnd() 返回其内部 windows 版本的 HWND（isize 语义），
+        // 按数值转换到本 crate 的 windows 0.57 HWND
+        let hwnd = HWND(h.0);
+        if unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(hwnd, want)
         }
-        false
+        .is_ok()
+        {
+            return true;
+        }
+        if enable {
+            // WDA_EXCLUDEFROMCAPTURE 需 Win10 2004+：退化为 WDA_MONITOR（截屏中变黑块）
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::WDA_MONITOR,
+                )
+            }
+            .is_ok()
+        } else {
+            false
+        }
     }
     #[cfg(not(windows))]
     {
@@ -111,7 +120,7 @@ impl log::Log for FileLogger {
         eprint!("[LynVault] {}", line);
         use std::io::{Seek, SeekFrom, Write};
         let _guard = self.lock.lock();
-        if let Ok(mut f) = OpenOptions::new().create(true).write(true).open(&self.path) {
+        if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(false).open(&self.path) {
             // 2.6.1 安全轮转：先整体覆写再截断。
             // 旧实现直接 set_len(0)，只是把旧内容标记为可复用，磁盘上仍可恢复 ——
             // 对一个把「擦除」当卖点的产品，这种残留不能留。
@@ -394,8 +403,10 @@ fn main() {
         return;
     }
 
-    // 2.8.0：按设置应用防截屏（默认开启；失败仅记日志，不影响使用）
-    if apply_anti_screenshot(&app.handle(), anti_screenshot) && anti_screenshot {
+    // 2.8.0：按设置应用防截屏（默认开启）。
+    // 2.8.1：仅在实际未生效且用户要求开启时告警（旧判断恰好写反）
+    let applied = apply_anti_screenshot(&app.handle(), anti_screenshot);
+    if anti_screenshot && !applied {
         log::warn!("防截屏保护未生效（系统不支持或窗口句柄异常）");
     }
 

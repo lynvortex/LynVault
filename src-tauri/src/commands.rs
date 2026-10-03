@@ -108,10 +108,10 @@ pub async fn create_vault(
     key_file_path: Option<String>,
 ) -> Result<(), String> {
     run_blocking(&app, "create_vault", move |state| {
-        state.check_auth_cooldown()?;
-        // 2.3.0 修复：密码 / 密钥文件在所有路径（含 load_key_file 失败、操作失败）上都零化，
-        // 旧实现 `?` 提前返回会跳过零化。
+        // 2.8.1：冷却检查移入内层闭包 —— 旧实现它在零化作用域之外 `?` 提前返回，
+        // 密码未经 zeroize 就被丢弃
         let result: Result<(), String> = (|| {
+            state.check_auth_cooldown()?;
             let key_data = load_key_file(&key_file_path)?;
             let created: Result<(), String> = (|| {
                 // 2.4.1（P2-20）：Vault::create 成功即进入已解锁会话
@@ -144,8 +144,9 @@ pub async fn open_vault(
     key_file_path: Option<String>,
 ) -> Result<usize, String> {
     run_blocking(&app, "open_vault", move |state| {
-        state.check_auth_cooldown()?;
+        // 2.8.1：冷却检查移入内层（同 create_vault，覆盖密码零化）
         let result: Result<usize, String> = (|| {
+            state.check_auth_cooldown()?;
             let key_data = load_key_file(&key_file_path)?;
             let opened: Result<usize, String> = (|| {
                 let mut vault = Vault::default();
@@ -185,14 +186,24 @@ pub async fn close_vault(app: AppHandle) -> Result<(), String> {
 
 // ───────────────── 文件浏览 ─────────────────
 
-/// 2.4.1（P1-16）：返回结构化数组而非手工序列化的 JSON 字符串，
-/// 免去前端 JSON.parse；数组语义与旧版一致。
+/// 2.4.1（P1-16）：返回结构化数组而非手工序列化的 JSON 字符串。
+/// 2.8.1（性能）：改用 vault-core 的只读索引借用（免整索引克隆）+ 类型化
+/// struct 序列化（比逐项 serde_json::json! 构造 Map 便宜一个量级）。
+#[derive(serde::Serialize)]
+pub struct ListItem {
+    pub name: String,
+    pub vpath: String,
+    #[serde(rename = "type")]
+    pub item_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
 #[tauri::command]
-pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<serde_json::Value>, String> {
+pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<ListItem>, String> {
     run_blocking(&app, "list_folder", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        let index = vault.load_index().map_err(|e| e.to_string())?;
 
         // 2.3.0 修复：归一化目录参数（去掉结尾 '/'，根目录保持 "/"），
         // 避免用户在路径框输入 "dir/" 时返回空列表
@@ -203,18 +214,23 @@ pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<serde_jso
             .filter(|p| vault_core::Index::validate_vpath(p))
             .ok_or_else(|| "无效的目录路径".to_string())?;
 
-        let mut items: Vec<serde_json::Value> = Vec::new();
+        let index = vault.index_ref().map_err(|e| e.to_string())?;
 
-        for (vpath, _) in &index.folders {
+        let mut items: Vec<ListItem> = Vec::new();
+
+        for vpath in index.folders.keys() {
             if vpath.is_empty() || *vpath == "/" { continue; }
             let parent = vpath.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             let display_parent = if parent.is_empty() { "/" } else { parent };
             if display_parent == folder_norm {
                 let name = vpath.rsplit_once('/').map(|(_, n)| n).unwrap_or(vpath);
                 if !name.is_empty() {
-                    items.push(serde_json::json!({
-                        "name": name, "vpath": vpath, "type": "folder"
-                    }));
+                    items.push(ListItem {
+                        name: name.to_string(),
+                        vpath: vpath.clone(),
+                        item_type: "folder",
+                        size: None,
+                    });
                 }
             }
         }
@@ -223,18 +239,19 @@ pub async fn list_folder(app: AppHandle, folder: String) -> Result<Vec<serde_jso
             let dir = vpath.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             let display_dir = if dir.is_empty() { "/" } else { dir };
             if display_dir == folder_norm {
-                items.push(serde_json::json!({
-                    "name": meta.name, "vpath": vpath, "type": "file", "size": meta.size
-                }));
+                items.push(ListItem {
+                    name: meta.name.clone(),
+                    vpath: vpath.clone(),
+                    item_type: "file",
+                    size: Some(meta.size),
+                });
             }
         }
 
         items.sort_by(|a, b| {
-            let ta = a["type"].as_str().unwrap_or("");
-            let tb = b["type"].as_str().unwrap_or("");
-            if ta == tb {
-                a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
-            } else if ta == "folder" { std::cmp::Ordering::Less }
+            if a.item_type == b.item_type {
+                a.name.cmp(&b.name)
+            } else if a.item_type == "folder" { std::cmp::Ordering::Less }
             else { std::cmp::Ordering::Greater }
         });
 
@@ -297,6 +314,8 @@ pub async fn import_dropped_paths(
         let mut imported_files: Vec<String> = Vec::new();
         let mut imported_folders: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        let mut dir_paths: Vec<String> = Vec::new();
+        let mut file_paths: Vec<String> = Vec::new();
 
         // 2.4.1 新功能：拖入的 .lyt/.vault 是保险柜文件而非待加密文件 —— 分流处理，
         // 由前端走「打开保险柜」流程，这里直接跳过（不导入、不报错）。
@@ -314,20 +333,35 @@ pub async fn import_dropped_paths(
         for p in &normal_paths {
             let path = Path::new(p);
             if path.is_dir() {
-                match vault.import_folder(path, &dest_base) {
-                    Ok(_) => imported_folders.push(p.clone()),
-                    Err(e) => errors.push(format!("文件夹 '{}': {}", p, e)),
-                }
+                dir_paths.push(p.clone());
             } else if path.is_file() {
-                let filename = path.file_name()
-                    .unwrap_or_default().to_string_lossy().to_string();
-                let full_vpath = format!("{}/{}", dest_base.trim_end_matches('/'), filename);
-                match vault.import_file(path, &full_vpath) {
-                    Ok(_) => imported_files.push(p.clone()),
-                    Err(e) => errors.push(format!("文件 '{}': {}", p, e)),
-                }
+                file_paths.push(p.clone());
             } else {
                 errors.push(format!("跳过 '{}': 不是有效文件或目录", p));
+            }
+        }
+
+        // 2.8.1（性能）：文件走单次批量导入 —— 旧实现每文件一次 import_file =
+        // 每文件一次完整索引落盘（9 次 fsync + 8×索引体积写放大），拖入 50 个
+        // 文件 ≈ 450 次 fsync；批量后只有 1 次保存。
+        if !file_paths.is_empty() {
+            match vault.import_files_batch(&file_paths, &dest_base) {
+                Ok((ok, fail)) => {
+                    if fail == 0 {
+                        imported_files = file_paths;
+                    } else {
+                        // 批量路径不返回逐文件结果；失败明细由批量接口记入前端可见的计数
+                        errors.push(format!("文件批量导入：成功 {} 个，失败 {} 个", ok, fail));
+                        // 批量路径不返回逐文件结果，失败项无法定位 —— 置空避免误报
+                    }
+                }
+                Err(e) => errors.push(format!("文件批量导入失败: {}", e)),
+            }
+        }
+        for p in &dir_paths {
+            match vault.import_folder(Path::new(p), &dest_base) {
+                Ok(_) => imported_folders.push(p.clone()),
+                Err(e) => errors.push(format!("文件夹 '{}': {}", p, e)),
             }
         }
 
@@ -524,7 +558,11 @@ pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
         // （ERROR_SHARING_VIOLATION / os error 32），销毁在 Windows 上从未成功过。
         // 符号链接 / 重解析点的拒绝已前移到会话打开阶段（vault-core open_vault_rw），
         // 句柄锚定的 TOCTOU 防护不再削弱。
-        vault.destroy().map_err(|e| e.to_string())
+        vault.destroy().map_err(|e| e.to_string())?;
+        // 2.8.1：清空会话槽位 —— 旧实现残留 Some（is_open=false 的空壳），
+        // 后续命令报「保险柜未打开」的内部态而非干净的用户语义
+        *guard = None;
+        Ok(())
     })
     .await;
     // 2.8.0：销毁后会话不存在 → 停止剪贴板保护
@@ -774,6 +812,8 @@ pub async fn change_password(
 }
 
 /// 2.8.0：移动文件/文件夹到目标目录（跨目录移动只改索引，不重加密）。
+/// 2.8.1（性能）：走 vault-core 批量 API —— 单次 load/save，N 项一次索引落盘
+///（旧实现每项一次完整保存：9 次 fsync + 8×索引体积写放大）。
 /// 返回 { ok, fail, errors }。
 #[tauri::command]
 pub async fn move_items(
@@ -787,42 +827,8 @@ pub async fn move_items(
         let dest_norm = vault_core::Index::normalize_vpath(&dest_folder)
             .filter(|p| vault_core::Index::validate_vpath(p))
             .ok_or_else(|| "目标目录非法".to_string())?;
-        // 先按索引分类（文件夹 / 文件），非法输入（根目录/空路径）直接计为失败
-        let mut ok = 0usize;
-        let mut fail = 0usize;
-        let mut errors: Vec<String> = Vec::new();
-        let classified: Vec<(String, bool)> = {
-            let index = vault.load_index().map_err(|e| e.to_string())?;
-            let mut out = Vec::new();
-            for vp in &vpaths {
-                let vp_norm = vp.trim_end_matches('/');
-                if vp_norm.is_empty() || vp_norm == "/" {
-                    fail += 1;
-                    errors.push(format!("{}: 非法路径", vp));
-                    continue;
-                }
-                let is_dir = index.folders.contains_key(vp_norm);
-                out.push((vp_norm.to_string(), is_dir));
-            }
-            out
-        };
-        for (vp, is_dir) in &classified {
-            let r = {
-                let mut mgr = vault.get_index_manager().map_err(|e| e.to_string())?;
-                if *is_dir {
-                    mgr.move_folder(vp, &dest_norm)
-                } else {
-                    mgr.move_file(vp, &dest_norm)
-                }
-            };
-            match r {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    fail += 1;
-                    errors.push(format!("{}: {}", vp, e));
-                }
-            }
-        }
+        let mut mgr = vault.get_index_manager().map_err(|e| e.to_string())?;
+        let (ok, fail, errors) = mgr.move_items(&vpaths, &dest_norm).map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "ok": ok, "fail": fail, "errors": errors }))
     })
     .await
@@ -847,10 +853,11 @@ pub async fn search_files(
     limit: Option<u32>,
 ) -> Result<Vec<vault_core::SearchHit>, String> {
     run_blocking(&app, "search_files", move |state| {
-        let mut guard = lock_vault(state)?;
-        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        // 2.8.1：search_files 改为 &self 借用缓存（免 clone），只读守卫即可
+        let guard = lock_vault(state)?;
+        let vault = guard.as_ref().ok_or("保险柜未打开")?;
         let limit = limit.unwrap_or(200).clamp(1, 1000) as usize;
-        vault.search_files(&query, limit).map_err(|e| e.to_string())
+        Ok(vault.search_files(&query, limit))
     })
     .await
 }
@@ -884,12 +891,19 @@ pub async fn verify_vault_integrity(app: AppHandle) -> Result<serde_json::Value,
     run_blocking(&app, "verify_vault_integrity", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        // 2.8.1（性能）：进度事件按时间节流（≥100ms 一个）—— 旧实现每文件
+        // 一个 IPC 事件，10k 文件 = 1 万事件轰炸 WebView 造成秒级卡顿。
+        // Cell 保证闭包仍是 Fn（verify_integrity 的进度回调约束）。
+        let last_emit = std::cell::Cell::new(Instant::now() - Duration::from_millis(200));
         let (total, broken) = vault
             .verify_integrity(Some(move |done: usize, total: usize, current: &str| {
-                let _ = app2.emit_all(
-                    "integrity-progress",
-                    serde_json::json!({ "done": done, "total": total, "current": current }),
-                );
+                if last_emit.get().elapsed() >= Duration::from_millis(100) {
+                    last_emit.set(Instant::now());
+                    let _ = app2.emit_all(
+                        "integrity-progress",
+                        serde_json::json!({ "done": done, "total": total, "current": current }),
+                    );
+                }
             }))
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "total": total, "broken": broken }))
@@ -967,8 +981,11 @@ pub async fn save_settings(app: AppHandle, settings: serde_json::Value) -> Resul
         let path = crate::settings::active_config_path()
             .ok_or("未启用持久化，请先在设置中启用后再修改")?;
         crate::settings::save_at(&path, &s)?;
-        // 防截屏开关即时生效（主题 / 自动锁定时长由前端即时应用）
-        let _ = crate::apply_anti_screenshot(&app2, s.anti_screenshot);
+        // 防截屏开关即时生效（主题 / 自动锁定时长由前端即时应用）。
+        // 2.8.1：应用失败向上传播 —— 旧实现静默吞掉，用户切开关失败也显示成功
+        if !crate::apply_anti_screenshot(&app2, s.anti_screenshot) {
+            return Err("设置已写入，但防截屏开关应用失败（系统可能不支持，重启后仍以保存值为准）".into());
+        }
         Ok(())
     })
     .await
@@ -1044,7 +1061,7 @@ pub async fn scan_vault_files(dir: String) -> Result<Vec<serde_json::Value>, Str
                 entries.push((path, mtime, meta.len()));
             }
             // 按修改时间倒序（最新在前）
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1)); // 2.8.1：修改时间倒序
             let result = entries.into_iter().map(|(p, mtime, size)| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                 let mtime_secs = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1229,6 +1246,9 @@ fn read_windows_file_icon(ext: &str) -> Result<String, String> {
     if ok.is_err() {
         return Err("GetIconInfo 失败".into());
     }
+    // 2.8.1：RAII 接管两个位图，覆盖本函数所有早退路径
+    let _bm_color = BitmapGuard(icon_info.hbmColor);
+    let _bm_mask = BitmapGuard(icon_info.hbmMask);
 
     // 优先用 color bitmap
     let hbm = icon_info.hbmColor;
@@ -1331,7 +1351,20 @@ fn read_windows_file_icon(ext: &str) -> Result<String, String> {
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 #[cfg(windows)]
-use windows::Win32::Graphics::Gdi::{DeleteDC, HDC};
+use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, HBITMAP, HDC};
+
+/// 2.8.1：GetIconInfo 返回的 hbmColor / hbmMask 都必须 DeleteObject ——
+/// 旧实现两者都不释放（每次查询新扩展名泄漏 2 个 GDI 句柄）。
+#[cfg(windows)]
+struct BitmapGuard(HBITMAP);
+#[cfg(windows)]
+impl Drop for BitmapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.0.0));
+        }
+    }
+}
 
 #[cfg(windows)]
 struct IconGuard(HICON);

@@ -70,7 +70,7 @@ pub fn derive_legacy_lock_key(
 
     // 2.4.1 修复：精确预留容量，避免多次 realloc 在堆上留下含密码的旧副本
     let kf_len = key_file_data.map_or(0, |kf| kf.len());
-    let mut combined = Vec::with_capacity(password.as_bytes().len() + kf_len);
+    let mut combined = Vec::with_capacity(password.len() + kf_len);
     combined.extend_from_slice(password.as_bytes());
     if let Some(kf) = key_file_data {
         combined.extend_from_slice(kf);
@@ -256,20 +256,64 @@ pub fn decrypt_gcm(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
 ///
 /// 返回 None = 口令错误或包裹体被篡改（GCM 认证失败）。这是 v5 打开流程中
 /// 「口令是否正确」的判定点 —— 口令正确性由 AES-GCM 认证标签保证。
+/// 2.8.1：解出的明文 data_key 清零后才丢弃 —— 这是保护全部文件数据的密钥，
+/// 任何路径都不允许明文残留堆内存。
 pub fn unwrap_data_key(kek: &[u8; 32], wrapped: &[u8], aad: &[u8]) -> Option<[u8; 32]> {
     if wrapped.len() != 60 {
         return None;
     }
-    let plain = decrypt_gcm(kek, wrapped, aad)?;
+    let mut plain = decrypt_gcm(kek, wrapped, aad)?;
     if plain.len() != 32 {
-        // 长度异常的明文同样不能残留
-        let mut p = plain;
-        p.zeroize();
+        plain.zeroize();
         return None;
     }
     let mut dk = [0u8; 32];
     dk.copy_from_slice(&plain);
+    plain.zeroize();
     Some(dk)
+}
+
+/// 2.8.1：就地解密 —— 消费 `nonce(12) || ciphertext || tag(16)` 布局的缓冲区，
+/// 解密直接发生在原缓冲上，返回明文（缓冲复用，避免大文件场景的多份全尺寸分配）。
+/// 输出与 `decrypt_gcm` 完全一致的明文；认证失败返回 None（缓冲内容不再可信）。
+pub fn decrypt_into(key: &[u8; 32], mut data: Vec<u8>, aad: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::AeadInPlace;
+    if data.len() < 12 + 16 {
+        return None;
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    let (nonce, rest) = data.split_at_mut(12);
+    let (ct, tag_bytes) = rest.split_at_mut(rest.len() - 16);
+    let tag = aes_gcm::Tag::from_slice(tag_bytes);
+    let nonce_arr: [u8; 12] = nonce.try_into().expect("nonce 长度已在上方检查为 12");
+    cipher.decrypt_in_place_detached((&nonce_arr).into(), aad, ct, tag).ok()?;
+    // 就地收缩为明文：截掉尾部 tag、移除头部 nonce（一次前移拷贝）
+    let plain_len = ct.len();
+    data.truncate(12 + plain_len);
+    data.drain(..12);
+    Some(data)
+}
+
+/// 2.8.1：消费明文缓冲就地加密，输出 `nonce(12) || ciphertext || tag(16)` ——
+/// 与 `encrypt_gcm` 的线格式逐字节一致（AAD/密钥相同时可互换），
+/// 但省去一次全尺寸密文拷贝（明文缓冲被移动复用）。
+pub fn encrypt_into(
+    key: &[u8; 32],
+    mut plain: Vec<u8>,
+    aad: &[u8],
+) -> Result<Vec<u8>, VaultError> {
+    use aes_gcm::aead::AeadInPlace;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| VaultError::EncryptFailed)?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let tag = cipher
+        .encrypt_in_place_detached((&nonce).into(), aad, &mut plain)
+        .map_err(|_| VaultError::EncryptFailed)?;
+    let mut out = Vec::with_capacity(12 + plain.len() + 16);
+    out.extend_from_slice(&nonce);
+    out.append(&mut plain);
+    out.extend_from_slice(tag.as_slice());
+    Ok(out)
 }
 
 /// 生成认证标签（HMAC-SHA256 of b"AUTH_OK"）—— **旧格式**。

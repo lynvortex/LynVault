@@ -199,6 +199,7 @@ fn mark_delete_on_close(file: &File) -> bool {
 }
 
 /// 安全删除多个文件（DoD 7-pass）
+#[allow(clippy::type_complexity)] // 2.8.1：回调签名与公开 API 兼容性优先
 pub fn dod_erase_files(paths: &[&Path], progress_callback: Option<&dyn Fn(usize, &str)>) -> io::Result<()> {
     for (i, path) in paths.iter().enumerate() {
         let name = path.file_name()

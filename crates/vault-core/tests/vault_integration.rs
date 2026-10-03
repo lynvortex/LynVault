@@ -109,7 +109,7 @@ fn password_length_by_char_count() {
     // 12 个汉字（字节数 36，字符数 12）也必须通过 —— 旧实现按字节算会误放 4 个汉字
     let path2 = dir.join("t2.lyt");
     let mut v2 = Vault::default();
-    v2.create(&path2, &"密码密码密码密码密码密码".to_string(), None)
+    v2.create(&path2, "密码密码密码密码密码密码", None)
         .expect("12 个汉字（36 字节）应通过字符数校验");
 }
 
@@ -321,7 +321,7 @@ fn index_cache_consistent_after_save_and_close() {
     {
         let mut idx = v.load_index().unwrap();
         idx.folders.insert("/made/by/test".to_string(), true);
-        v.save_index(&idx).unwrap();
+        v.save_index(idx).unwrap();
     }
     let idx2 = v.load_index().unwrap();
     assert!(idx2.folders.contains_key("/made/by/test"), "缓存应反映 save 后的索引");
@@ -610,7 +610,7 @@ fn legacy_index_without_aad_tag_still_readable() {
     {
         let mut idx = v.load_index().unwrap();
         idx.files.get_mut("/old.bin").unwrap().aad_tag = None;
-        v.save_index(&idx).unwrap();
+        v.save_index(idx).unwrap();
     }
 
     // 回退路径：按当前 vpath 解密，仍应成功
@@ -939,15 +939,15 @@ fn search_files_matches_name_and_vpath() {
     v.import_file(&write_src(&dir, "Q3-Summary.txt", b"x"), "/Reports/Q3-Summary.txt").unwrap();
     v.import_file(&write_src(&dir, "other.txt", b"y"), "/other.txt").unwrap();
 
-    let hits = v.search_files("q3", 50).unwrap();
+    let hits = v.search_files("q3", 50);
     assert_eq!(hits.len(), 1, "应命中 /Reports/Q3-Summary.txt（vpath 包含 q3）");
     assert!(!hits[0].is_dir);
-    let hits = v.search_files("reports", 50).unwrap();
+    let hits = v.search_files("reports", 50);
     assert_eq!(hits.len(), 2, "应命中文件夹 /Reports 及其下文件（vpath 包含）");
     assert!(hits[0].is_dir, "文件夹条目应标记 is_dir 且排在前面");
-    let hits = v.search_files("summary", 50).unwrap();
+    let hits = v.search_files("summary", 50);
     assert!(hits.iter().any(|h| h.name.contains("Q3-Summary")));
-    let hits = v.search_files("zzz-not-exist", 50).unwrap();
+    let hits = v.search_files("zzz-not-exist", 50);
     assert!(hits.is_empty());
 }
 
@@ -966,4 +966,61 @@ fn read_lock_info_reports_failed_attempts() {
     let info = vault_core::read_lock_info(&path).unwrap();
     assert_eq!(info.failed_count, 1, "失败尝试应被记录");
     assert!(!info.locked, "1 次失败不应触发锁定");
+}
+
+/// 2.8.1：file/folder 交叉命名空间碰撞必须被拒绝（防 rename/delete 语义含混）
+#[test]
+fn file_folder_collision_rejected() {
+    let dir = tempdir("collision");
+    let (mut v, _) = new_vault(&dir);
+    // 先建文件 /docs，再建同名文件夹应被拒绝
+    v.import_file(&write_src(&dir, "d.txt", b"D"), "/docs").unwrap();
+    assert!(
+        v.get_index_manager().unwrap().add_folder("/docs").is_err(),
+        "同名文件夹应被拒绝"
+    );
+    // 反向：先建文件夹 /x，再导入同名文件应被拒绝
+    v.get_index_manager().unwrap().add_folder("/x").unwrap();
+    assert!(
+        v.import_file(&write_src(&dir, "y.txt", b"Y"), "/x").is_err(),
+        "同名文件应被拒绝"
+    );
+    // 拒绝后两命名空间各自完好
+    let idx = v.load_index().unwrap();
+    assert!(idx.files.contains_key("/docs"));
+    assert!(idx.folders.contains_key("/x"));
+}
+
+/// 2.8.1：批量移动单次索引落盘 —— 内容可读、计数正确、混合失败正确
+#[test]
+fn move_items_batch_single_pass() {
+    let dir = tempdir("movebatch");
+    let (mut v, _) = new_vault(&dir);
+    v.get_index_manager().unwrap().add_folder("/dst").unwrap();
+    for i in 0..10 {
+        let name = format!("f{}.txt", i);
+        v.import_file(&write_src(&dir, &name, format!("content-{}", i).as_bytes()), &format!("/f{}.txt", i)).unwrap();
+    }
+    let count_before = v.load_index().unwrap().files.len();
+    let vpaths: Vec<String> = (0..10).map(|i| format!("/f{}.txt", i)).collect();
+    let (ok, fail, errors) = v.get_index_manager().unwrap().move_items(&vpaths, "/dst").unwrap();
+    assert_eq!(ok, 10);
+    assert_eq!(fail, 0);
+    assert!(errors.is_empty());
+    let idx = v.load_index().unwrap();
+    assert_eq!(idx.files.len(), count_before, "移动不增减条目数");
+    for i in 0..10 {
+        let vp = format!("/dst/f{}.txt", i);
+        assert!(idx.files.contains_key(&vp), "{} 应在 /dst 下", vp);
+        assert_eq!(
+            v.load_file_data(&vp).unwrap(),
+            format!("content-{}", i).into_bytes(),
+            "移动后内容必须完好"
+        );
+    }
+    // 混合失败：不存在的文件 + 非法的根路径
+    let bad: Vec<String> = vec!["/ghost.txt".to_string(), "/".to_string()];
+    let (ok2, fail2, _) = v.get_index_manager().unwrap().move_items(&bad, "/dst").unwrap();
+    assert_eq!(ok2, 0);
+    assert_eq!(fail2, 2);
 }

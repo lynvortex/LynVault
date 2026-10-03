@@ -285,6 +285,7 @@ function showDialog(title, bodyHtml, buttons, wide) {
                             // 重试：重新启用按钮
                             allBtns.forEach(x => x.disabled = false);
                         } else {
+                            _activeCancelHandler = null;
                             hideDialog();
                         }
                     }).catch(() => {
@@ -292,6 +293,7 @@ function showDialog(title, bodyHtml, buttons, wide) {
                         allBtns.forEach(x => x.disabled = false);
                     });
                 } else if (ret !== false) {
+                    _activeCancelHandler = null;
                     hideDialog();
                 }
             } else {
@@ -322,6 +324,17 @@ function cleanupDialogBlobs() {
 
 function hideDialog() {
     const dlg = $('dialog');
+    // 2.8.1：清空对话框内容 —— 密码输入框等明文不允许残留在 DOM 中
+    //（场景：锁屏触发的 vault-locked 会强制关闭正在输入的对话框）
+    $('dialog-title').textContent = '';
+    $('dialog-body').innerHTML = '';
+    $('dialog-buttons').innerHTML = '';
+    // 关闭对话框等同于放弃当前输入：触发挂起的取消回调（见 showInput）
+    if (_activeCancelHandler) {
+        const h = _activeCancelHandler;
+        _activeCancelHandler = null;
+        try { h(); } catch (e) { /* ignore */ }
+    }
     dlg.style.width = '';
     dlg.style.height = '';
     dlg.style.maxWidth = '';
@@ -403,6 +416,10 @@ function escapeAttr(s) {
     });
 }
 
+// 2.8.1：当前对话框的取消回调（showInput 注册）。遮罩点击触发的 hideDialog
+// 现在会触发它 —— 修复启动密码框阶段点遮罩导致 _startupProcessing 卡死的软锁死
+let _activeCancelHandler = null;
+
 // 2.4.1：bytesToBase64 已删除 —— load_file_content 后端直接返回 base64 字符串，
 // 前端不再需要手工转换（也避免了旧实现对大文件的字符串拼接开销）。
 
@@ -424,6 +441,9 @@ function showInput(title, label, defaultValue, callback, isPassword, onCancel) {
             { text: '取消', cls: 'btn-cancel', action: () => { if (onCancel) onCancel(); } }
         ]
     );
+    // 2.8.1：注册取消回调 —— 遮罩点击关对话框时同样触发（回调内部自带
+    // 重置 _startupProcessing / 重弹启动窗的逻辑）
+    _activeCancelHandler = onCancel || null;
     setTimeout(() => { const inp = $('dlg-input'); if (inp) { inp.focus(); inp.select(); } }, 50);
 }
 
@@ -534,51 +554,75 @@ function hideCtxMenu() {
 }
 
 // ───────────────── 列表渲染 ─────────────────
-function renderList(data) {
+// 2.8.1（性能）：共享行构建 + DocumentFragment + 事件委托。
+// 旧实现每项 3 个闭包 + 逐项 appendChild（2000 项 ≈ 6000 闭包、整页回流多次），
+// 现在每项一次 innerHTML 构建进 fragment、一次挂载，交互事件统一委托到 #file-list。
+function buildFileRow(f) {
+    const isFolder = f.type === 'folder';
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    div.dataset.vpath = f.vpath;
+    div.dataset.type = f.type;
+    div.dataset.name = f.name;
+    const fallbackEmoji = isFolder ? '📁' : getIcon(f.name, false);
+    div.innerHTML = `<span class="fi-icon"></span><span class="fi-name">${escapeHtml(f.name)}</span><span class="fi-size">${isFolder ? '-' : formatSize(f.size)}</span>`;
+    const iconSpan = div.querySelector('.fi-icon');
+    if (isFolder) {
+        iconSpan.textContent = fallbackEmoji;
+    } else {
+        applySysIcon(iconSpan, f.name, fallbackEmoji);
+    }
+    return div;
+}
+
+function mountRows(rows, emptyHintHtml) {
     const list = $('file-list');
     list.innerHTML = '';
     state.selectedItems = [];
-
-    if (!data || !data.length) {
-        list.innerHTML = '<div class="empty-hint">' +
-            '<svg width="45" height="55" viewBox="0 0 45 55" fill="none" style="display:block;margin:0 auto 12px auto;opacity:0.5">' +
-            '<path d="M0 0H33L45 12V55H0Z" fill="#a0a0a0"/>' +
-            '<path d="M33 0V12H45Z" fill="#828282"/>' +
-            '</svg>' +
-            '<span>将文件拖放至此（右键可新建文件夹 / 导入）</span>' +
-            '</div>';
+    if (!rows.length) {
+        list.innerHTML = emptyHintHtml;
         return;
     }
+    const frag = document.createDocumentFragment();
+    rows.forEach(r => frag.appendChild(r));
+    list.appendChild(frag);
+}
 
-    data.forEach(f => {
-        const div = document.createElement('div');
-        div.className = 'file-item';
-        div.dataset.vpath = f.vpath;
-        div.dataset.type = f.type;
-        div.dataset.name = f.name;
-        const isFolder = f.type === 'folder';
-        const fallbackEmoji = isFolder ? '📁' : getIcon(f.name, false);
-        // 先用 emoji 占位渲染，再异步尝试替换为系统图标
-        div.innerHTML = `<span class="fi-icon"></span><span class="fi-name">${escapeHtml(f.name)}</span><span class="fi-size">${isFolder ? '-' : formatSize(f.size)}</span>`;
-        const iconSpan = div.querySelector('.fi-icon');
-        if (isFolder) {
-            iconSpan.textContent = fallbackEmoji;
-        } else {
-            applySysIcon(iconSpan, f.name, fallbackEmoji);
+function renderList(data) {
+    const rows = (data || []).map(f => buildFileRow(f));
+    mountRows(rows, '<div class="empty-hint">' +
+        '<svg width="45" height="55" viewBox="0 0 45 55" fill="none" style="display:block;margin:0 auto 12px auto;opacity:0.5">' +
+        '<path d="M0 0H33L45 12V55H0Z" fill="#a0a0a0"/>' +
+        '<path d="M33 0V12H45Z" fill="#828282"/>' +
+        '</svg>' +
+        '<span>将文件拖放至此（右键可新建文件夹 / 导入）</span>' +
+        '</div>');
+}
+
+// 事件委托：单次绑定，取代旧 per-item 闭包（点击选择 / 双击打开 / 右键菜单）
+function bindListDelegation() {
+    const list = $('file-list');
+    list.addEventListener('click', (e) => {
+        const el = e.target.closest('.file-item');
+        if (el) selectItem(el, e);
+    });
+    list.addEventListener('dblclick', (e) => {
+        const el = e.target.closest('.file-item');
+        if (!el) return;
+        if (el.dataset.type === 'folder') navigateTo(el.dataset.vpath);
+        else viewFile(el.dataset.vpath, el.dataset.name);
+    });
+    list.addEventListener('contextmenu', (e) => {
+        const el = e.target.closest('.file-item');
+        if (!el) return;
+        e.preventDefault();
+        e.stopPropagation(); // 防止触发空白区菜单
+        // 2.3.0：若该条目已在多选中，保留整组选择（提取/删除作用于全部选中项）；
+        // 否则仅选中该条目
+        if (!el.classList.contains('selected')) {
+            selectItem(el, e);
         }
-        div.onclick = e => selectItem(div, e);
-        div.ondblclick = () => isFolder ? navigateTo(f.vpath) : viewFile(f.vpath, f.name);
-        div.oncontextmenu = e => {
-            e.preventDefault();
-            e.stopPropagation(); // 防止触发空白区菜单
-            // 2.3.0：若该条目已在多选中，保留整组选择（提取/删除作用于全部选中项）；
-            // 否则仅选中该条目
-            if (!div.classList.contains('selected')) {
-                selectItem(div, e);
-            }
-            showItemMenu(e.clientX, e.clientY, { vpath: f.vpath, type: f.type, name: f.name }, state.selectedItems.length);
-        };
-        list.appendChild(div);
+        showItemMenu(e.clientX, e.clientY, { vpath: el.dataset.vpath, type: el.dataset.type, name: el.dataset.name }, state.selectedItems.length);
     });
 }
 
@@ -1107,6 +1151,7 @@ async function destroyVault() {
 
 // ───────────────── 2.8.0：文件名搜索 ─────────────────
 let _searchDebounce = null;
+let _searchSeq = 0; // 2.8.1：慢查询晚到不得覆盖新结果
 
 function bindSearch() {
     const input = $('search-input');
@@ -1136,12 +1181,14 @@ async function runSearch() {
         return;
     }
     if (!state.vaultOpen) return;
+    const seq = ++_searchSeq;
     try {
         const hits = await invoke('search_files', { query: q, limit: 200 });
+        if (seq !== _searchSeq) return; // 已有更新的查询发出，丢弃过期结果
         state.searchMode = true;
         renderSearchResults(hits);
     } catch (e) {
-        showError(String(e));
+        if (seq === _searchSeq) showError(String(e));
     }
 }
 
@@ -1154,6 +1201,8 @@ function renderSearchResults(hits) {
         setStatus('搜索：无匹配结果');
         return;
     }
+    // 2.8.1：与 renderList 相同的 fragment + 委托模式（交互由 bindListDelegation 统一处理）
+    const frag = document.createDocumentFragment();
     for (const f of hits) {
         const isFolder = !!f.is_dir;
         const div = document.createElement('div');
@@ -1169,19 +1218,9 @@ function renderSearchResults(hits) {
         const iconSpan = div.querySelector('.fi-icon');
         if (isFolder) iconSpan.textContent = fallbackEmoji;
         else applySysIcon(iconSpan, f.name, fallbackEmoji);
-        div.onclick = e => selectItem(div, e);
-        div.ondblclick = () => {
-            if (isFolder) navigateTo(f.vpath);
-            else viewFile(f.vpath, f.name);
-        };
-        div.oncontextmenu = e => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!div.classList.contains('selected')) selectItem(div, e);
-            showItemMenu(e.clientX, e.clientY, { vpath: f.vpath, type: div.dataset.type, name: f.name }, state.selectedItems.length);
-        };
-        list.appendChild(div);
+        frag.appendChild(div);
     }
+    list.appendChild(frag);
     setStatus(`搜索：${hits.length} 个匹配（双击进入目录 / 打开文件）`);
 }
 
@@ -1261,7 +1300,8 @@ async function showAuditLog() {
 async function verifyIntegrity() {
     showDialog('完整性体检',
         '<div class="verify-box"><div id="verify-status">正在逐文件校验认证标签…（大保险柜需要一些时间）</div>' +
-        '<div class="progress-track"><div id="verify-bar" class="progress-fill" style="width:0%"></div></div></div>',
+        '<div class="progress-track"><div id="verify-bar" class="progress-fill" style="width:0%"></div></div></div>' +
+        '<p class="audit-note">体检为只读操作，期间其他保险柜操作将排队等待扫描完成。</p>',
         [{ text: '关闭', cls: 'btn-cancel', action: () => true }]);
     try {
         const raw = await invoke('verify_vault_integrity');
@@ -1458,6 +1498,12 @@ function noteActivity() {
 async function autoLockVault() {
     if (!state.vaultOpen) return;
     _idleTimer = null;
+    // 2.8.1：触发前复查最近 30 秒内是否有过活动（noteActivity 的 5 秒节流
+    // 存在理论上漏记的可能）—— 有则顺延计时而不是关柜
+    if (Date.now() - _lastActivity < 30000) {
+        resetIdleTimer();
+        return;
+    }
     let savedNote = '';
     try {
         const ta = document.querySelector('#dialog-body textarea.txt-editor');
@@ -1544,6 +1590,8 @@ function bindEvents() {
     $('btn-settings').onclick = openSettings;
     // 2.8.0：搜索框
     bindSearch();
+    // 2.8.1：列表事件委托（配合 fragment 渲染）
+    bindListDelegation();
     // 2.8.0：空闲自动锁定的活动监听（mousemove 高频，noteActivity 内部节流）
     ['pointerdown', 'keydown', 'wheel', 'mousemove', 'touchstart'].forEach(evt => {
         document.addEventListener(evt, noteActivity, { passive: true });
@@ -1975,8 +2023,11 @@ window.addEventListener('DOMContentLoaded', async () => {
                 // 已运行实例收到第二个实例双击的 .lyt 文件
                 openVaultFromExternal(evt.payload);
             });
-            // 2.8.0：系统锁屏 / 睡眠 / 注销 → 后端已关闭保险柜，前端回启动弹窗
+            // 2.8.0：系统锁屏 / 睡眠 / 注销 → 后端已关闭保险柜，前端回启动弹窗。
+            // 2.8.1：仅 vaultOpen 时处理 —— 后端已改为只在实际关闭了保险柜时发射；
+            // 未开柜时忽略，避免把正在输入的密码框 / 设置对话框无理由关掉
             await window.__TAURI__.event.listen('vault-locked', () => {
+                if (!state.vaultOpen) return;
                 toggleUI(false);
                 hideDialog();
                 hideCtxMenu();

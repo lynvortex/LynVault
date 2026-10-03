@@ -130,8 +130,15 @@ impl<'a> IndexManager<'a> {
         let mut index = self.vault.load_index()?;
         // C5 修复：重名直接覆盖会丢失旧文件元数据（其密文残留无法清理）。
         // 改为冲突时报错，让调用方决定是覆盖、重命名还是取消。
+        // 2.8.1：同时检查文件夹命名空间 —— file/folder 同名碰撞会让
+        // rename/delete/move 语义含混（两套删除实现对同一 vpath 行为不同）。
         if index.files.contains_key(&vpath) {
             return Err(VaultError::Other(format!("目标路径已存在: {}", vpath)));
+        }
+        if index.folders.contains_key(&vpath) {
+            return Err(VaultError::Other(format!(
+                "目标路径已存在同名文件夹，无法创建为文件: {}", vpath
+            )));
         }
         index.files.insert(vpath.clone(), FileMeta {
             name: name.into(),
@@ -150,7 +157,7 @@ impl<'a> IndexManager<'a> {
             }
         }
         self.vault.log_event(&format!("添加文件 '{}'", vpath));
-        self.vault.save_index(&index)?;
+        self.vault.save_index(index)?;
         Ok(())
     }
 
@@ -158,7 +165,7 @@ impl<'a> IndexManager<'a> {
         let mut index = self.vault.load_index()?;
         if index.files.remove(vpath).is_some() {
             self.vault.log_event(&format!("删除文件 '{}'", vpath));
-            self.vault.save_index(&index)?;
+            self.vault.save_index(index)?;
         }
         Ok(())
     }
@@ -174,9 +181,15 @@ impl<'a> IndexManager<'a> {
         if index.folders.contains_key(&vpath) {
             return Err(VaultError::Other(format!("文件夹已存在: {}", vpath)));
         }
+        // 2.8.1：交叉命名空间碰撞防护（同 add_file）
+        if index.files.contains_key(&vpath) {
+            return Err(VaultError::Other(format!(
+                "目标路径已存在同名文件，无法创建为文件夹: {}", vpath
+            )));
+        }
         index.folders.insert(vpath.clone(), true);
         self.vault.log_event(&format!("创建文件夹 '{}'", vpath));
-        self.vault.save_index(&index)?;
+        self.vault.save_index(index)?;
         Ok(())
     }
 
@@ -201,7 +214,7 @@ impl<'a> IndexManager<'a> {
         index.folders.remove(vpath);
 
         self.vault.log_event(&format!("删除文件夹 '{}'", vpath));
-        self.vault.save_index(&index)?;
+        self.vault.save_index(index)?;
         Ok(())
     }
 
@@ -243,7 +256,7 @@ impl<'a> IndexManager<'a> {
             ..meta
         });
         self.vault.log_event(&format!("重命名 '{}' -> '{}'", old_vpath, new_vpath));
-        self.vault.save_index(&index)?;
+        self.vault.save_index(index)?;
         Ok(())
     }
 
@@ -311,123 +324,194 @@ impl<'a> IndexManager<'a> {
         index.folders = new_folders;
 
         self.vault.log_event(&format!("重命名文件夹 '{}' -> '{}'", old_vpath, new_vpath));
-        self.vault.save_index(&index)?;
+        self.vault.save_index(index)?;
         Ok(())
     }
 
     /// 2.8.0：移动文件到目标目录（跨目录移动 = 索引 key 前缀改写，密文不动 ——
     /// AAD 绑定的是导入时冻结的 aad_tag，与重命名同一语义）。
     pub fn move_file(&mut self, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
-        let dest_dir = Index::normalize_vpath(dest_dir)
-            .filter(|p| Index::validate_vpath(p))
-            .ok_or_else(|| VaultError::Other("目标目录非法".into()))?;
         let mut index = self.vault.load_index()?;
-        if dest_dir != "/" && !index.folders.contains_key(&dest_dir) {
-            return Err(VaultError::Other(format!("目标文件夹不存在: {}", dest_dir)));
-        }
-        let name = old_vpath.rsplit('/').next()
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| VaultError::Other("源路径非法".into()))?;
-        let new_vpath = if dest_dir == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", dest_dir, name)
-        };
-        if !Index::validate_vpath(&new_vpath) {
-            return Err(VaultError::Other("目标路径非法".into()));
-        }
-        if new_vpath == old_vpath {
-            return Ok(()); // 移动到当前所在目录：无操作
-        }
-        let mut meta = index.files.remove(old_vpath)
-            .ok_or(VaultError::Other("文件不存在".into()))?;
-        // AAD 冻结（与 rename_file 相同：旧索引可能没有 aad_tag）
-        if meta.aad_tag.is_none() {
-            meta.aad_tag = Some(old_vpath.to_string());
-        }
-        if index.files.contains_key(&new_vpath) {
-            index.files.insert(old_vpath.to_string(), meta);
-            return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
-        }
-        index.files.insert(new_vpath.clone(), meta);
-        self.vault.log_event(&format!("移动 '{}' -> '{}'", old_vpath, new_vpath));
-        self.vault.save_index(&index)?;
+        move_file_in_index(&mut index, old_vpath, dest_dir)?;
+        self.vault.log_event(&format!("移动 '{}'（文件）", old_vpath));
+        self.vault.save_index(index)?;
         Ok(())
     }
 
     /// 2.8.0：移动文件夹（含全部子树）到目标目录。
     /// 拒绝移入自身或自身的子目录；子树 key 前缀改写并逐个冻结 aad_tag。
     pub fn move_folder(&mut self, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
-        let dest_dir = Index::normalize_vpath(dest_dir)
-            .filter(|p| Index::validate_vpath(p))
-            .ok_or_else(|| VaultError::Other("目标目录非法".into()))?;
         let mut index = self.vault.load_index()?;
-        if !index.folders.contains_key(old_vpath) {
-            return Err(VaultError::Other("文件夹不存在".into()));
-        }
-        if dest_dir != "/" && !index.folders.contains_key(&dest_dir) {
-            return Err(VaultError::Other(format!("目标文件夹不存在: {}", dest_dir)));
-        }
-        let name = old_vpath.rsplit('/').next()
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| VaultError::Other("源路径非法".into()))?;
-        let new_vpath = if dest_dir == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", dest_dir, name)
-        };
-        if !Index::validate_vpath(&new_vpath) {
-            return Err(VaultError::Other("目标路径非法".into()));
-        }
-        if new_vpath == old_vpath {
-            return Ok(());
-        }
-        // 不能移入自身 / 自身子目录（否则 key 改写会产生环）
-        if new_vpath == old_vpath || new_vpath.starts_with(&format!("{}/", old_vpath)) {
-            return Err(VaultError::Other("不能把文件夹移动到它自身或其子目录内".into()));
-        }
-        if index.folders.contains_key(&new_vpath) || index.files.contains_key(&new_vpath) {
-            return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
-        }
-
-        let mut new_files = HashMap::new();
-        let mut new_folders = HashMap::new();
-        let old_prefix = format!("{}/", old_vpath);
-        let new_prefix = format!("{}/", new_vpath);
-
-        for (k, v) in &index.files {
-            if k.starts_with(&old_prefix) || k == old_vpath {
-                // AAD 冻结（与 rename_folder 相同）
-                let mut meta = v.clone();
-                if meta.aad_tag.is_none() {
-                    meta.aad_tag = Some(k.clone());
-                }
-                let new_key = if k == old_vpath {
-                    new_vpath.clone()
-                } else {
-                    new_prefix.to_string() + &k[old_prefix.len()..]
-                };
-                new_files.insert(new_key, meta);
-            } else {
-                new_files.insert(k.clone(), v.clone());
-            }
-        }
-        for k in index.folders.keys() {
-            if k.starts_with(&old_prefix) {
-                new_folders.insert(new_prefix.to_string() + &k[old_prefix.len()..], true);
-            } else if k == old_vpath {
-                new_folders.insert(new_vpath.clone(), true);
-            } else {
-                new_folders.insert(k.clone(), true);
-            }
-        }
-        index.files = new_files;
-        index.folders = new_folders;
-
-        self.vault.log_event(&format!("移动文件夹 '{}' -> '{}'", old_vpath, new_vpath));
-        self.vault.save_index(&index)?;
+        move_folder_in_index(&mut index, old_vpath, dest_dir)?;
+        self.vault.log_event(&format!("移动文件夹 '{}'（含子树）", old_vpath));
+        self.vault.save_index(index)?;
         Ok(())
     }
+
+    /// 2.8.1（性能）：批量移动 —— 单次 load_index，N 项在内存中依次变换，
+    /// **一次** save_index。旧实现每项一次完整「加密落盘 + 头部重写 + 旧索引
+    /// DoD 7-pass 擦除」（约 9 次 fsync + 8× 索引体积写入），100 项 × 10k 文件
+    /// 索引 ≈ 1.6GB 写放大；批量化后与 import_files_batch 同一成本模型。
+    /// 返回 (成功数, 失败数, 失败明细)。
+    pub fn move_items(
+        &mut self,
+        vpaths: &[String],
+        dest_dir: &str,
+    ) -> Result<(usize, usize, Vec<String>), VaultError> {
+        let mut index = self.vault.load_index()?;
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for vp in vpaths {
+            let vp_norm = vp.trim_end_matches('/');
+            if vp_norm.is_empty() || vp_norm == "/" {
+                fail += 1;
+                errors.push(format!("{}: 非法路径", vp));
+                continue;
+            }
+            let is_dir = index.folders.contains_key(vp_norm);
+            let is_file = index.files.contains_key(vp_norm);
+            if !is_dir && !is_file {
+                fail += 1;
+                errors.push(format!("{}: 不存在", vp));
+                continue;
+            }
+            let r = if is_dir {
+                move_folder_in_index(&mut index, vp_norm, dest_dir)
+            } else {
+                move_file_in_index(&mut index, vp_norm, dest_dir)
+            };
+            match r {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    errors.push(format!("{}: {}", vp_norm, e));
+                }
+            }
+        }
+        if ok > 0 {
+            self.vault
+                .log_event(&format!("批量移动 {} 项（失败 {} 项）", ok, fail));
+            self.vault.save_index(index)?;
+        }
+        Ok((ok, fail, errors))
+    }
+}
+
+/// 2.8.1：移动文件的纯索引变换（不做 load/save，单项与批量路径共用）。
+fn move_file_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
+    let dest_dir = Index::normalize_vpath(dest_dir)
+        .filter(|p| Index::validate_vpath(p))
+        .ok_or_else(|| VaultError::Other("目标目录非法".into()))?;
+    // 2.8.1 修复：存在性检查前移 —— 旧实现 no-op 短路在存在性检查之前，
+    // 「移动不存在的文件到原地」会误报成功
+    if !index.files.contains_key(old_vpath) {
+        return Err(VaultError::Other("文件不存在".into()));
+    }
+    if dest_dir != "/" && !index.folders.contains_key(&dest_dir) {
+        return Err(VaultError::Other(format!("目标文件夹不存在: {}", dest_dir)));
+    }
+    let name = old_vpath
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| VaultError::Other("源路径非法".into()))?;
+    let new_vpath = if dest_dir == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", dest_dir, name)
+    };
+    if !Index::validate_vpath(&new_vpath) {
+        return Err(VaultError::Other("目标路径非法".into()));
+    }
+    if new_vpath == old_vpath {
+        return Ok(()); // 移动到当前所在目录：无操作（源已确认存在）
+    }
+    let mut meta = index
+        .files
+        .remove(old_vpath)
+        .ok_or(VaultError::Other("文件不存在".into()))?;
+    // AAD 冻结（与 rename_file 相同：旧索引可能没有 aad_tag）
+    if meta.aad_tag.is_none() {
+        meta.aad_tag = Some(old_vpath.to_string());
+    }
+    if index.files.contains_key(&new_vpath) {
+        index.files.insert(old_vpath.to_string(), meta);
+        return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
+    }
+    index.files.insert(new_vpath, meta);
+    Ok(())
+}
+
+/// 2.8.1：移动文件夹的纯索引变换（不做 load/save，单项与批量路径共用）。
+fn move_folder_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
+    let dest_dir = Index::normalize_vpath(dest_dir)
+        .filter(|p| Index::validate_vpath(p))
+        .ok_or_else(|| VaultError::Other("目标目录非法".into()))?;
+    if !index.folders.contains_key(old_vpath) {
+        return Err(VaultError::Other("文件夹不存在".into()));
+    }
+    if dest_dir != "/" && !index.folders.contains_key(&dest_dir) {
+        return Err(VaultError::Other(format!("目标文件夹不存在: {}", dest_dir)));
+    }
+    let name = old_vpath
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| VaultError::Other("源路径非法".into()))?;
+    let new_vpath = if dest_dir == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", dest_dir, name)
+    };
+    if !Index::validate_vpath(&new_vpath) {
+        return Err(VaultError::Other("目标路径非法".into()));
+    }
+    if new_vpath == old_vpath {
+        return Ok(()); // 原地：无操作（源已确认存在）
+    }
+    // 不能移入自身 / 自身子目录（否则 key 改写会产生环）
+    if new_vpath.starts_with(&format!("{}/", old_vpath)) {
+        return Err(VaultError::Other("不能把文件夹移动到它自身或其子目录内".into()));
+    }
+    if index.folders.contains_key(&new_vpath) || index.files.contains_key(&new_vpath) {
+        return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
+    }
+
+    let mut new_files = HashMap::new();
+    let mut new_folders = HashMap::new();
+    let old_prefix = format!("{}/", old_vpath);
+    let new_prefix = format!("{}/", new_vpath);
+
+    for (k, v) in &index.files {
+        if k.starts_with(&old_prefix) || k == old_vpath {
+            // AAD 冻结（与 rename_folder 相同）
+            let mut meta = v.clone();
+            if meta.aad_tag.is_none() {
+                meta.aad_tag = Some(k.clone());
+            }
+            let new_key = if k == old_vpath {
+                new_vpath.clone()
+            } else {
+                new_prefix.to_string() + &k[old_prefix.len()..]
+            };
+            new_files.insert(new_key, meta);
+        } else {
+            new_files.insert(k.clone(), v.clone());
+        }
+    }
+    for k in index.folders.keys() {
+        if k.starts_with(&old_prefix) {
+            new_folders.insert(new_prefix.to_string() + &k[old_prefix.len()..], true);
+        } else if k == old_vpath {
+            new_folders.insert(new_vpath.clone(), true);
+        } else {
+            new_folders.insert(k.clone(), true);
+        }
+    }
+    index.files = new_files;
+    index.folders = new_folders;
+    Ok(())
 }
 
 #[cfg(test)]

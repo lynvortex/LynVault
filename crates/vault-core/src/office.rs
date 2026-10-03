@@ -164,7 +164,7 @@ fn new_aes(key: &[u8]) -> Option<AesKey> {
 
 /// AES-CBC 解密（手写 CBC：逐块 ECB 解密后与前一块密文异或，避免引入 cbc crate）
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 || iv.len() < 16 {
+    if data.is_empty() || !data.len().is_multiple_of(16) || iv.len() < 16 {
         return None;
     }
     let cipher = new_aes(key)?;
@@ -364,7 +364,7 @@ fn decrypt_encrypted_package(data: &[u8], password: &str) -> Result<Vec<u8>, Str
     } else if info.len() >= 4
         && info[1] == 0
         && info[2] == 2
-        && matches!(info[0], 2 | 3 | 4)
+        && matches!(info[0], 2..=4)
     {
         decrypt_standard_package(&info, &package, password)
     } else {
@@ -562,7 +562,7 @@ fn derive_standard_key(h_final: &[u8], key_bits: usize) -> Vec<u8> {
 
 /// AES-ECB 解密（Standard Encryption 的校验器与数据段不使用 IV）
 fn aes_ecb_decrypt(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         return None;
     }
     let cipher = new_aes(key)?;
@@ -615,11 +615,26 @@ fn decrypt_standard_package(
     let p = parse_standard_encryption_info(info)?;
     let key = derive_standard_key_from_password(password, &p.salt, p.key_bits);
 
-    // 口令校验（AES-ECB）
-    let mut verifier = aes_ecb_decrypt(&key, &p.encrypted_verifier).ok_or("文档已损坏")?;
+    // 口令校验（AES-ECB）。
+    // 2.8.1：verifier 比对改为恒定时间（与 Agile 路径的 ct_eq 纪律一致），
+    // 并给 verifier_hash 解密失败的早退路径补上 key 清零（旧实现 key 以明文 drop）
+    let mut verifier = aes_ecb_decrypt(&key, &p.encrypted_verifier).ok_or_else(|| {
+        let mut k = key.clone();
+        k.zeroize();
+        "文档已损坏".to_string()
+    })?;
     let expected = hash_bytes(HashAlg::Sha1, &verifier);
-    let verifier_hash = aes_ecb_decrypt(&key, &p.encrypted_verifier_hash).ok_or("文档已损坏")?;
-    let ok = verifier_hash.len() >= expected.len() && verifier_hash[..expected.len()] == expected[..];
+    let verifier_hash = aes_ecb_decrypt(&key, &p.encrypted_verifier_hash).ok_or_else(|| {
+        let mut k = key.clone();
+        k.zeroize();
+        "文档已损坏".to_string()
+    })?;
+    use subtle::ConstantTimeEq;
+    let ok = verifier_hash.len() >= expected.len()
+        && bool::from(
+            verifier_hash.as_slice()[..expected.len()]
+                .ct_eq(&expected[..]),
+        );
     verifier.zeroize();
     if !ok {
         let mut key = key;
@@ -639,7 +654,7 @@ fn decrypt_standard_package(
         key.zeroize();
         return Err(format!("文档解密后超过预览上限（{} 字节）", MAX_OFFICE_TEXT));
     }
-    if package.len() - 8 == 0 || (package.len() - 8) % 16 != 0 {
+    if package.len() - 8 == 0 || !(package.len() - 8).is_multiple_of(16) {
         let mut key = key;
         key.zeroize();
         return Err("文档已损坏".into());
@@ -797,7 +812,7 @@ fn extract_doc_text(data: &[u8]) -> io::Result<String> {
             let hi2 = stream_data[i + 3];
             let low_pair = u16::from_le_bytes([lo2, hi2]);
             if (0xDC00..=0xDFFF).contains(&low_pair) {
-                let c = (((ch as u32) - 0xD800) << 10 | (low_pair as u32) - 0xDC00) + 0x10000;
+                let c = ((((ch as u32) - 0xD800) << 10) | ((low_pair as u32) - 0xDC00)) + 0x10000;
                 current.push(char::from_u32(c).unwrap_or('?'));
                 i += 4;
                 continue;
@@ -1177,7 +1192,7 @@ mod tests {
         }
         let cipher = new_aes(key)?;
         let mut padded = data.to_vec();
-        if padded.len() % 16 != 0 {
+        if !padded.len().is_multiple_of(16) {
             padded.resize((padded.len() / 16 + 1) * 16, 0);
         }
         let mut prev: [u8; 16] = iv[..16].try_into().ok()?;

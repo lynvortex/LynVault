@@ -92,12 +92,24 @@ fn event_loop() {
             return;
         }
     };
-    if STOP_REQUESTED.load(Ordering::Relaxed) {
-        return; // stop() 在窗口创建前就已请求退出
-    }
+    // 2.8.1（竞态修复）：先发布句柄、再检查停止标志。
+    // 旧顺序（先查标志后存句柄）下，stop() 恰好在两者之间执行时拿不到句柄，
+    // WM_STOP 永远发不出去 → GetMessageW 永久阻塞 → stop() 的 join 卡死 →
+    // 下一次 open_vault 里的 start()/stop() 全部挂起。
+    // 现顺序下：stop() 无论在哪个时刻运行，要么 swap 到句柄发出 WM_STOP，
+    // 要么本线程随后的 STOP_REQUESTED 检查必然为 true 而自行退出。
     GUARD_HWND.store(hwnd.0 as isize, Ordering::Release);
+    if STOP_REQUESTED.load(Ordering::Acquire) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+        }
+        return;
+    }
     if unsafe { windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd) }.is_err() {
         log::warn!("AddClipboardFormatListener 失败，剪贴板保护未生效");
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+        }
         return;
     }
 
@@ -109,7 +121,7 @@ fn event_loop() {
         if r.0 <= 0 {
             break;
         }
-        if msg.message == WM_STOP || STOP_REQUESTED.load(Ordering::Relaxed) {
+        if msg.message == WM_STOP || STOP_REQUESTED.load(Ordering::Acquire) {
             break;
         }
         if msg.message == WM_CLIPBOARDUPDATE {
@@ -122,6 +134,8 @@ fn event_loop() {
     }
     unsafe {
         let _ = windows::Win32::System::DataExchange::RemoveClipboardFormatListener(hwnd);
+        // 2.8.1：销毁监听窗口 —— 否则句柄跨 start/stop 泄漏累积
+        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
     }
     GUARD_HWND.store(0, Ordering::Release);
 }
@@ -181,7 +195,13 @@ fn create_message_window() -> Result<windows::Win32::Foundation::HWND, String> {
         ..Default::default()
     };
     if unsafe { RegisterClassW(&wc) } == 0 {
-        return Err("RegisterClassW 失败".into());
+        // 2.8.1（生命周期修复）：窗口类注册进进程全局表，进程内第二次 start()
+        // 再注册同一类名会失败（ERROR_CLASS_ALREADY_EXISTS）—— 旧实现直接报错
+        // 退出，导致第一次关柜之后剪贴板保护全程静默失效。类已存在时直接复用。
+        let err = unsafe { windows::Win32::Foundation::GetLastError() };
+        if err != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
+            return Err(format!("RegisterClassW 失败: {:?}", err));
+        }
     }
     let hwnd = unsafe {
         CreateWindowExW(

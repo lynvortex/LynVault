@@ -60,8 +60,27 @@ fn si_port() -> u16 {
     20000 + (fnv1a(APP_ID) % 20000) as u16
 }
 
-/// 判断路径是否为 LynVault 保险柜文件（扩展名 + magic bytes 双重校验）
+/// 2.8.1 新增：拒绝远程 / 设备路径。
+///
+/// 单实例端口接受任意本地进程的连接（2.7.1 已把「打开动作」置于用户确认之后），
+/// 但 `looks_like_vault` 的 magic bytes 预检发生在确认**之前** —— 路径若是
+/// `\\server\share\...`（UNC）或 `\\.\device`，OpenClipboard 式的文件打开会
+/// 无提示地发起 SMB 访问，构成免交互的 NTLM 凭据外泄 / 中继触发原语。
+/// 本程序的用户场景永远是「本地磁盘上的保险柜文件」，直接拒绝一切
+/// UNC / 设备路径（`\\?\C:\...` verbatim 本地路径仍放行）。
+fn is_remote_or_device_path(p: &str) -> bool {
+    let t = p.trim_start_matches('"');
+    // verbatim 前缀剥掉后再判断：\\?\C:\... 是本地路径，\\?\UNC\... 是远程
+    let t = t.strip_prefix(r"\\?\").unwrap_or(t);
+    t.starts_with(r"\\")
+}
+
+/// 判断路径是否为 LynVault 保险柜文件（扩展名 + magic bytes 双重校验）。
+/// 2.8.1：远程 / 设备路径不做文件打开（见 is_remote_or_device_path）。
 fn looks_like_vault(p: &str) -> bool {
+    if is_remote_or_device_path(p) {
+        return false;
+    }
     let path = Path::new(p);
     let ext_ok = path.extension()
         .and_then(|e| e.to_str())
