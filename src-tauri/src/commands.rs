@@ -121,6 +121,8 @@ pub async fn create_vault(
                     .map_err(|e| e.to_string())?;
                 let mut guard = lock_vault(state)?;
                 *guard = Some(vault);
+                // 2.8.0：保险柜已打开 → 启动剪贴板保护（开柜期间即时清空）
+                crate::clipboard_guard::start();
                 Ok(())
             })();
             if let Some(kd) = key_data {
@@ -151,6 +153,8 @@ pub async fn open_vault(
                     .map_err(|e| e.to_string())?;
                 let mut guard = lock_vault(state)?;
                 *guard = Some(vault);
+                // 2.8.0：保险柜已打开 → 启动剪贴板保护（开柜期间即时清空）
+                crate::clipboard_guard::start();
                 Ok(idx)
             })();
             if let Some(kd) = key_data {
@@ -172,6 +176,8 @@ pub async fn close_vault(app: AppHandle) -> Result<(), String> {
             v.close(); // 2.4.1：清理索引缓存 + 审计补落盘，再释放会话
         }
         *guard = None;
+        // 2.8.0：会话已结束 → 停止剪贴板保护（系统剪贴板恢复正常）
+        crate::clipboard_guard::stop();
         Ok(())
     })
     .await
@@ -509,7 +515,7 @@ pub async fn defragment_vault(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
-    run_blocking(&app, "destroy_vault", move |state| {
+    let result = run_blocking(&app, "destroy_vault", move |state| {
         let mut guard = lock_vault(state)?;
         let vault = guard.as_mut().ok_or("保险柜未打开")?;
         // 2.7.1 修复（关键回归）：销毁改为全程使用会话句柄（Vault::destroy），
@@ -520,7 +526,10 @@ pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
         // 句柄锚定的 TOCTOU 防护不再削弱。
         vault.destroy().map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    // 2.8.0：销毁后会话不存在 → 停止剪贴板保护
+    crate::clipboard_guard::stop();
+    result
 }
 
 // ───────────────── 文件信息与预览 ─────────────────
@@ -721,6 +730,266 @@ pub fn get_launch_vault_arg() -> Result<Option<String>, String> {
 #[tauri::command]
 pub fn frontend_ready() -> Result<(), String> {
     crate::single_instance::FRONTEND_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+// ───────────────── 2.8.0：改密码 / 移动 / 搜索 / 审计 / 体检 / 锁定信息 / 设置 ─────────────────
+
+/// 2.8.0：修改当前分区密码。
+/// - v5 保险柜：头部级操作（换盐重新包裹 data_key），数据零接触；
+/// - v4 保险柜：自动升级为 v5（一次性全库重加密）。
+/// 必须验证当前密码，防止他人在已解锁的机器上改密锁死真正的主人。
+#[tauri::command]
+pub async fn change_password(
+    app: AppHandle,
+    mut current_password: String,
+    mut new_password: String,
+    key_file_path: Option<String>,
+) -> Result<(), String> {
+    run_blocking(&app, "change_password", move |state| {
+        let result: Result<(), String> = (|| {
+            let key_data = load_key_file(&key_file_path)?;
+            let changed: Result<(), String> = (|| {
+                let mut guard = lock_vault(state)?;
+                let vault = guard.as_mut().ok_or("保险柜未打开")?;
+                vault
+                    .change_password(
+                        &current_password,
+                        &new_password,
+                        key_data.as_deref(),
+                        None::<fn(usize)>,
+                    )
+                    .map_err(|e| e.to_string())
+            })();
+            if let Some(kd) = key_data {
+                vault_core::wipe::secure_wipe_vec(kd);
+            }
+            changed
+        })();
+        current_password.as_mut_str().zeroize();
+        new_password.as_mut_str().zeroize();
+        result
+    })
+    .await
+}
+
+/// 2.8.0：移动文件/文件夹到目标目录（跨目录移动只改索引，不重加密）。
+/// 返回 { ok, fail, errors }。
+#[tauri::command]
+pub async fn move_items(
+    app: AppHandle,
+    vpaths: Vec<String>,
+    dest_folder: String,
+) -> Result<serde_json::Value, String> {
+    run_blocking(&app, "move_items", move |state| {
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        let dest_norm = vault_core::Index::normalize_vpath(&dest_folder)
+            .filter(|p| vault_core::Index::validate_vpath(p))
+            .ok_or_else(|| "目标目录非法".to_string())?;
+        // 先按索引分类（文件夹 / 文件），非法输入（根目录/空路径）直接计为失败
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let classified: Vec<(String, bool)> = {
+            let index = vault.load_index().map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for vp in &vpaths {
+                let vp_norm = vp.trim_end_matches('/');
+                if vp_norm.is_empty() || vp_norm == "/" {
+                    fail += 1;
+                    errors.push(format!("{}: 非法路径", vp));
+                    continue;
+                }
+                let is_dir = index.folders.contains_key(vp_norm);
+                out.push((vp_norm.to_string(), is_dir));
+            }
+            out
+        };
+        for (vp, is_dir) in &classified {
+            let r = {
+                let mut mgr = vault.get_index_manager().map_err(|e| e.to_string())?;
+                if *is_dir {
+                    mgr.move_folder(vp, &dest_norm)
+                } else {
+                    mgr.move_file(vp, &dest_norm)
+                }
+            };
+            match r {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    errors.push(format!("{}: {}", vp, e));
+                }
+            }
+        }
+        Ok(serde_json::json!({ "ok": ok, "fail": fail, "errors": errors }))
+    })
+    .await
+}
+
+/// 2.8.0：列出当前分区全部文件夹（移动选择器用）。
+#[tauri::command]
+pub async fn list_all_folders(app: AppHandle) -> Result<Vec<String>, String> {
+    run_blocking(&app, "list_all_folders", move |state| {
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        vault.list_all_folders().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// 2.8.0：按文件名 / vpath 搜索（大小写不敏感子串，文件夹在前）。
+#[tauri::command]
+pub async fn search_files(
+    app: AppHandle,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<vault_core::SearchHit>, String> {
+    run_blocking(&app, "search_files", move |state| {
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        let limit = limit.unwrap_or(200).clamp(1, 1000) as usize;
+        vault.search_files(&query, limit).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// 2.8.0：读取保险柜内部审计日志（链式 HMAC 保护，倒序，最新在前）。
+#[tauri::command]
+pub async fn get_audit_log(
+    app: AppHandle,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    run_blocking(&app, "get_audit_log", move |state| {
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        let limit = limit.unwrap_or(500).clamp(1, 5000) as usize;
+        let entries = vault.get_audit_entries();
+        Ok(entries
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|e| serde_json::json!({ "ts": e.ts, "event": e.event }))
+            .collect())
+    })
+    .await
+}
+
+/// 2.8.0：全库完整性体检 —— 逐文件解密校验 GCM 认证标签（只读）。
+/// 过程经 `integrity-progress` 事件向前端汇报进度。
+#[tauri::command]
+pub async fn verify_vault_integrity(app: AppHandle) -> Result<serde_json::Value, String> {
+    let app2 = app.clone();
+    run_blocking(&app, "verify_vault_integrity", move |state| {
+        let mut guard = lock_vault(state)?;
+        let vault = guard.as_mut().ok_or("保险柜未打开")?;
+        let (total, broken) = vault
+            .verify_integrity(Some(move |done: usize, total: usize, current: &str| {
+                let _ = app2.emit_all(
+                    "integrity-progress",
+                    serde_json::json!({ "done": done, "total": total, "current": current }),
+                );
+            }))
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "total": total, "broken": broken }))
+    })
+    .await
+}
+
+/// 2.8.0：读取保险柜头部锁定区的失败尝试计数（开锁前提示用，无需密码）。
+#[tauri::command]
+pub fn get_lock_info(path: String) -> Result<serde_json::Value, String> {
+    catch("get_lock_info", || {
+        let info = vault_core::read_lock_info(Path::new(&path)).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "failedCount": info.failed_count,
+            "locked": info.locked,
+            "lockUntilEpoch": info.lock_until_epoch,
+        }))
+    })
+}
+
+/// 2.8.0：读取当前设置（enabled=false 表示未启用持久化，settings 字段为默认值）。
+#[tauri::command]
+pub fn get_settings() -> Result<serde_json::Value, String> {
+    catch("get_settings", || {
+        match crate::settings::load_active() {
+            Some((path, s)) => Ok(serde_json::json!({
+                "enabled": true,
+                "path": path.to_string_lossy(),
+                "settings": serde_json::to_value(&s).map_err(|e| e.to_string())?,
+            })),
+            None => Ok(serde_json::json!({
+                "enabled": false,
+                "path": serde_json::Value::Null,
+                "settings": serde_json::to_value(crate::settings::Settings::default())
+                    .map_err(|e| e.to_string())?,
+            })),
+        }
+    })
+}
+
+/// 2.8.0：启用设置持久化（写入用户选择的位置；已启用时保留现有值迁移到新位置）。
+#[tauri::command]
+pub fn enable_persistence(location: String) -> Result<String, String> {
+    catch("enable_persistence", || {
+        let loc = match location.as_str() {
+            "portable" => crate::settings::ConfigLocation::Portable,
+            "appdata" => crate::settings::ConfigLocation::AppData,
+            _ => return Err("未知的配置位置".into()),
+        };
+        let s = crate::settings::load_active()
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        let path = crate::settings::save_to(loc, &s)?;
+        Ok(path.to_string_lossy().to_string())
+    })
+}
+
+/// 2.8.0：关闭持久化（删除当前生效的配置文件）。
+#[tauri::command]
+pub fn disable_persistence() -> Result<String, String> {
+    catch("disable_persistence", || {
+        let path = crate::settings::delete_active()?;
+        Ok(path.to_string_lossy().to_string())
+    })
+}
+
+/// 2.8.0：保存设置（要求已启用持久化）。防截屏开关即时生效。
+#[tauri::command]
+pub async fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), String> {
+    let app2 = app.clone();
+    run_blocking(&app, "save_settings", move |_state| {
+        let s: crate::settings::Settings = serde_json::from_value(settings)
+            .map_err(|e| format!("设置格式无效: {}", e))?;
+        let s = s.sanitized();
+        let path = crate::settings::active_config_path()
+            .ok_or("未启用持久化，请先在设置中启用后再修改")?;
+        crate::settings::save_at(&path, &s)?;
+        // 防截屏开关即时生效（主题 / 自动锁定时长由前端即时应用）
+        let _ = crate::apply_anti_screenshot(&app2, s.anti_screenshot);
+        Ok(())
+    })
+    .await
+}
+
+/// 2.8.0：系统锁屏 / 睡眠 / 注销触发的自动关闭（system_events 调用）。
+/// 关闭会话 + 停止剪贴板保护 + 通知前端回到启动弹窗。
+/// 仅 Windows 的 system_events 模块调用，非 Windows 平台静默保留。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn system_lock_vault(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    catch("system_lock_vault", || {
+        let mut guard = lock_vault(&state)?;
+        if let Some(v) = guard.as_mut() {
+            v.close();
+        }
+        *guard = None;
+        Ok(())
+    })?;
+    crate::clipboard_guard::stop();
+    let _ = app.emit_all("vault-locked", ());
     Ok(())
 }
 

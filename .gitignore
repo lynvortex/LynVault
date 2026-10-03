@@ -21,6 +21,7 @@ Thumbs.db
 *.exe
 lynvault-fixed*
 *.deb
+LynVault-*-linux-amd64
 
 # 本地保险柜与碎片整理临时文件
 *.lyt
@@ -32,3 +33,7 @@ lynvault-fixed*
 
 # 调试探针 / 临时目录（勿提交）
 .probe/
+
+# ZCode 会话目录（勿提交）
+.zcode/
+.zcodeignore

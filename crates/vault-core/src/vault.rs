@@ -16,10 +16,24 @@ use crate::wipe::{dod_erase, dod_overwrite_range, secure_wipe_vec};
 
 // --- 常量 ---
 const MAGIC: &[u8; 8] = b"PYVAULT4";
-const VERSION: u8 = 4;
-const HEADER_SIZE: usize = 1024;
+/// v4 格式（1024 字节头部，会话密钥直接由口令派生）
+const VERSION_V4: u8 = 4;
+/// v5 格式（2.8.0：信封加密 —— 随机 data_key 由口令包裹存储于头部，
+/// 修改口令只需重写头部，数据零接触）
+const VERSION_V5: u8 = 5;
+const HEADER_SIZE_V4: usize = 1024;
+const HEADER_SIZE_V5: usize = 2048;
 const MAX_PARTITIONS: usize = 8;
-const PARTITION_ENTRY_SIZE: usize = 96;
+const PARTITION_ENTRY_SIZE_V4: usize = 96;
+const PARTITION_ENTRY_SIZE_V5: usize = 192;
+const LOCK_OFFSET_V4: usize = 887;
+/// v5 头部：106 + 8×192 = 1642
+const LOCK_OFFSET_V5: usize = 1642;
+/// v5 头部签名覆盖 header[..1984]，签名本体位于 1984..2048
+const SIGNED_LENGTH_V5: usize = 1984;
+const SIGNATURE_OFFSET_V5: usize = 1984;
+/// v5 分区条目中的包裹密钥字段：nonce(12) + data_key 密文(32) + GCM tag(16)
+const WRAPPED_KEY_SIZE: usize = 60;
 
 /// LynVault 文件 magic bytes（8 字节），用于启动扫描时识别真正的保险柜文件
 pub const VAULT_MAGIC: &[u8; 8] = MAGIC;
@@ -36,6 +50,72 @@ pub fn is_vault_file(path: &Path) -> bool {
         Ok(_) => &buf == VAULT_MAGIC,
         Err(_) => false,
     }
+}
+
+/// 2.8.0：完整性体检的单个异常条目
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IntegrityIssue {
+    pub vpath: String,
+    pub reason: String,
+}
+
+/// 2.8.0：搜索结果条目
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub vpath: String,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+/// 2.8.0：头部锁定区信息（开锁前的失败尝试提示用）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LockInfo {
+    /// 累计失败尝试次数（成功打开后清零）
+    pub failed_count: u8,
+    /// 当前是否处于锁定状态（≥5 次失败且未到期）
+    pub locked: bool,
+    /// 锁定到期时刻（epoch 秒；未锁定为 0）
+    pub lock_until_epoch: f64,
+}
+
+/// 2.8.0：读取保险柜头部锁定区的失败计数（无需密码 —— 锁定区 HMAC 用公开密钥）。
+///
+/// 供开锁前的 UI 提示使用：用户能看到「这个文件已被试错 N 次」，从而察觉
+/// 有人动过自己的保险柜。锁定区 HMAC 校验失败（头部被篡改）时返回错误。
+pub fn read_lock_info(path: &Path) -> Result<LockInfo, VaultError> {
+    let mut f = File::open(path)?;
+    let mut sniff = [0u8; 9];
+    f.read_exact(&mut sniff)?;
+    if &sniff[..8] != MAGIC {
+        return Err(VaultError::BadMagic);
+    }
+    let lock_offset = match sniff[8] {
+        VERSION_V4 => LOCK_OFFSET_V4,
+        VERSION_V5 => LOCK_OFFSET_V5,
+        v => return Err(VaultError::Other(format!("不支持的保险柜格式版本 {}", v))),
+    };
+    // 保险柜 salt 在 v4/v5 布局中位置一致（73..105）
+    f.seek(SeekFrom::Start(73))?;
+    let mut salt = [0u8; 32];
+    f.read_exact(&mut salt)?;
+    f.seek(SeekFrom::Start(lock_offset as u64))?;
+    let mut buf = [0u8; 41];
+    f.read_exact(&mut buf)?;
+    let lock_state = LockState {
+        lock_count: buf[0],
+        lock_until: f64::from_le_bytes(buf[1..9].try_into().unwrap()),
+        lock_until_monotonic: None,
+    };
+    let mac_key = derive_lock_mac_key(&salt);
+    if !lock_state.verify_hmac(&mac_key, &buf[9..41].try_into().unwrap()) {
+        return Err(VaultError::Other("头部锁定区校验失败 —— 头部可能被篡改".into()));
+    }
+    Ok(LockInfo {
+        failed_count: lock_state.lock_count,
+        locked: lock_state.is_locked(),
+        lock_until_epoch: lock_state.lock_until,
+    })
 }
 
 /// 2.6.1 新增：以「读写 + 独占访问」打开保险柜文件。
@@ -122,8 +202,7 @@ fn lock_vault_exclusive(_file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
-const LOCK_OFFSET: usize = 887;
-// 签名范围仅到 lock_offset 之前；锁定区（887-927）由自身 HMAC 保护，
+// 签名范围仅到 lock_offset 之前；锁定区由自身 HMAC 保护，
 // 每次认证失败都会修改锁定区，若包含在签名中会导致后续认证因签名不匹配而失败。
 // 2.7.1：常量单一来源收敛到 crypto.rs（本文件经 `use crate::crypto::*` 导入）
 
@@ -380,18 +459,34 @@ fn replace_file_windows(temp: &Path, dest: &Path) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
-/// 写入完整头部（含签名）
+/// 写入完整头部（含签名）—— 按格式版本分发。
 fn write_header_to_file(
+    file: &mut File,
+    version: u8,
+    lock_state: &LockState,
+    salt: &[u8; 32],
+    partitions: &[PartitionInfo],
+    sign_key: &[u8; 32],
+) -> Result<(), VaultError> {
+    match version {
+        VERSION_V4 => write_header_v4(file, lock_state, salt, partitions, sign_key),
+        VERSION_V5 => write_header_v5(file, lock_state, salt, partitions, sign_key),
+        v => Err(VaultError::Other(format!("未知的保险柜格式版本: {}", v))),
+    }
+}
+
+/// v4 头部（1024 字节）—— 与 2.x 历史格式逐字节一致。
+fn write_header_v4(
     file: &mut File,
     lock_state: &LockState,
     salt: &[u8; 32],
     partitions: &[PartitionInfo],
     sign_key: &[u8; 32],
 ) -> Result<(), VaultError> {
-    let mut header = [0u8; HEADER_SIZE];
+    let mut header = [0u8; HEADER_SIZE_V4];
 
     header[..8].copy_from_slice(MAGIC);
-    header[8] = VERSION;
+    header[8] = VERSION_V4;
     // bytes 9..40 reserved
     // bytes 41..73: was lock_key (plaintext) — now zeroed (lock_key is derived from salt)
     header[73..105].copy_from_slice(salt);
@@ -418,21 +513,21 @@ fn write_header_to_file(
             // 2.3.0 修复（防元数据泄露）：未使用的条目**整体**填充随机数据（含别名），
             // 不再以「别名首字节 0」作标记 —— 旧标记使读取者可数出真实分区数量。
             // 打开时会对全部 8 个条目做恒定次数的认证尝试，伪条目认证必然失败。
-            let mut rand_buf = [0u8; PARTITION_ENTRY_SIZE];
+            let mut rand_buf = [0u8; PARTITION_ENTRY_SIZE_V4];
             OsRng.fill_bytes(&mut rand_buf);
-            header[off..off + PARTITION_ENTRY_SIZE].copy_from_slice(&rand_buf);
-            off += PARTITION_ENTRY_SIZE;
+            header[off..off + PARTITION_ENTRY_SIZE_V4].copy_from_slice(&rand_buf);
+            off += PARTITION_ENTRY_SIZE_V4;
         }
     }
 
-    header[LOCK_OFFSET] = lock_state.lock_count;
-    header[LOCK_OFFSET + 1..LOCK_OFFSET + 9]
+    header[LOCK_OFFSET_V4] = lock_state.lock_count;
+    header[LOCK_OFFSET_V4 + 1..LOCK_OFFSET_V4 + 9]
         .copy_from_slice(&lock_state.lock_until.to_le_bytes());
     // 2.3.0 修复：锁定区 HMAC 使用从 salt 独立派生的公开密钥，
     // 任意密码的打开尝试都能校验并递增计数（详见 crypto::derive_lock_mac_key）
     let mac_key = derive_lock_mac_key(salt);
     let hmac = lock_state.compute_hmac(&mac_key);
-    header[LOCK_OFFSET + 9..LOCK_OFFSET + 9 + 32].copy_from_slice(&hmac);
+    header[LOCK_OFFSET_V4 + 9..LOCK_OFFSET_V4 + 9 + 32].copy_from_slice(&hmac);
 
     let sig = compute_header_signature(&header[..SIGNED_LENGTH], sign_key);
     header[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE].copy_from_slice(&sig);
@@ -442,6 +537,74 @@ fn write_header_to_file(
     file.flush()?;
     file.sync_all()?;
     Ok(())
+}
+
+/// v5 头部（2048 字节，2.8.0）：与 v4 的差异 ——
+/// - 分区条目 96 → 192 字节：新增 60 字节 `wrapped_key`（nonce12 + ct32 + tag16）；
+/// - 条目保留字段同样填充随机数（真实条目先整体随机再覆写结构化字段，
+///   不给「保留区为 0」这类可区分标记留位置）；
+/// - 锁定区移至 1642（106 + 8×192），签名覆盖 header[..1984] 并写在 1984..2048。
+fn write_header_v5(
+    file: &mut File,
+    lock_state: &LockState,
+    salt: &[u8; 32],
+    partitions: &[PartitionInfo],
+    sign_key: &[u8; 32],
+) -> Result<(), VaultError> {
+    let mut header = [0u8; HEADER_SIZE_V5];
+
+    header[..8].copy_from_slice(MAGIC);
+    header[8] = VERSION_V5;
+    header[73..105].copy_from_slice(salt);
+    header[105] = MAX_PARTITIONS as u8;
+
+    let mut off = 106;
+    for i in 0..MAX_PARTITIONS {
+        let mut entry = [0u8; PARTITION_ENTRY_SIZE_V5];
+        // 真实/伪条目统一先填随机：保留区不留可区分标记（与 v4 同一策略的延伸）
+        OsRng.fill_bytes(&mut entry);
+        if let Some(p) = partitions.get(i) {
+            let alias_field = alias_field16(&p.alias);
+            entry[..16].copy_from_slice(&alias_field);
+            entry[16..48].copy_from_slice(&p.salt);
+            entry[48..80].copy_from_slice(&p.auth_tag);
+            entry[80..88].copy_from_slice(&p.index_offset.to_le_bytes());
+            entry[88..96].copy_from_slice(&p.index_length.to_le_bytes());
+            let wrapped = p.wrapped_key.ok_or_else(|| {
+                VaultError::Other("v5 分区条目缺少包裹密钥（内部错误）".into())
+            })?;
+            entry[96..96 + WRAPPED_KEY_SIZE].copy_from_slice(&wrapped);
+            // 156..192 保留（已填随机）
+        }
+        header[off..off + PARTITION_ENTRY_SIZE_V5].copy_from_slice(&entry);
+        off += PARTITION_ENTRY_SIZE_V5;
+    }
+
+    header[LOCK_OFFSET_V5] = lock_state.lock_count;
+    header[LOCK_OFFSET_V5 + 1..LOCK_OFFSET_V5 + 9]
+        .copy_from_slice(&lock_state.lock_until.to_le_bytes());
+    let mac_key = derive_lock_mac_key(salt);
+    let hmac = lock_state.compute_hmac(&mac_key);
+    header[LOCK_OFFSET_V5 + 9..LOCK_OFFSET_V5 + 9 + 32].copy_from_slice(&hmac);
+
+    let sig = compute_header_signature(&header[..SIGNED_LENGTH_V5], sign_key);
+    header[SIGNATURE_OFFSET_V5..SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE].copy_from_slice(&sig);
+
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// 按格式版本返回头部大小（碎片整理 / 升级管线的占位头部尺寸必须与之一致，
+/// 否则 v4→v5 升级时 1024 字节占位会让 v5 头部覆写越界到数据区）。
+fn header_size_of(version: u8) -> Result<usize, VaultError> {
+    match version {
+        VERSION_V4 => Ok(HEADER_SIZE_V4),
+        VERSION_V5 => Ok(HEADER_SIZE_V5),
+        v => Err(VaultError::Other(format!("未知的保险柜格式版本: {}", v))),
+    }
 }
 
 /// 解密文件数据时应使用的 AAD。
@@ -642,10 +805,11 @@ fn alias_field16(alias: &str) -> [u8; 16] {
 
 /// 2.6.1：头部绑定认证标签所用的「头部前缀」，与 `write_header_to_file` 写出的
 /// `header[..105]` 逐字节一致：magic(8) || version(1) || 保留区(64, 全 0) || 保险柜 salt(32)。
-fn auth_tag_header_prefix(vault_salt: &[u8; 32]) -> [u8; 105] {
+/// 2.8.0：版本字节参数化（v4 前缀与历史格式逐字节一致）。
+fn auth_tag_header_prefix(vault_salt: &[u8; 32], version: u8) -> [u8; 105] {
     let mut p = [0u8; 105];
     p[..8].copy_from_slice(MAGIC);
-    p[8] = VERSION;
+    p[8] = version;
     p[73..105].copy_from_slice(vault_salt);
     p
 }
@@ -654,11 +818,36 @@ fn auth_tag_header_prefix(vault_salt: &[u8; 32]) -> [u8; 105] {
 fn bound_auth_tag(
     auth_key: &[u8; 32],
     vault_salt: &[u8; 32],
+    version: u8,
     entry_alias: &[u8; 16],
     entry_salt: &[u8; 32],
 ) -> [u8; 32] {
-    let prefix = auth_tag_header_prefix(vault_salt);
+    let prefix = auth_tag_header_prefix(vault_salt, version);
     create_auth_tag_bound(auth_key, &prefix, entry_alias, entry_salt)
+}
+
+/// 2.8.0（v5）：包裹密钥的 AAD —— 域分隔 || 头部前缀(105) || 条目别名字段(16) || 条目盐(32)。
+///
+/// 把包裹体绑定到头部全局字段与该条目自身：调包两个分区的 wrapped_key、或
+/// 篡改头部版本/salt 都会让解包失败（与 auth_tag 的绑定互相独立、互为备份）。
+fn key_wrap_aad(header_prefix: &[u8; 105], entry_alias: &[u8], entry_salt: &[u8; 32]) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"LYNVAULT-KEY-WRAP-V5";
+    let mut aad = Vec::with_capacity(DOMAIN.len() + 105 + 16 + 32);
+    aad.extend_from_slice(DOMAIN);
+    aad.extend_from_slice(header_prefix);
+    aad.extend_from_slice(entry_alias);
+    aad.extend_from_slice(entry_salt);
+    aad
+}
+
+/// 2.8.0（v5）：恒定时间校验 v5 头部签名（覆盖 header[..1984]，签名在 1984..2048）。
+/// 仅用于「分区密码正确但索引校验失败」时的诊断取证（与 v4 的 verify_header_signature 同角色）。
+fn verify_header_signature_v5(header: &[u8; HEADER_SIZE_V5], sign_key: &[u8; 32]) -> bool {
+    let computed = compute_header_signature(&header[..SIGNED_LENGTH_V5], sign_key);
+    use subtle::ConstantTimeEq;
+    computed
+        .ct_eq(&header[SIGNATURE_OFFSET_V5..SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE])
+        .into()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -671,6 +860,13 @@ pub struct Vault {
     pub(crate) enc_key: Option<[u8; 32]>,
     pub(crate) auth_key: Option<[u8; 32]>,
     pub(crate) sign_key: Option<[u8; 32]>,
+
+    /// 2.8.0（v5）：保险柜文件格式版本（4 = 旧格式兼容，5 = 信封加密）。
+    /// 仅在会话建立后有意义的元数据；未打开时为 0。
+    pub(crate) format_version: u8,
+    /// 2.8.0（v5）：当前分区的随机数据密钥（口令包裹层之下的真正密钥）。
+    /// v4 会话为 None。修改口令时以它为锚 —— 数据密钥不变，只换包裹。
+    pub(crate) data_key: Option<[u8; 32]>,
 
     pub(crate) salt: [u8; 32],
     pub(crate) lock_state: LockState,
@@ -700,6 +896,8 @@ impl Default for Vault {
             enc_key: None,
             auth_key: None,
             sign_key: None,
+            format_version: 0,
+            data_key: None,
             salt: [0u8; 32],
             lock_state: LockState::new(),
             partitions: Vec::new(),
@@ -718,6 +916,10 @@ pub struct PartitionInfo {
     pub auth_tag: [u8; 32],
     pub index_offset: u64,
     pub index_length: u64,
+    /// 2.8.0（v5）：被分区口令包裹的随机 data_key（nonce12 + ct32 + tag16）。
+    /// v4 条目为 None（v4 的会话密钥直接由口令派生，无包裹层）。
+    /// 未使用条目整体随机填充时该字段同样是随机字节，与真实条目不可区分。
+    pub wrapped_key: Option<[u8; WRAPPED_KEY_SIZE]>,
 }
 
 impl Vault {
@@ -782,17 +984,37 @@ impl Vault {
         // 2.6.1：创建即为独占会话，避免与另一实例并发写同一文件
         lock_vault_exclusive(&file)
             .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
-        file.write_all(&[0u8; HEADER_SIZE])?;
+        file.write_all(&[0u8; HEADER_SIZE_V5])?;
         file.flush()?;
 
-        let mut salt = [0u8; 32];
-        OsRng.fill_bytes(&mut salt);
+        // ── 2.8.0（v5 信封加密）──
+        // 随机 data_key 承担真正的加密职责；口令只负责「包裹」它存进头部。
+        // 修改口令 = 换盐重新包裹 + 重写头部，数据一个字节不动。
+        let mut vault_salt = [0u8; 32];
+        OsRng.fill_bytes(&mut vault_salt);
+        let mut data_key = [0u8; 32];
+        OsRng.fill_bytes(&mut data_key);
+        let mut keys = expand_keys(&data_key)?;
 
-        let mut keys = derive_keys(password, key_file_data, &salt)?;
-        // 2.6.1：认证标签绑定头部（含保险柜 salt 与本题条目别名字段），
+        let mut part_salt = [0u8; 32];
+        OsRng.fill_bytes(&mut part_salt);
+        let mut kek = derive_kek(password, key_file_data, &part_salt)?;
+        let alias_field = alias_field16(DEFAULT_PARTITION);
+        let wrap_aad = key_wrap_aad(
+            &auth_tag_header_prefix(&vault_salt, VERSION_V5),
+            &alias_field,
+            &part_salt,
+        );
+        let wrapped_v = encrypt_gcm(&kek, &data_key, &wrap_aad, None)?;
+        let mut wrapped = [0u8; WRAPPED_KEY_SIZE];
+        wrapped.copy_from_slice(&wrapped_v);
+        kek.zeroize();
+        secure_wipe_vec(wrapped_v);
+
+        // 2.6.1：认证标签绑定头部（含保险柜 salt 与本条目别名字段），
         // 消除多分区场景下头部完整性被整体跳过的降级（详见 crypto::create_auth_tag_bound）。
         let auth_tag = bound_auth_tag(
-            &keys.auth_key, &salt, &alias_field16(DEFAULT_PARTITION), &salt,
+            &keys.auth_key, &vault_salt, VERSION_V5, &alias_field, &part_salt,
         );
 
         let empty_index = Index::new();
@@ -807,16 +1029,17 @@ impl Vault {
 
         let partition = PartitionInfo {
             alias: DEFAULT_PARTITION.into(),
-            salt,
+            salt: part_salt,
             auth_tag,
             index_offset,
             index_length,
+            wrapped_key: Some(wrapped),
         };
 
         // 2.3.0：锁定区 HMAC 由 write_header_to_file 用公开密钥计算（见 crypto::derive_lock_mac_key），
         // 不再绑定主密码 —— 旧实现导致错误密码无法递增计数（锁定永不生效）且诱饵分区无法打开。
         let lock_state = LockState::new();
-        write_header_to_file(&mut file, &lock_state, &salt, &[partition.clone()], &keys.sign_key)?;
+        write_header_to_file(&mut file, VERSION_V5, &lock_state, &vault_salt, &[partition.clone()], &keys.sign_key)?;
 
         // ── P2-20：直接建立会话（不再二次认证） ──
         let mut audit = AuditLog::new(keys.auth_key);
@@ -826,7 +1049,9 @@ impl Vault {
 
         self.file = Some(file);
         self.path = Some(path.to_path_buf());
-        self.salt = salt;
+        self.format_version = VERSION_V5;
+        self.data_key = Some(data_key);
+        self.salt = vault_salt;
         self.enc_key = Some(keys.enc_key);
         self.auth_key = Some(keys.auth_key);
         self.sign_key = Some(keys.sign_key);
@@ -838,6 +1063,80 @@ impl Vault {
         self.audit_dirty = true; // 审计尚未随索引落盘，close() 时补写
 
         keys.zeroize(); // 各密钥副本已存入 self，此处清理临时结构
+        data_key.zeroize();
+        secure_wipe_vec(index_json);
+        Ok(())
+    }
+
+    /// 仅供集成测试构造 v4 旧格式夹具（v4 兼容 / 升级路径的回归测试需要）。
+    /// 逻辑为 2.7.1 `create` 的原样复刻（含「库盐即分区盐」的历史行为）。
+    #[doc(hidden)]
+    pub fn create_v4_for_tests(
+        &mut self,
+        path: &Path,
+        password: &str,
+        key_file_data: Option<&[u8]>,
+    ) -> Result<(), VaultError> {
+        if password.chars().count() < 12 {
+            return Err(VaultError::Other("密码长度至少 12 位".into()));
+        }
+        if self.is_open() {
+            return Err(VaultError::AlreadyOpen);
+        }
+        let mut file = open_vault_create_new(path)?;
+        lock_vault_exclusive(&file)
+            .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
+        file.write_all(&[0u8; HEADER_SIZE_V4])?;
+        file.flush()?;
+
+        let mut salt = [0u8; 32];
+        OsRng.fill_bytes(&mut salt);
+        let mut keys = derive_keys(password, key_file_data, &salt)?;
+        let auth_tag = bound_auth_tag(
+            &keys.auth_key, &salt, VERSION_V4, &alias_field16(DEFAULT_PARTITION), &salt,
+        );
+
+        let empty_index = Index::new();
+        let index_json = serde_json::to_vec(&empty_index)?;
+        let enc_index = encrypt_gcm(&keys.enc_key, &index_json, b"index", None)?;
+        let index_offset = file.seek(SeekFrom::End(0))?;
+        let index_length = enc_index.len() as u64;
+        file.write_all(&enc_index)?;
+        file.flush()?;
+        file.sync_all()?;
+
+        let partition = PartitionInfo {
+            alias: DEFAULT_PARTITION.into(),
+            salt,
+            auth_tag,
+            index_offset,
+            index_length,
+            wrapped_key: None,
+        };
+        let lock_state = LockState::new();
+        write_header_to_file(&mut file, VERSION_V4, &lock_state, &salt, &[partition.clone()], &keys.sign_key)?;
+
+        let mut audit = AuditLog::new(keys.auth_key);
+        audit.add("保险柜已创建并解锁");
+        let mut cached = empty_index;
+        cached.audit = audit.to_vec();
+
+        self.file = Some(file);
+        self.path = Some(path.to_path_buf());
+        self.format_version = VERSION_V4;
+        self.data_key = None;
+        self.salt = salt;
+        self.enc_key = Some(keys.enc_key);
+        self.auth_key = Some(keys.auth_key);
+        self.sign_key = Some(keys.sign_key);
+        self.lock_state = lock_state;
+        self.partitions = vec![partition];
+        self.active_partition = Some(0);
+        self.audit = Some(audit);
+        self.cached_index = Some(cached);
+        self.audit_dirty = true;
+
+        keys.zeroize();
         secure_wipe_vec(index_json);
         Ok(())
     }
@@ -857,16 +1156,43 @@ impl Vault {
         // 2.6.1：独占打开 —— 第二个实例（或同进程重复打开）必须失败而非并发写入
         lock_vault_exclusive(&file)
             .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
-        let mut header = [0u8; HEADER_SIZE];
+        // 2.8.0：先嗅探 magic + 版本字节，再按格式读取对应大小的头部
+        // （v4 文件总长可能不足 2048 字节，不能直接按 v5 头部大小读取）
+        let mut sniff = [0u8; 9];
+        file.read_exact(&mut sniff)?;
+        if &sniff[..8] != MAGIC {
+            return Err(VaultError::BadMagic);
+        }
+        match sniff[8] {
+            VERSION_V4 => self.open_and_authenticate_v4(path, file, password, key_file_data),
+            VERSION_V5 => self.open_and_authenticate_v5(path, file, password, key_file_data),
+            v => Err(VaultError::Other(format!(
+                "不支持的保险柜格式版本 {}（文件可能来自更新版本的 LynVault，请升级软件后重试）",
+                v
+            ))),
+        }
+    }
+
+    /// v4 旧格式打开（2.8.0 起仅为兼容保留；新建保险柜一律 v5）。
+    /// 认证逻辑与 2.7.1 的 open_and_authenticate 完全一致。
+    fn open_and_authenticate_v4(
+        &mut self,
+        path: &Path,
+        mut file: File,
+        password: &str,
+        key_file_data: Option<&[u8]>,
+    ) -> Result<usize, VaultError> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut header = [0u8; HEADER_SIZE_V4];
         file.read_exact(&mut header)?;
 
         let (magic, version, salt) = Self::parse_header(&header)?;
-        if &magic != MAGIC || version != VERSION {
+        if &magic != MAGIC || version != VERSION_V4 {
             return Err(VaultError::BadMagic);
         }
 
-        let lock_count = header[LOCK_OFFSET];
-        let lock_until = f64::from_le_bytes(header[LOCK_OFFSET+1..LOCK_OFFSET+9].try_into().unwrap());
+        let lock_count = header[LOCK_OFFSET_V4];
+        let lock_until = f64::from_le_bytes(header[LOCK_OFFSET_V4+1..LOCK_OFFSET_V4+9].try_into().unwrap());
 
         // 2.3.0 修复（关键）：锁定区 HMAC 使用从 salt 独立派生的**公开**密钥，
         // 与密码无关。因此：
@@ -875,7 +1201,7 @@ impl Vault {
         // 旧版（<2.3.0）锁定区用密码派生密钥签名，此处做兼容校验并在后续写入时自动迁移。
         let mac_key = derive_lock_mac_key(&salt);
         let mut lock_state = LockState { lock_count, lock_until, lock_until_monotonic: None };
-        let stored_hmac: [u8; 32] = header[LOCK_OFFSET+9..LOCK_OFFSET+9+32].try_into().unwrap();
+        let stored_hmac: [u8; 32] = header[LOCK_OFFSET_V4+9..LOCK_OFFSET_V4+9+32].try_into().unwrap();
         let verified = if lock_state.verify_hmac(&mac_key, &stored_hmac) {
             true
         } else {
@@ -905,7 +1231,7 @@ impl Vault {
         let mut parsed: Vec<PartitionInfo> = Vec::new();
         let mut off = 106;
         for _ in 0..MAX_PARTITIONS {
-            if off + PARTITION_ENTRY_SIZE > HEADER_SIZE { break; }
+            if off + PARTITION_ENTRY_SIZE_V4 > HEADER_SIZE_V4 { break; }
             let alias_len = header[off..off+16].iter().position(|&b| b == 0).unwrap_or(16);
             let alias = String::from_utf8_lossy(&header[off..off+alias_len]).to_string();
             let mut p_salt = [0u8; 32];
@@ -914,8 +1240,8 @@ impl Vault {
             auth_tag.copy_from_slice(&header[off+48..off+80]);
             let index_offset = u64::from_le_bytes(header[off+80..off+88].try_into().unwrap());
             let index_length = u64::from_le_bytes(header[off+88..off+96].try_into().unwrap());
-            parsed.push(PartitionInfo { alias, salt: p_salt, auth_tag, index_offset, index_length });
-            off += PARTITION_ENTRY_SIZE;
+            parsed.push(PartitionInfo { alias, salt: p_salt, auth_tag, index_offset, index_length, wrapped_key: None });
+            off += PARTITION_ENTRY_SIZE_V4;
         }
 
         // C9 修复 + 2.3.0 + 2.4.1：始终对**全部 8 个条目**执行完整 Argon2id 派生
@@ -955,7 +1281,7 @@ impl Vault {
             let p = &parsed[idx];
             // 2.6.1：用「绑定头部」的认证标签校验 —— 头部前缀 + 本条目别名字段 + salt
             // 都被纳入 HMAC，因此篡改头部必然使该分区匹配失败（不再依赖分区计数）。
-            let eoff = 106 + idx * PARTITION_ENTRY_SIZE;
+            let eoff = 106 + idx * PARTITION_ENTRY_SIZE_V4;
             let tag_ok = verify_auth_tag_bound(
                 &keys.auth_key,
                 &header[..105],
@@ -1018,16 +1344,19 @@ impl Vault {
             lock_state.reset();
             self.lock_state = lock_state;
             self.salt = salt;
+            // 2.8.0：会话元数据 —— v4 格式无包裹层，data_key 为 None
+            self.format_version = VERSION_V4;
+            self.data_key = None;
             self.partitions = real_partitions;
             self.active_partition = Some(active);
 
             // 2.6.1：旧格式（未绑定头部）认证标签 → 首次成功打开即就地迁移为绑定格式，
             // 之后头部完整性由 auth_tag 无条件保证。仅迁移当前分区（其他分区的
             // auth_key 未知，待其各自被打开时迁移），由随后的 update_header 落盘。
-            let moff = 106 + idx * PARTITION_ENTRY_SIZE;
+            let moff = 106 + idx * PARTITION_ENTRY_SIZE_V4;
             let migrated_tag = create_auth_tag_bound(
                 &auth_key,
-                &auth_tag_header_prefix(&salt),
+                &auth_tag_header_prefix(&salt, VERSION_V4),
                 &header[moff..moff + 16],
                 &header[moff + 16..moff + 48],
             );
@@ -1063,7 +1392,7 @@ impl Vault {
         lock_buf[1..9].copy_from_slice(&lock_state.lock_until.to_le_bytes());
         let hmac = lock_state.compute_hmac(&mac_key);
         lock_buf[9..41].copy_from_slice(&hmac);
-        file.seek(SeekFrom::Start(LOCK_OFFSET as u64))?;
+        file.seek(SeekFrom::Start(LOCK_OFFSET_V4 as u64))?;
         file.write_all(&lock_buf)?;
         file.flush()?;
         file.sync_all()?;
@@ -1071,6 +1400,190 @@ impl Vault {
         Err(VaultError::AuthFailed)
     }
 
+    /// 2.8.0（v5 信封加密）打开认证。
+    ///
+    /// 与 v4 的恒定时间结构一致：先对全部 8 个条目并行完成 Argon2id（KEK 派生，
+    /// 绝对主导成本），再进入逐条目「解包 data_key → 派生会话密钥 → 验证绑定
+    /// 认证标签」的轻量比较阶段 —— 每个条目都完整尝试，不因中途匹配而短路。
+    /// 口令正确 ⇔ 该条目的 GCM 解包成功（错误口令解包必然失败）。
+    fn open_and_authenticate_v5(
+        &mut self,
+        path: &Path,
+        mut file: File,
+        password: &str,
+        key_file_data: Option<&[u8]>,
+    ) -> Result<usize, VaultError> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut header = [0u8; HEADER_SIZE_V5];
+        file.read_exact(&mut header)?;
+
+        let (magic, version, salt) = Self::parse_header(&header)?;
+        if &magic != MAGIC || version != VERSION_V5 {
+            return Err(VaultError::BadMagic);
+        }
+
+        let lock_count = header[LOCK_OFFSET_V5];
+        let lock_until = f64::from_le_bytes(header[LOCK_OFFSET_V5+1..LOCK_OFFSET_V5+9].try_into().unwrap());
+
+        // 锁定区校验（公开密钥，与 v4 同一机制；v5 为新格式，无 legacy 回退）
+        let mac_key = derive_lock_mac_key(&salt);
+        let mut lock_state = LockState { lock_count, lock_until, lock_until_monotonic: None };
+        let stored_hmac: [u8; 32] = header[LOCK_OFFSET_V5+9..LOCK_OFFSET_V5+9+32].try_into().unwrap();
+        if !lock_state.verify_hmac(&mac_key, &stored_hmac) {
+            return Err(VaultError::Other("头部锁定区校验失败 —— 头部可能被篡改".into()));
+        }
+        if lock_state.is_locked() {
+            return Err(VaultError::Locked);
+        }
+
+        // 解析 8 个 192 字节条目（含 60 字节包裹密钥；伪条目为随机字节，认证必然失败）
+        let mut parsed: Vec<PartitionInfo> = Vec::new();
+        let mut off = 106;
+        for _ in 0..MAX_PARTITIONS {
+            let alias_len = header[off..off+16].iter().position(|&b| b == 0).unwrap_or(16);
+            let alias = String::from_utf8_lossy(&header[off..off+alias_len]).to_string();
+            let mut p_salt = [0u8; 32];
+            p_salt.copy_from_slice(&header[off+16..off+48]);
+            let mut auth_tag = [0u8; 32];
+            auth_tag.copy_from_slice(&header[off+48..off+80]);
+            let index_offset = u64::from_le_bytes(header[off+80..off+88].try_into().unwrap());
+            let index_length = u64::from_le_bytes(header[off+88..off+96].try_into().unwrap());
+            let mut wrapped = [0u8; WRAPPED_KEY_SIZE];
+            wrapped.copy_from_slice(&header[off+96..off+96+WRAPPED_KEY_SIZE]);
+            parsed.push(PartitionInfo { alias, salt: p_salt, auth_tag, index_offset, index_length, wrapped_key: Some(wrapped) });
+            off += PARTITION_ENTRY_SIZE_V5;
+        }
+
+        // 阶段 1：8 × Argon2id（KEK 派生），分块并行（与 v4 相同的调度优化）
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let parallel = cpus.min(4).max(1);
+        let mut kek_list: Vec<[u8; 32]> = Vec::with_capacity(parsed.len());
+        for chunk in parsed.chunks(parallel) {
+            let results: Vec<Result<[u8; 32], VaultError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|p| s.spawn(move || derive_kek(password, key_file_data, &p.salt)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(VaultError::Other("密钥派生线程失败".into())))
+                    })
+                    .collect()
+            });
+            for r in results {
+                kek_list.push(r?);
+            }
+        }
+
+        // 阶段 2：逐条目解包 + 认证标签校验（轻量，全部尝试保持恒定时间语义）
+        let prefix = auth_tag_header_prefix(&salt, VERSION_V5);
+        let mut matched: Option<(usize, Index, KeyMaterial, [u8; 32])> = None;
+        for (idx, kek) in kek_list.iter().enumerate() {
+            let p = &parsed[idx];
+            let eoff = 106 + idx * PARTITION_ENTRY_SIZE_V5;
+            let alias_field = &header[eoff..eoff + 16];
+            let wrap_aad = key_wrap_aad(&prefix, alias_field, &p.salt);
+            let mut candidate: Option<(KeyMaterial, [u8; 32])> = None;
+            if let Some(dk) = unwrap_data_key(kek, &p.wrapped_key.unwrap_or([0u8; WRAPPED_KEY_SIZE]), &wrap_aad) {
+                if let Ok(keys) = expand_keys(&dk) {
+                    if verify_auth_tag_bound(&keys.auth_key, &prefix, alias_field, &p.salt, &p.auth_tag) {
+                        candidate = Some((keys, dk));
+                    } else {
+                        let mut dk2 = dk;
+                        dk2.zeroize();
+                    }
+                } else {
+                    let mut dk2 = dk;
+                    dk2.zeroize();
+                }
+            }
+            if matched.is_none() {
+                if let Some((keys, dk)) = candidate {
+                    match Self::try_authenticate_partition(&mut file, &parsed, idx, &keys) {
+                        Ok(index) => matched = Some((idx, index, keys, dk)),
+                        Err(e) => {
+                            // 匹配分区但头部/索引校验失败 → 视为篡改，中止并清理全部密钥
+                            let sig_ok = verify_header_signature_v5(&header, &keys.sign_key);
+                            for k in kek_list.iter_mut() { k.zeroize(); }
+                            return Err(VaultError::Other(format!(
+                                "分区密码正确，但该分区数据校验失败（{}）。头部签名{}。为避免进一步损坏，请勿再向此保险柜写入任何数据，并改用更早时间点的副本",
+                                e,
+                                if sig_ok {
+                                    "校验通过 —— 头部未被篡改，损坏位于索引数据区"
+                                } else {
+                                    "校验失败 —— 头部可能也被篡改"
+                                }
+                            )));
+                        }
+                    }
+                }
+            } else if let Some((_, dk)) = candidate {
+                // 防御分支：理论上至多一个条目能通过认证，多余的密钥立即清零
+                let mut d = dk;
+                d.zeroize();
+            }
+        }
+        for k in kek_list.iter_mut() { k.zeroize(); }
+
+        if let Some((idx, index, keys, data_key)) = matched {
+            // 过滤出真实分区（伪条目随机数据几乎不可能通过认证）
+            let real_partitions: Vec<PartitionInfo> = parsed.iter()
+                .filter(|p| is_plausible_alias(&p.alias))
+                .cloned()
+                .collect();
+            let matched_salt = parsed[idx].salt;
+            let matched_tag = parsed[idx].auth_tag;
+            // 恒定时间比较（与 v4 相同）
+            let active = real_partitions.iter()
+                .position(|p| {
+                    use subtle::ConstantTimeEq;
+                    bool::from(p.salt.ct_eq(&matched_salt) & p.auth_tag.ct_eq(&matched_tag))
+                })
+                .ok_or_else(|| VaultError::Other("内部错误：匹配分区丢失".into()))?;
+
+            lock_state.reset();
+            self.lock_state = lock_state;
+            self.salt = salt;
+            self.format_version = VERSION_V5;
+            self.partitions = real_partitions;
+            self.active_partition = Some(active);
+
+            self.enc_key = Some(keys.enc_key);
+            self.auth_key = Some(keys.auth_key);
+            self.sign_key = Some(keys.sign_key);
+            self.data_key = Some(data_key);
+
+            let mut audit = AuditLog::from_entries(index.audit.clone(), keys.auth_key);
+            audit.add("保险柜已解锁");
+            self.audit = Some(audit);
+
+            self.file = Some(file);
+            self.path = Some(path.to_path_buf());
+            self.cached_index = Some(index);
+            self.audit_dirty = true;
+
+            // 成功打开：重置锁定区并重新签名头部
+            self.update_header()?;
+
+            return Ok(active);
+        }
+
+        // 全部失败：递增锁定计数（v5 偏移）
+        lock_state.record_failure();
+        let mut lock_buf = [0u8; 41];
+        lock_buf[0] = lock_state.lock_count;
+        lock_buf[1..9].copy_from_slice(&lock_state.lock_until.to_le_bytes());
+        let hmac = lock_state.compute_hmac(&mac_key);
+        lock_buf[9..41].copy_from_slice(&hmac);
+        file.seek(SeekFrom::Start(LOCK_OFFSET_V5 as u64))?;
+        file.write_all(&lock_buf)?;
+        file.flush()?;
+        file.sync_all()?;
+
+        Err(VaultError::AuthFailed)
+    }
     /// 2.4.1 新增（从 open_and_authenticate 抽取）：对已通过 auth_tag（头部绑定）校验的
     /// 分区做索引边界检查 + 读取解密。密钥由调用方持有并负责清理。
     /// 头部完整性已由调用方在 auth_tag 校验阶段无条件保证。
@@ -1194,14 +1707,18 @@ impl Vault {
         let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
         let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
         write_header_to_file(
-            file, &self.lock_state,
+            file, self.format_version, &self.lock_state,
             &self.salt, &self.partitions, sign_key,
         )
     }
 
-    fn parse_header(header: &[u8; HEADER_SIZE])
+    /// 头部前缀解析（magic / 版本 / 保险柜 salt）—— 三个字段在 v4/v5 布局中位置一致。
+    fn parse_header(header: &[u8])
         -> Result<([u8; 8], u8, [u8; 32]), VaultError>
     {
+        if header.len() < 105 {
+            return Err(VaultError::BadMagic);
+        }
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&header[..8]);
         let version = header[8];
@@ -1227,10 +1744,32 @@ impl Vault {
 
         let mut part_salt = [0u8; 32];
         OsRng.fill_bytes(&mut part_salt);
-        let mut keys = derive_keys(fake_password, key_file_data, &part_salt)?;
+        // 2.8.0：v5 为新分区生成随机 data_key 并用分区口令包裹；v4 保持旧派生路径
+        let alias_field = alias_field16(alias);
+        let (mut keys, wrapped_key) = match self.format_version {
+            VERSION_V5 => {
+                let mut dk = [0u8; 32];
+                OsRng.fill_bytes(&mut dk);
+                let k = expand_keys(&dk)?;
+                let mut kek = derive_kek(fake_password, key_file_data, &part_salt)?;
+                let wrap_aad = key_wrap_aad(
+                    &auth_tag_header_prefix(&self.salt, VERSION_V5),
+                    &alias_field,
+                    &part_salt,
+                );
+                let wrapped_v = encrypt_gcm(&kek, &dk, &wrap_aad, None)?;
+                let mut wrapped = [0u8; WRAPPED_KEY_SIZE];
+                wrapped.copy_from_slice(&wrapped_v);
+                kek.zeroize();
+                dk.zeroize();
+                secure_wipe_vec(wrapped_v);
+                (k, Some(wrapped))
+            }
+            _ => (derive_keys(fake_password, key_file_data, &part_salt)?, None),
+        };
         // 2.6.1：新分区同样使用绑定头部的认证标签（保险柜 salt + 本分区别名/salt）
         let auth_tag = bound_auth_tag(
-            &keys.auth_key, &self.salt, &alias_field16(alias), &part_salt,
+            &keys.auth_key, &self.salt, self.format_version, &alias_field, &part_salt,
         );
 
         let empty_index = Index::new();
@@ -1249,6 +1788,7 @@ impl Vault {
             auth_tag,
             index_offset: offset,
             index_length: enc.len() as u64,
+            wrapped_key,
         });
 
         self.log_event(&format!("添加伪装分区 '{}'", alias));
@@ -1290,6 +1830,396 @@ impl Vault {
             let _ = file.sync_all();
         }
         Ok(())
+    }
+
+    // ═══════════════ 密码修改（2.8.0）═══════════════
+
+    /// 修改当前分区的密码。
+    ///
+    /// - **v5 保险柜**：仅重写头部（换盐重新包裹 data_key + 重算认证标签 + 重签名），
+    ///   文件数据一个字节不动，瞬间完成。
+    /// - **v4 保险柜**：v4 的会话密钥直接由口令派生，改密码必须重加密全部数据。
+    ///   借此机会**自动升级**为 v5 信封加密（一次性全库重加密，此后改密码都是头部级）。
+    ///   多分区 v4 保险柜无法升级：其余分区口令未知，无法生成 v5 必需的包裹密钥
+    ///   （填随机数会让那些分区永久无法打开）—— 明确报错而非静默破坏。
+    ///
+    /// 必须提供**当前密码**（或等价的密钥文件）：防止他人在已解锁的机器上
+    /// 改密锁死真正的主人。新密码 ≥ 12 字符（与创建一致，按字符数）。
+    pub fn change_password<F: Fn(usize)>(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+        key_file_data: Option<&[u8]>,
+        progress: Option<F>,
+    ) -> Result<(), VaultError> {
+        if !self.is_open() {
+            return Err(VaultError::NotOpen);
+        }
+        if new_password.chars().count() < 12 {
+            return Err(VaultError::Other("新密码长度至少 12 位".into()));
+        }
+        match self.format_version {
+            VERSION_V5 => self.change_password_v5(current_password, new_password, key_file_data),
+            VERSION_V4 => self.change_password_v4_upgrade(
+                current_password, new_password, key_file_data, progress,
+            ),
+            v => Err(VaultError::Other(format!("未知的保险柜格式版本: {}", v))),
+        }
+    }
+
+    /// v5：头部级改密码。验当前密码（解包 + 恒定时间比较 data_key）→
+    /// 换盐重新包裹 → 重算认证标签 → 重写头部重签名。
+    fn change_password_v5(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+        key_file_data: Option<&[u8]>,
+    ) -> Result<(), VaultError> {
+        let active = self.active_partition.ok_or(VaultError::NotOpen)?;
+        let session_dk = self.data_key.ok_or(VaultError::NotOpen)?;
+        let p = self.partitions[active].clone();
+        let alias_field = alias_field16(&p.alias);
+        let prefix = auth_tag_header_prefix(&self.salt, VERSION_V5);
+
+        // 1. 验证当前密码：用当前盐派生 KEK 解包，与会话中的 data_key 恒定时间比较
+        let mut kek = derive_kek(current_password, key_file_data, &p.salt)?;
+        let aad = key_wrap_aad(&prefix, &alias_field, &p.salt);
+        let unwrapped = unwrap_data_key(&kek, &p.wrapped_key.unwrap_or([0u8; WRAPPED_KEY_SIZE]), &aad);
+        let mut verified = false;
+        if let Some(cand) = &unwrapped {
+            use subtle::ConstantTimeEq;
+            verified = bool::from(cand.ct_eq(&session_dk));
+        }
+        let mut unwrapped = unwrapped;
+        if let Some(mut c) = unwrapped.take() { c.zeroize(); }
+        kek.zeroize();
+        if !verified {
+            return Err(VaultError::Other("当前密码或密钥文件不正确".into()));
+        }
+
+        // 2. 换盐重新包裹 data_key（数据密钥本身不变 → 所有密文继续有效）
+        let mut new_salt = [0u8; 32];
+        OsRng.fill_bytes(&mut new_salt);
+        let mut new_kek = derive_kek(new_password, key_file_data, &new_salt)?;
+        let new_aad = key_wrap_aad(&prefix, &alias_field, &new_salt);
+        let wrapped_v = encrypt_gcm(&new_kek, &session_dk, &new_aad, None)?;
+        let mut new_wrapped = [0u8; WRAPPED_KEY_SIZE];
+        new_wrapped.copy_from_slice(&wrapped_v);
+        new_kek.zeroize();
+        secure_wipe_vec(wrapped_v);
+
+        // 3. 重算认证标签（盐变了必须重算）并重写头部（update_header 内部重签名；
+        //    sign_key 由未变的 data_key 派生，依然有效）
+        let auth_key = self.auth_key.ok_or(VaultError::NotOpen)?;
+        let new_tag = bound_auth_tag(&auth_key, &self.salt, VERSION_V5, &alias_field, &new_salt);
+        self.partitions[active].salt = new_salt;
+        self.partitions[active].auth_tag = new_tag;
+        self.partitions[active].wrapped_key = Some(new_wrapped);
+        self.update_header()?;
+        self.log_event("修改当前分区密码");
+        Ok(())
+    }
+
+    /// v4 → v5 升级 + 改密码（一次性全库重加密）。
+    ///
+    /// 复用碎片整理的安全管线：磁盘预检 → .bak 完整备份 → .tmp 上重建
+    /// （逐文件旧密钥解密 / 新 data_key 重加密，AAD 不变）→ v5 头部 →
+    /// ReplaceFileW 原子替换 → 失败回滚。仅支持单分区 v4 保险柜。
+    fn change_password_v4_upgrade<F: Fn(usize)>(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+        key_file_data: Option<&[u8]>,
+        progress: Option<F>,
+    ) -> Result<(), VaultError> {
+        if self.partitions.len() != 1 {
+            return Err(VaultError::Other(
+                "多分区 v4 保险柜暂不支持修改密码：其余分区的口令未知，无法为它们生成 \
+                 v5 必需的包裹密钥（填入随机数据会使那些分区永久无法打开）。\
+                 可先用对应密码打开各分区导出重要数据，或保持 v4 格式继续使用"
+                    .into(),
+            ));
+        }
+        let old_part = self.partitions[0].clone();
+        let old_enc_key = *self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
+        let old_auth_key = *self.auth_key.as_ref().ok_or(VaultError::NotOpen)?;
+
+        // 1. 验证当前密码（v4：直接派生三把密钥并与会话密钥恒定时间比较）
+        {
+            let keys = derive_keys(current_password, key_file_data, &old_part.salt)?;
+            use subtle::ConstantTimeEq;
+            let enc_ok = bool::from(keys.enc_key.ct_eq(&old_enc_key));
+            let mut k = keys;
+            k.zeroize();
+            if !enc_ok {
+                return Err(VaultError::Other("当前密码或密钥文件不正确".into()));
+            }
+        }
+
+        let vault_path = self.path.as_ref().ok_or(VaultError::NotOpen)?.clone();
+        let orig_len = std::fs::metadata(&vault_path)?.len();
+
+        // 2. 磁盘预检（备份完整副本 + 临时文件，同一磁盘：约 2× + 4 MiB）
+        let need = orig_len.saturating_mul(2).saturating_add(4 * 1024 * 1024);
+        if let Ok(free) = disk_free_bytes(vault_path.parent().unwrap_or(Path::new("."))) {
+            if free < need {
+                return Err(VaultError::Other(format!(
+                    "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），已取消操作，未产生任何中间文件",
+                    need / (1024 * 1024),
+                    free / (1024 * 1024),
+                )));
+            }
+        }
+
+        // 3. 随机临时/备份文件名（防符号链接攻击，与碎片整理同一策略）
+        let mut rand_suffix = [0u8; 16];
+        OsRng.fill_bytes(&mut rand_suffix);
+        let temp_path = PathBuf::from(format!("{}.tmp.{}", vault_path.display(), hex::encode(rand_suffix)));
+        let backup_path = PathBuf::from(format!("{}.bak.{}", vault_path.display(), hex::encode(rand_suffix)));
+
+        // 4. 完整备份（失败统一「先 DoD 擦除再删除」）
+        let backup_result: std::io::Result<()> = (|| {
+            let mut backup_file = OpenOptions::new().write(true).create_new(true).open(&backup_path)?;
+            let mut original = File::open(&vault_path)?;
+            let copy = std::io::copy(&mut original, &mut backup_file);
+            let sync = backup_file.sync_all();
+            drop(backup_file);
+            drop(original);
+            copy.and(sync).map(|_| ())
+        })();
+        if let Err(e) = backup_result {
+            wipe_scratch_file(&backup_path);
+            return Err(e.into());
+        }
+
+        // 5. 新信封密钥
+        let mut data_key = [0u8; 32];
+        OsRng.fill_bytes(&mut data_key);
+        let new_keys = expand_keys(&data_key)?;
+
+        // 6. 加载旧索引（原文件此刻未被修改；审计随后换钥重建）
+        let mut index = {
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            load_index_from_file(file, &old_enc_key, old_part.index_offset, old_part.index_length)?
+        };
+        let mut audit_log = AuditLog::from_entries(index.audit.clone(), old_auth_key);
+        // 换钥前先用旧密钥硬校验整条链（篡改即中止，不静默截断），再重建
+        audit_log.rekey(&old_auth_key, new_keys.auth_key)?;
+        audit_log.add("修改密码并升级为 v5 信封加密");
+        index.audit = audit_log.to_vec();
+
+        // 7. 重加密管线（闭包内只读 self 的克隆值，不持有 &mut self）
+        let alias_field = alias_field16(&old_part.alias);
+        let salt = self.salt;
+        let lock_state = self.lock_state.clone();
+        let result = (|| -> Result<PartitionInfo, VaultError> {
+            // 7a. 临时文件 + v5 占位头部
+            let mut tmp_file = OpenOptions::new()
+                .read(true).write(true).create_new(true)
+                .open(&temp_path)?;
+            tmp_file.write_all(&[0u8; HEADER_SIZE_V5])?;
+            tmp_file.flush()?;
+
+            // 7b. 逐文件解密 → 新密钥重加密（AAD 不变，密文长度不变，偏移重排）
+            let files_snapshot: Vec<(String, u64, u64)> = index.files.iter()
+                .map(|(k, m)| (k.clone(), m.offset, m.length))
+                .collect();
+            let total = files_snapshot.len();
+            let mut src_file = File::open(&vault_path)?;
+            let mut write_cursor = HEADER_SIZE_V5 as u64;
+            for (i, (vpath, old_off, old_len)) in files_snapshot.iter().enumerate() {
+                let aad_tag = index.files.get(vpath).and_then(|m| m.aad_tag.clone());
+                let aad = aad_bytes(aad_tag.as_deref(), vpath).to_vec();
+                src_file.seek(SeekFrom::Start(*old_off))?;
+                let mut enc_old = vec![0u8; *old_len as usize];
+                src_file.read_exact(&mut enc_old)?;
+                let plain = decrypt_gcm(&old_enc_key, &enc_old, &aad)
+                    .ok_or(VaultError::DecryptFailed)?;
+                secure_wipe_vec(enc_old);
+                let enc_new = encrypt_gcm(&new_keys.enc_key, &plain, &aad, None)?;
+                secure_wipe_vec(plain);
+                tmp_file.seek(SeekFrom::Start(write_cursor))?;
+                tmp_file.write_all(&enc_new)?;
+                index.files.get_mut(vpath)
+                    .ok_or_else(|| VaultError::Other("升级管线：文件不在索引中".into()))?
+                    .offset = write_cursor;
+                write_cursor += enc_new.len() as u64;
+                if let Some(ref cb) = progress {
+                    cb((i + 1) * 80 / total.max(1));
+                }
+            }
+            drop(src_file);
+
+            // 7c. 新索引（已含换钥后的审计链）
+            let idx_json = serde_json::to_vec(&index)?;
+            let enc_idx = encrypt_gcm(&new_keys.enc_key, &idx_json, b"index", None)?;
+            tmp_file.seek(SeekFrom::Start(write_cursor))?;
+            tmp_file.write_all(&enc_idx)?;
+            tmp_file.flush()?;
+            tmp_file.sync_all()?;
+            secure_wipe_vec(idx_json);
+            if let Some(ref cb) = progress {
+                cb(90);
+            }
+
+            // 7d. 构建唯一的 v5 分区条目
+            let mut new_part_salt = [0u8; 32];
+            OsRng.fill_bytes(&mut new_part_salt);
+            let mut kek = derive_kek(new_password, key_file_data, &new_part_salt)?;
+            let prefix = auth_tag_header_prefix(&salt, VERSION_V5);
+            let wrap_aad = key_wrap_aad(&prefix, &alias_field, &new_part_salt);
+            let wrapped_v = encrypt_gcm(&kek, &data_key, &wrap_aad, None)?;
+            let mut wrapped = [0u8; WRAPPED_KEY_SIZE];
+            wrapped.copy_from_slice(&wrapped_v);
+            kek.zeroize();
+            secure_wipe_vec(wrapped_v);
+            let auth_tag = bound_auth_tag(&new_keys.auth_key, &salt, VERSION_V5, &alias_field, &new_part_salt);
+            let new_part = PartitionInfo {
+                alias: old_part.alias.clone(),
+                salt: new_part_salt,
+                auth_tag,
+                index_offset: write_cursor,
+                index_length: enc_idx.len() as u64,
+                wrapped_key: Some(wrapped),
+            };
+
+            // 7e. v5 头部（v4 布局的锁定区/签名随版本切换到新位置）
+            write_header_to_file(&mut tmp_file, VERSION_V5, &lock_state, &salt, &[new_part.clone()], &new_keys.sign_key)?;
+            tmp_file.flush()?;
+            tmp_file.sync_all()?;
+            drop(tmp_file);
+            if let Some(ref cb) = progress {
+                cb(100);
+            }
+            Ok(new_part)
+        })();
+
+        match result {
+            Ok(new_part) => {
+                // 8. 原子替换（先释放会话句柄 —— Windows 上 rename 需 DELETE 权）
+                self.file = None;
+                replace_vault_file(&temp_path, &vault_path)?;
+                sync_parent_dir(&vault_path);
+                if let Err(e) = dod_erase(&backup_path, None) {
+                    log::warn!("擦除升级备份失败（保险柜同目录可能残留 .bak 文件）: {}", e);
+                }
+                // 9. 重开句柄 + 会话切换到 v5
+                let file = open_vault_rw(&vault_path, false)?;
+                lock_vault_exclusive(&file)
+                    .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
+                self.file = Some(file);
+                self.format_version = VERSION_V5;
+                self.data_key = Some(data_key);
+                self.enc_key = Some(new_keys.enc_key);
+                self.auth_key = Some(new_keys.auth_key);
+                self.sign_key = Some(new_keys.sign_key);
+                self.partitions = vec![new_part];
+                self.active_partition = Some(0);
+                self.audit = Some(audit_log);
+                self.cached_index = Some(index);
+                self.audit_dirty = false; // 新索引（含审计）已随管线落盘
+                let mut old_enc = old_enc_key;
+                old_enc.zeroize();
+                let mut old_auth = old_auth_key;
+                old_auth.zeroize();
+                Ok(())
+            }
+            Err(e) => {
+                // 10. 回滚：擦除中间副本，从备份恢复原文件（分区/密钥状态未动，无需回滚）
+                self.file = None;
+                wipe_scratch_file(&temp_path);
+                if backup_path.exists() {
+                    if let Err(re) = fs::rename(&backup_path, &vault_path) {
+                        log::error!(
+                            "密码修改失败后从备份恢复保险柜失败：{}；同目录残留的 .bak 备份文件未被删除，请手动恢复",
+                            re
+                        );
+                        return Err(VaultError::Other(format!(
+                            "密码修改失败（{}），且自动恢复失败（{}）：请勿再次写入，同目录的 .bak 备份文件可手动恢复",
+                            e, re
+                        )));
+                    }
+                    self.file = None;
+                    let file = open_vault_rw(&vault_path, false).ok().and_then(|f| {
+                        lock_vault_exclusive(&f).ok()?;
+                        Some(f)
+                    });
+                    self.file = file;
+                }
+                let mut dk = data_key;
+                dk.zeroize();
+                Err(e)
+            }
+        }
+    }
+
+    // ═══════════════ 完整性体检 / 搜索 / 锁定信息（2.8.0）═══════════════
+
+    /// 2.8.0：全库完整性体检 —— 逐文件解密校验 AES-GCM 认证标签，
+    /// 检出坏块 / 位腐 / 云同步损坏。只读操作（不修改任何数据）。
+    pub fn verify_integrity<F: Fn(usize, usize, &str)>(
+        &mut self,
+        progress: Option<F>,
+    ) -> Result<(usize, Vec<IntegrityIssue>), VaultError> {
+        if !self.is_open() {
+            return Err(VaultError::NotOpen);
+        }
+        let index = self.load_index()?;
+        let mut items: Vec<(String, u64, u64, Option<String>)> = index.files.iter()
+            .map(|(k, m)| (k.clone(), m.offset, m.length, m.aad_tag.clone()))
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let total = items.len();
+        let enc_key = *self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
+        let mut broken: Vec<IntegrityIssue> = Vec::new();
+        for (i, (vpath, off, len, aad_tag)) in items.iter().enumerate() {
+            if let Some(ref cb) = progress {
+                cb(i + 1, total, vpath);
+            }
+            let aad = aad_bytes(aad_tag.as_deref(), vpath).to_vec();
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            match read_decrypt_file_data(file, &enc_key, *off, *len, &aad) {
+                Ok(plain) => secure_wipe_vec(plain),
+                Err(e) => broken.push(IntegrityIssue { vpath: vpath.clone(), reason: e.to_string() }),
+            }
+        }
+        self.log_event(&format!("完整性体检：{} 个文件，{} 个异常", total, broken.len()));
+        Ok((total, broken))
+    }
+
+    /// 2.8.0：按文件名 / vpath 大小写不敏感子串搜索（含文件夹，文件夹在前）。
+    pub fn search_files(&mut self, query: &str, limit: usize) -> Result<Vec<SearchHit>, VaultError> {
+        let index = self.load_index()?;
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for (vpath, m) in &index.files {
+            if vpath.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q) {
+                hits.push(SearchHit { vpath: vpath.clone(), name: m.name.clone(), size: m.size, is_dir: false });
+            }
+        }
+        for vpath in index.folders.keys() {
+            if vpath.to_lowercase().contains(&q) {
+                let name = vpath.rsplit('/').next().unwrap_or(vpath).to_string();
+                hits.push(SearchHit { vpath: vpath.clone(), name, size: 0, is_dir: true });
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir)
+                .then_with(|| a.vpath.to_lowercase().cmp(&b.vpath.to_lowercase()))
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// 2.8.0：列出当前分区全部文件夹 vpath（移动选择器用，已排序）。
+    pub fn list_all_folders(&mut self) -> Result<Vec<String>, VaultError> {
+        let index = self.load_index()?;
+        let mut v: Vec<String> = index.folders.keys().cloned().collect();
+        v.sort();
+        Ok(v)
     }
 
     // ═══════════════ 文件导入 ═══════════════
@@ -1739,7 +2669,7 @@ impl Vault {
             .values()
             .fold(0u64, |acc, m| acc.saturating_add(m.length));
         let dead = file_len
-            .saturating_sub(HEADER_SIZE as u64)
+            .saturating_sub(header_size_of(self.format_version).ok()? as u64)
             .saturating_sub(self.partitions[0].index_length)
             .saturating_sub(used);
         Some(dead)
@@ -2075,6 +3005,9 @@ impl Vault {
             let single_partition = self.partitions.len() == 1;
 
             // 步骤 1：准备临时文件
+            // 2.8.0：占位头部尺寸必须与当前格式版本一致 —— v4→v5 升级等场景下
+            // 版本可能变化，占位不足会让头部覆写越界到数据区
+            let hdr_size = header_size_of(self.format_version)?;
             let mut tmp_file = {
                 let mut tmp_file = OpenOptions::new()
                     .read(true).write(true).create_new(true)
@@ -2087,7 +3020,7 @@ impl Vault {
                     tmp_file.sync_all()?;
                 } else {
                     // 单分区：头部占位（步骤 6 重写为最终内容）
-                    tmp_file.write_all(&[0u8; HEADER_SIZE])?;
+                    tmp_file.write_all(&vec![0u8; hdr_size])?;
                     tmp_file.flush()?;
                     tmp_file.sync_all()?;
                 }
@@ -2112,7 +3045,7 @@ impl Vault {
             // 避免单文件自拷贝在区间重叠时的数据破坏风险）
             let mut src_file = File::open(&vault_path)?;
             let mut write_cursor = if single_partition {
-                HEADER_SIZE as u64
+                hdr_size as u64
             } else {
                 tmp_file.seek(SeekFrom::End(0))?
             };
@@ -2159,7 +3092,7 @@ impl Vault {
             let lock_state = &self.lock_state;
             let salt = &self.salt;
             let partitions = &self.partitions;
-            write_header_to_file(&mut tmp_file, lock_state, salt, partitions, &sign_key)?;
+            write_header_to_file(&mut tmp_file, self.format_version, lock_state, salt, partitions, &sign_key)?;
             tmp_file.flush()?;
             tmp_file.sync_all()?;
             drop(tmp_file);
@@ -2451,6 +3384,8 @@ impl Vault {
         if let Some(mut key) = self.enc_key.take() { key.zeroize(); }
         if let Some(mut key) = self.auth_key.take() { key.zeroize(); }
         if let Some(mut key) = self.sign_key.take() { key.zeroize(); }
+        if let Some(mut key) = self.data_key.take() { key.zeroize(); }
+        self.format_version = 0;
         self.active_partition = None;
         self.audit = None;
         self.audit_dirty = false;
@@ -2490,6 +3425,8 @@ impl Vault {
         if let Some(mut key) = self.enc_key.take() { key.zeroize(); }
         if let Some(mut key) = self.auth_key.take() { key.zeroize(); }
         if let Some(mut key) = self.sign_key.take() { key.zeroize(); }
+        if let Some(mut key) = self.data_key.take() { key.zeroize(); }
+        self.format_version = 0;
         self.active_partition = None;
         self.audit = None;
         self.audit_dirty = false;
@@ -2511,5 +3448,7 @@ impl Drop for Vault {
         if let Some(mut key) = self.enc_key.take() { key.zeroize(); }
         if let Some(mut key) = self.auth_key.take() { key.zeroize(); }
         if let Some(mut key) = self.sign_key.take() { key.zeroize(); }
+        if let Some(mut key) = self.data_key.take() { key.zeroize(); }
+        self.format_version = 0;
     }
 }

@@ -108,17 +108,17 @@ const ARGON2_M_COST: u32 = 65536; // 64 MB
 const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
 
-/// 从主密码 + 可选密钥文件 + 盐 派生出三个密钥（Argon2id → HKDF-SHA512）
+/// Argon2id 主派生（v4/v5 共用）：口令 + 可选密钥文件（长度前缀）+ 盐 → 32 字节。
 ///
 /// 安全性：使用长度前缀 + 分隔符避免拼接歧义。
 /// 旧实现 `password + key_file` 会让 `("abc","def")` 与 `("abcd","ef")` 派生相同密钥。
 /// 现在格式为：`u64_le(password_len) || password || u64_le(keyfile_len) || key_file`，
 /// 任意一方长度变化都会改变前缀字节，从根本上消除歧义。
-pub fn derive_keys(
+fn argon2_master(
     password: &str,
     key_file_data: Option<&[u8]>,
     salt: &[u8],
-) -> Result<KeyMaterial, VaultError> {
+) -> Result<[u8; 32], VaultError> {
     // 2.7.1 修复：参数校验前置（与 derive_legacy_lock_key 同一问题）——
     // 口令已拼进 combined 之后再 `?` 会跳过零化
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
@@ -140,19 +140,44 @@ pub fn derive_keys(
         combined.extend_from_slice(&0u64.to_le_bytes());
     }
 
-    // 2.7.0 修复：与 derive_legacy_lock_key 一致，所有错误路径都先零化
+    // 2.7.0 修复：与 derive_legacy_lock_key 一致，所有错误路径都先 zeroize
     // combined（含主密码字节）再返回，不允许 `?` 提前返回跳过零化
     let mut master = [0u8; 32];
     if let Err(e) = argon2.hash_password_into(&combined, salt, &mut master) {
         combined.zeroize();
         return Err(VaultError::Other(format!("Argon2id 派生失败: {}", e)));
     }
+    combined.zeroize();
+    Ok(master)
+}
 
-    let hkdf = Hkdf::<Sha512>::new(None, &master);
+/// 从主密码 + 可选密钥文件 + 盐 派生出三个密钥（Argon2id → HKDF-SHA512）
+pub fn derive_keys(
+    password: &str,
+    key_file_data: Option<&[u8]>,
+    salt: &[u8],
+) -> Result<KeyMaterial, VaultError> {
+    let mut master = argon2_master(password, key_file_data, salt)?;
+    let keys = match expand_keys(&master) {
+        Ok(k) => k,
+        Err(e) => {
+            master.zeroize();
+            return Err(e);
+        }
+    };
+    master.zeroize();
+    Ok(keys)
+}
+
+/// 2.8.0（v5 信封加密）：从 32 字节 data_key 派生三把会话密钥。
+///
+/// 与 v4 的「master → HKDF 扩展」完全同构（v4 中 master 直接由口令派生），
+/// v5 中 master 换成随机 data_key —— 文件/索引密文的 GCM 布局与 AAD 约定
+/// 因此完全不变，v4→v5 升级只需重加密数据本身。
+pub fn expand_keys(data_key: &[u8; 32]) -> Result<KeyMaterial, VaultError> {
+    let hkdf = Hkdf::<Sha512>::new(None, data_key);
     let mut derived = vec![0u8; 96];
     if hkdf.expand(b"pyvault4-keys", &mut derived).is_err() {
-        combined.zeroize();
-        master.zeroize();
         return Err(VaultError::Other("HKDF 派生失败".into()));
     }
 
@@ -165,12 +190,29 @@ pub fn derive_keys(
     keys.auth_key.copy_from_slice(&derived[32..64]);
     keys.sign_key.copy_from_slice(&derived[64..96]);
 
-    // 擦除中间量
-    combined.zeroize();
-    master.zeroize();
     derived.zeroize();
-
     Ok(keys)
+}
+
+/// 2.8.0（v5 信封加密）：从口令 + 可选密钥文件 + 盐 派生 KEK（密钥包裹密钥）。
+///
+/// Argon2id 参数与 `derive_keys` 完全一致（相同的内存硬度 = 相同的暴力破解成本），
+/// 仅 HKDF 扩展的 info 域分离（`pyvault5-kek`），与 data_key → 会话密钥的扩展
+/// 互不混淆。口令只负责「包裹」随机 data_key，因此修改口令无需重加密数据。
+pub fn derive_kek(
+    password: &str,
+    key_file_data: Option<&[u8]>,
+    salt: &[u8],
+) -> Result<[u8; 32], VaultError> {
+    let mut master = argon2_master(password, key_file_data, salt)?;
+    let hkdf = Hkdf::<Sha512>::new(None, &master);
+    let mut kek = [0u8; 32];
+    if hkdf.expand(b"pyvault5-kek", &mut kek).is_err() {
+        master.zeroize();
+        return Err(VaultError::Other("HKDF 派生失败".into()));
+    }
+    master.zeroize();
+    Ok(kek)
 }
 
 /// AES-256-GCM 加密，返回 nonce(12) || ciphertext
@@ -208,6 +250,26 @@ pub fn decrypt_gcm(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     let nonce = Nonce::from_slice(nonce);
     let payload = Payload { msg: ct, aad };
     cipher.decrypt(nonce, payload).ok()
+}
+
+/// 2.8.0（v5 信封加密）：用 KEK 解包 data_key（输入 60 字节 nonce12||ct32||tag16）。
+///
+/// 返回 None = 口令错误或包裹体被篡改（GCM 认证失败）。这是 v5 打开流程中
+/// 「口令是否正确」的判定点 —— 口令正确性由 AES-GCM 认证标签保证。
+pub fn unwrap_data_key(kek: &[u8; 32], wrapped: &[u8], aad: &[u8]) -> Option<[u8; 32]> {
+    if wrapped.len() != 60 {
+        return None;
+    }
+    let plain = decrypt_gcm(kek, wrapped, aad)?;
+    if plain.len() != 32 {
+        // 长度异常的明文同样不能残留
+        let mut p = plain;
+        p.zeroize();
+        return None;
+    }
+    let mut dk = [0u8; 32];
+    dk.copy_from_slice(&plain);
+    Some(dk)
 }
 
 /// 生成认证标签（HMAC-SHA256 of b"AUTH_OK"）—— **旧格式**。

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LynVault 2.7.0</title>
+    <title>LynVault 2.8.0</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -34,17 +34,25 @@
         <span class="sep"></span>
         <button id="btn-defrag" disabled>整理保险柜</button>
         <button id="btn-destroy" class="danger" disabled>销毁保险箱</button>
+        <span class="sep"></span>
+        <!-- 2.8.0：改密码 / 操作记录 / 完整性体检（开柜后可用）+ 设置（始终可用） -->
+        <button id="btn-change-pwd" disabled>修改密码</button>
+        <button id="btn-audit" disabled>操作记录</button>
+        <button id="btn-verify" disabled>完整性体检</button>
+        <button id="btn-settings">设置</button>
     </div>
 
     <div id="nav" class="hidden">
         <button id="btn-up" title="向上">↑</button>
         <input type="text" id="path-input" value="/">
+        <!-- 2.8.0：文件名搜索（跨全库，大小写不敏感；Esc 或清空恢复目录视图） -->
+        <input type="text" id="search-input" placeholder="🔍 搜索文件名…" autocomplete="off">
     </div>
 
     <div id="file-list"></div>
 
     <!-- 2.4.1：开源地址已移至标题栏右侧；状态栏文案会被 setStatus 动态覆盖 -->
-    <div id="status-bar">©绘萤者 LynVault 2.7.0</div>
+    <div id="status-bar">©绘萤者 LynVault 2.8.0</div>
 
     <!-- 模态框 -->
     <div id="overlay" class="hidden"></div>

@@ -469,10 +469,10 @@ fn fake_partition_cannot_downgrade_header_integrity() {
     let (_, path) = new_vault(&dir);
 
     let mut b = fs::read(&path).unwrap();
-    // 条目 1 偏移 = 106 + 96 = 202。整段别名先清零，再写入合法别名 "evil"，
-    // 使 is_valid_alias 判定为真（把 real_count 抬到 2）。
-    b[202..218].copy_from_slice(&[0u8; 16]);
-    b[202..206].copy_from_slice(b"evil");
+    // 2.8.0（v5）：条目 1 偏移 = 106 + 192 = 298。整段别名先清零，再写入合法别名
+    // "evil"，使 is_plausible_alias 判定为真（把真实分区数抬到 2）。
+    b[298..314].copy_from_slice(&[0u8; 16]);
+    b[298..302].copy_from_slice(b"evil");
     // 同时篡改主分区别名（让头部与主分区 auth_tag 不再匹配）
     b[106] ^= 0xFF;
     fs::write(&path, &b).unwrap();
@@ -695,4 +695,275 @@ fn delete_entries_normalize_vpath() {
         "三种输入形式都应命中删除（仍剩 {} 项）",
         idx.files.len()
     );
+}
+
+// ───────────────── 2.8.0：v5 信封加密 / 改密码 / 升级 ─────────────────
+
+/// v4 旧格式夹具（兼容路径回归测试用）
+fn new_vault_v4(dir: &Path) -> (Vault, PathBuf) {
+    let path = dir.join("test-v4.lyt");
+    let mut v = Vault::default();
+    v.create_v4_for_tests(&path, PWD, None).expect("创建 v4 保险柜失败");
+    (v, path)
+}
+
+/// 新建保险柜必须是 v5（信封加密），且头部版本字节 = 5、头部 2048 字节
+#[test]
+fn v5_create_uses_envelope_format() {
+    let dir = tempdir("v5create");
+    let (_, path) = new_vault(&dir);
+    let b = fs::read(&path).unwrap();
+    assert_eq!(&b[..8], b"PYVAULT4", "magic 保持不变（识别路径依赖）");
+    assert_eq!(b[8], 5, "新建保险柜应为 v5 格式");
+    assert!(b.len() >= 2048, "v5 头部为 2048 字节");
+}
+
+/// v4 旧保险柜仍可打开、改名后仍可读（只读兼容）
+#[test]
+fn v4_vault_opens_and_rename_keeps_readable() {
+    let dir = tempdir("v4compat");
+    let (mut v, path) = new_vault_v4(&dir);
+    let src = write_src(&dir, "a.txt", b"v4 content");
+    v.import_file(&src, "/a.txt").unwrap();
+    v.get_index_manager().unwrap().rename_file("/a.txt", "b.txt").unwrap();
+    let data = v.load_file_data("/b.txt").unwrap();
+    assert_eq!(data, b"v4 content");
+    drop(v);
+
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None).expect("v4 保险柜应能打开");
+    let data = v2.load_file_data("/b.txt").unwrap();
+    assert_eq!(data, b"v4 content");
+}
+
+/// v4 保险柜的锁定区 / 篡改检测在新版本下依旧生效
+#[test]
+fn v4_tamper_still_detected() {
+    let dir = tempdir("v4tamper");
+    let (_, path) = new_vault_v4(&dir);
+    let mut b = fs::read(&path).unwrap();
+    b[106] ^= 0xFF; // 条目 0 别名（v4 布局）
+    fs::write(&path, &b).unwrap();
+    let mut v = Vault::default();
+    assert!(v.open_and_authenticate(&path, PWD, None).is_err(), "v4 头部篡改必须被捕获");
+}
+
+/// v5 改密码：头部级操作 —— 文件数据偏移/长度完全不变，新密码可开、旧密码失效
+#[test]
+fn v5_change_password_is_header_only() {
+    let dir = tempdir("v5chg");
+    let (mut v, path) = new_vault(&dir);
+    let src = write_src(&dir, "doc.txt", b"secret content for change test");
+    v.import_file(&src, "/doc.txt").unwrap();
+    let before: Vec<(u64, u64)> = v.load_index().unwrap().files.values()
+        .map(|m| (m.offset, m.length)).collect();
+    let file_len_before = fs::metadata(&path).unwrap().len();
+
+    v.change_password(PWD, "brand new password 123", None, None::<fn(usize)>)
+        .expect("v5 改密码失败");
+    let after: Vec<(u64, u64)> = v.load_index().unwrap().files.values()
+        .map(|m| (m.offset, m.length)).collect();
+    assert_eq!(before, after, "v5 改密码不得触碰数据区（偏移应逐字节一致）");
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        file_len_before,
+        "v5 改密码不得改变文件长度"
+    );
+    drop(v);
+
+    // 旧密码失效
+    let mut v2 = Vault::default();
+    assert!(v2.open_and_authenticate(&path, PWD, None).is_err(), "旧密码应被拒绝");
+    // 新密码可开，内容完好
+    let mut v3 = Vault::default();
+    v3.open_and_authenticate(&path, "brand new password 123", None)
+        .expect("新密码应能打开");
+    assert_eq!(v3.load_file_data("/doc.txt").unwrap(), b"secret content for change test");
+}
+
+/// v5 改密码必须验证当前密码（防未锁屏时被改密锁死）
+#[test]
+fn v5_change_password_requires_current_password() {
+    let dir = tempdir("v5chgverify");
+    let (mut v, _) = new_vault(&dir);
+    let r = v.change_password("wrong current password!", "brand new password 123", None, None::<fn(usize)>);
+    assert!(r.is_err(), "当前密码错误必须被拒绝");
+}
+
+/// v4 → v5 升级（改密码触发）：数据完好、格式变为 v5、旧密码失效、审计链保留
+#[test]
+fn v4_change_password_upgrades_to_v5() {
+    let dir = tempdir("v4upgrade");
+    let (mut v, path) = new_vault_v4(&dir);
+    let src = write_src(&dir, "doc.txt", b"upgrade me");
+    v.import_file(&src, "/doc.txt").unwrap();
+    drop(v);
+
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None).unwrap();
+    v2.change_password(PWD, "upgraded password 456", None, None::<fn(usize)>)
+        .expect("v4→v5 升级失败");
+    drop(v2);
+
+    let b = fs::read(&path).unwrap();
+    assert_eq!(b[8], 5, "升级后应为 v5 格式");
+    assert!(b.len() >= 2048, "升级后头部应为 2048 字节");
+
+    // 旧密码失效，新密码可开，内容完好
+    let mut v3 = Vault::default();
+    assert!(v3.open_and_authenticate(&path, PWD, None).is_err(), "旧密码应被拒绝");
+    let mut v4 = Vault::default();
+    v4.open_and_authenticate(&path, "upgraded password 456", None)
+        .expect("新密码应能打开升级后的保险柜");
+    assert_eq!(v4.load_file_data("/doc.txt").unwrap(), b"upgrade me");
+}
+
+/// 多分区 v4 保险柜改密码必须明确报错（其余分区口令未知，无法生成包裹密钥）
+#[test]
+fn v4_multi_partition_change_password_rejected() {
+    let dir = tempdir("v4multi");
+    let (mut v, _) = new_vault_v4(&dir);
+    v.add_partition("decoy", "decoy password 123", None).unwrap();
+    let r = v.change_password(PWD, "brand new password 123", None, None::<fn(usize)>);
+    assert!(r.is_err(), "多分区 v4 改密码应被拒绝");
+}
+
+/// v5 改密码后头部篡改仍能被检出（auth_tag 重新绑定新盐）
+#[test]
+fn v5_tamper_after_password_change_detected() {
+    let dir = tempdir("v5chgtamper");
+    let (mut v, path) = new_vault(&dir);
+    v.change_password(PWD, "brand new password 123", None, None::<fn(usize)>).unwrap();
+    drop(v);
+    let mut b = fs::read(&path).unwrap();
+    b[106] ^= 0xFF; // 条目 0 别名（v5 布局同样起始于 106）
+    fs::write(&path, &b).unwrap();
+    let mut v2 = Vault::default();
+    assert!(v2.open_and_authenticate(&path, "brand new password 123", None).is_err());
+}
+
+// ───────────────── 2.8.0：移动 / 搜索 / 完整性体检 / 锁定信息 ─────────────────
+
+/// 移动文件与文件夹：内容可读、冲突拒绝、移入自身子目录拒绝
+#[test]
+fn move_file_and_folder_keeps_content_readable() {
+    let dir = tempdir("move");
+    let (mut v, _) = new_vault(&dir);
+    v.get_index_manager().unwrap().add_folder("/docs").unwrap();
+    v.get_index_manager().unwrap().add_folder("/docs/sub").unwrap();
+    v.get_index_manager().unwrap().add_folder("/archive").unwrap();
+    let src = write_src(&dir, "a.txt", b"move me");
+    v.import_file(&src, "/a.txt").unwrap();
+    v.import_file(&write_src(&dir, "b.txt", b"nested"), "/docs/sub/b.txt").unwrap();
+
+    // 文件移动：根 → /docs
+    v.get_index_manager().unwrap().move_file("/a.txt", "/docs").unwrap();
+    assert_eq!(v.load_file_data("/docs/a.txt").unwrap(), b"move me");
+    assert!(!v.load_index().unwrap().files.contains_key("/a.txt"));
+
+    // 文件夹移动：/docs → /archive（子树整体迁移，内容仍可读）
+    v.get_index_manager().unwrap().move_folder("/docs", "/archive").unwrap();
+    let idx = v.load_index().unwrap();
+    assert!(idx.files.contains_key("/archive/docs/a.txt"), "文件应随子树迁移");
+    assert!(idx.files.contains_key("/archive/docs/sub/b.txt"), "子目录文件应随子树迁移");
+    assert!(!idx.folders.contains_key("/docs"), "原文件夹条目应消失");
+    drop(v);
+
+    // 重开后内容仍可读（持久化正确）
+    let (_, path) = ((), dir.join("test.lyt"));
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None).unwrap();
+    assert_eq!(v2.load_file_data("/archive/docs/sub/b.txt").unwrap(), b"nested");
+}
+
+/// 移动冲突与非法目标
+#[test]
+fn move_conflicts_rejected() {
+    let dir = tempdir("moveconflict");
+    let (mut v, _) = new_vault(&dir);
+    v.get_index_manager().unwrap().add_folder("/docs").unwrap();
+    v.import_file(&write_src(&dir, "a.txt", b"A"), "/a.txt").unwrap();
+    v.import_file(&write_src(&dir, "b.txt", b"B"), "/docs/b.txt").unwrap();
+    // 在 /docs 下再放一个同名 a.txt，制造真正的同名冲突
+    v.import_file(&write_src(&dir, "a2.txt", b"A2"), "/docs/a.txt").unwrap();
+
+    // 同名冲突
+    let r = v.get_index_manager().unwrap().move_file("/a.txt", "/docs");
+    assert!(r.is_err(), "同名冲突应被拒绝");
+    // 目标文件夹不存在
+    let r = v.get_index_manager().unwrap().move_file("/a.txt", "/nowhere");
+    assert!(r.is_err(), "目标文件夹不存在应被拒绝");
+    // 文件夹移入自身子目录
+    let r = v.get_index_manager().unwrap().move_folder("/docs", "/docs");
+    assert!(r.is_err(), "文件夹移入自身应被拒绝");
+    // 数据未被破坏（冲突后原文件仍可读）
+    assert_eq!(v.load_file_data("/a.txt").unwrap(), b"A");
+    assert_eq!(v.load_file_data("/docs/b.txt").unwrap(), b"B");
+}
+
+/// 完整性体检：完好库全部通过；翻转密文字节后能定位损坏文件
+#[test]
+fn verify_integrity_detects_tampering() {
+    let dir = tempdir("verify");
+    let (mut v, path) = new_vault(&dir);
+    v.import_file(&write_src(&dir, "ok.txt", b"fine"), "/ok.txt").unwrap();
+    let (total, broken) = v.verify_integrity(None::<fn(usize, usize, &str)>).unwrap();
+    assert_eq!(total, 1);
+    assert!(broken.is_empty(), "完好库不应有异常");
+    drop(v);
+
+    // 篡改文件密文（数据区从 2048 开始；索引在最前，其后是文件数据）
+    let meta_off = {
+        let mut v = Vault::default();
+        v.open_and_authenticate(&path, PWD, None).unwrap();
+        v.load_index().unwrap().files.get("/ok.txt").unwrap().offset
+    };
+    let mut b = fs::read(&path).unwrap();
+    b[meta_off as usize + 20] ^= 0xFF;
+    fs::write(&path, &b).unwrap();
+
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None).unwrap();
+    let (total, broken) = v2.verify_integrity(None::<fn(usize, usize, &str)>).unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(broken.len(), 1, "篡改必须被检出");
+    assert_eq!(broken[0].vpath, "/ok.txt");
+}
+
+/// 搜索：文件名与 vpath 大小写不敏感匹配
+#[test]
+fn search_files_matches_name_and_vpath() {
+    let dir = tempdir("search");
+    let (mut v, _) = new_vault(&dir);
+    v.get_index_manager().unwrap().add_folder("/Reports").unwrap();
+    v.import_file(&write_src(&dir, "Q3-Summary.txt", b"x"), "/Reports/Q3-Summary.txt").unwrap();
+    v.import_file(&write_src(&dir, "other.txt", b"y"), "/other.txt").unwrap();
+
+    let hits = v.search_files("q3", 50).unwrap();
+    assert_eq!(hits.len(), 1, "应命中 /Reports/Q3-Summary.txt（vpath 包含 q3）");
+    assert!(!hits[0].is_dir);
+    let hits = v.search_files("reports", 50).unwrap();
+    assert_eq!(hits.len(), 2, "应命中文件夹 /Reports 及其下文件（vpath 包含）");
+    assert!(hits[0].is_dir, "文件夹条目应标记 is_dir 且排在前面");
+    let hits = v.search_files("summary", 50).unwrap();
+    assert!(hits.iter().any(|h| h.name.contains("Q3-Summary")));
+    let hits = v.search_files("zzz-not-exist", 50).unwrap();
+    assert!(hits.is_empty());
+}
+
+/// 锁定信息：错误密码尝试后计数递增，UI 可在开锁前展示
+#[test]
+fn read_lock_info_reports_failed_attempts() {
+    let dir = tempdir("lockinfo");
+    let (_, path) = new_vault(&dir);
+    let info = vault_core::read_lock_info(&path).unwrap();
+    assert_eq!(info.failed_count, 0, "新库应为 0 次失败");
+    assert!(!info.locked);
+
+    // 一次错误尝试（真实打开路径会写入锁定区）
+    let mut v = Vault::default();
+    assert!(v.open_and_authenticate(&path, "wrong password 123", None).is_err());
+    let info = vault_core::read_lock_info(&path).unwrap();
+    assert_eq!(info.failed_count, 1, "失败尝试应被记录");
+    assert!(!info.locked, "1 次失败不应触发锁定");
 }

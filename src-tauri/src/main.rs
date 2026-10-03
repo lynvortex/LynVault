@@ -2,11 +2,65 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+// 2.8.0：剪贴板保护 —— 模块本身跨平台（start/stop 在非 Windows 为空实现），
+// 内部 win32 代码全部 cfg(windows) 隔离；不要在声明处 gate，
+// 否则 commands.rs 的无条件调用在 Linux 编译失败
+mod clipboard_guard;
 #[cfg(windows)]
 mod file_assoc;
+mod settings;
 mod single_instance;
+#[cfg(windows)]
+mod system_events;
 
 use std::fs::OpenOptions;
+
+/// 2.8.0：窗口标题版本号单一来源
+const APP_VERSION: &str = "2.8.0";
+
+/// 2.8.0：防截屏开关（对主窗口应用 SetWindowDisplayAffinity）。
+/// - 开启：WDA_EXCLUDEFROMCAPTURE（Win10 2004+，截屏/录屏/远程共享中窗口直接消失）；
+///   该值不被支持时（旧系统）退化为 WDA_MONITOR（截屏中变黑块）；
+/// - 关闭：WDA_NONE。
+/// 返回是否成功作用于窗口。注意：只能防软件抓屏，防不了物理拍摄。
+pub fn apply_anti_screenshot(app: &tauri::AppHandle, enable: bool) -> bool {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        use windows::Win32::Foundation::HWND;
+        let affinity = if enable {
+            windows::Win32::UI::WindowsAndMessaging::WDA_EXCLUDEFROMCAPTURE
+        } else {
+            windows::Win32::UI::WindowsAndMessaging::WDA_NONE
+        };
+        if let Some(win) = app.get_window("main") {
+            if let Ok(h) = win.hwnd() {
+                // tauri 1.x 的 hwnd() 返回其内部 windows 版本的 HWND（isize 语义），
+                // 按数值转换到本 crate 的 windows 0.57 HWND
+                let hwnd = HWND(h.0 as isize);
+                let r = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(hwnd, affinity)
+                };
+                if r.is_err() && enable {
+                    // WDA_EXCLUDEFROMCAPTURE 需 Win10 2004+；退化 WDA_MONITOR（截屏中变黑块）
+                    let _ = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(
+                            hwnd,
+                            windows::Win32::UI::WindowsAndMessaging::WDA_MONITOR,
+                        )
+                    };
+                }
+                return r.is_ok();
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, enable);
+        false
+    }
+}
 
 // ───────────────── 2.5.1 新增：日志初始化 ─────────────────
 //
@@ -170,10 +224,11 @@ fn webview2_data_dir_candidates() -> Vec<std::path::PathBuf> {
 
 /// 创建主窗口。`transparent` 失败时由调用方降级重试（透明 → 不透明）。
 /// 2.7.1 起窗口由代码创建（tauri.conf.json 的 windows 置空），启动失败可控。
-fn create_main_window(app: &tauri::App, transparent: bool) -> Result<(), String> {
+/// 2.8.0：窗口尺寸支持从设置持久化读取（无配置时 960×620 默认值）。
+fn create_main_window(app: &tauri::App, transparent: bool, width: f64, height: f64) -> Result<(), String> {
     tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::default())
-        .title("LynVault 2.7.1")
-        .inner_size(960.0, 620.0)
+        .title(format!("LynVault {}", APP_VERSION))
+        .inner_size(width, height)
         .resizable(true)
         .fullscreen(false)
         .decorations(false)
@@ -217,6 +272,9 @@ fn main() {
             // 首实例：启动单实例监听线程（持有端口监听器直到进程退出）
             let handle = app.handle().clone();
             std::thread::spawn(move || single_instance::server_loop(handle));
+            // 2.8.0：启动系统事件监听（锁屏 / 睡眠 / 注销 → 自动关闭保险柜）
+            #[cfg(windows)]
+            system_events::spawn(app.handle().clone());
             // 2.4.1：后台注册 .lyt 用户级文件关联（best-effort，不阻塞启动；
             // 用户已关联到其他程序时不覆盖）—— 仅 Windows
             #[cfg(windows)]
@@ -256,6 +314,19 @@ fn main() {
             commands::check_vault_file,
             commands::get_launch_vault_arg,
             commands::frontend_ready,
+
+            // 2.8.0 新增：改密码 / 移动 / 搜索 / 审计 / 体检 / 锁定信息 / 设置
+            commands::change_password,
+            commands::move_items,
+            commands::list_all_folders,
+            commands::search_files,
+            commands::get_audit_log,
+            commands::verify_vault_integrity,
+            commands::get_lock_info,
+            commands::get_settings,
+            commands::enable_persistence,
+            commands::disable_persistence,
+            commands::save_settings,
         ])
         .build(tauri::generate_context!())
     {
@@ -278,6 +349,11 @@ fn main() {
     // 主窗口降级重试：每个 WebView2 数据目录先试透明（与旧版观感一致）再试
     // 不透明；全部失败才放弃并告之原因。候选目录为空时不设置环境变量
     //（WebView2 用系统默认位置）。
+    // 2.8.0：窗口尺寸 / 防截屏从设置持久化读取（未启用时用默认值，防截屏默认开启）
+    let (cfg_w, cfg_h, anti_screenshot) = match settings::load_active() {
+        Some((_, s)) => (s.window_width, s.window_height, s.anti_screenshot),
+        None => (960.0, 620.0, true),
+    };
     let data_dirs = webview2_data_dir_candidates();
     let attempts: Vec<Option<&std::path::Path>> = if data_dirs.is_empty() {
         vec![None]
@@ -291,7 +367,7 @@ fn main() {
             std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", d);
         }
         for &transparent in &[true, false] {
-            match create_main_window(&app, transparent) {
+            match create_main_window(&app, transparent, cfg_w, cfg_h) {
                 Ok(()) => {
                     created = true;
                     break 'outer;
@@ -316,6 +392,11 @@ fn main() {
             ),
         );
         return;
+    }
+
+    // 2.8.0：按设置应用防截屏（默认开启；失败仅记日志，不影响使用）
+    if apply_anti_screenshot(&app.handle(), anti_screenshot) && anti_screenshot {
+        log::warn!("防截屏保护未生效（系统不支持或窗口句柄异常）");
     }
 
     app.run(|_app, _event| {});
