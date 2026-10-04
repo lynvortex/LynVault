@@ -2,6 +2,8 @@
 name = "LynVault"
 version = "3.0.0"
 edition = "2021"
+# cargo-deny licenses 门禁要求 manifest 显式声明（与仓库根 LICENSE 一致）
+license = "MIT"
 
 # 2.7.1：包名 lynvault-rs → LynVault —— 裸 `cargo build --release` 直接产出
 # target/release/LynVault.exe（此前为 lynvault-rs.exe，只有走 bundler 才会被

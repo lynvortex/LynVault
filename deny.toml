@@ -8,8 +8,10 @@
 [advisories]
 yanked = "deny"
 ignore = [
-  # 示例：
-  # { id = "RUSTSEC-0000-0000", reason = "仅影响未启用的 xxx feature" },
+  # proc-macro-error 失维护（RUSTSEC-2024-0370）：无可用升级，仅经
+  # glib-macros → gtk 传入（Tauri 2 的 Linux/GTK 构建专属依赖链），
+  # Windows 发布产物不受影响；待 gtk-rs/tauri 上游换用替代宏库后移除。
+  { id = "RUSTSEC-2024-0370", reason = "仅 Linux GTK 链路传入，无可用升级，上游跟进中" },
 ]
 
 # ── 许可证合规 ────────────────────────────────────────────────────────
@@ -30,6 +32,9 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Unicode-DFS-2016",
+  # libbz2-rs-sys（zip → bzip2，calamine 预览链路）自带 bzip2 源码许可证，
+  # BSD 风格宽松许可（保留版权声明即可自由使用）
+  "bzip2-1.0.6",
 ]
 
 # ── 重复依赖版本 ──────────────────────────────────────────────────────
