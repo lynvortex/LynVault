@@ -57,7 +57,7 @@ chmod 644 "$STAGE/DEBIAN/control" "$STAGE/DEBIAN/md5sums" \
     "$STAGE/usr/share/applications/lyn-vault.desktop" \
     "$STAGE/usr/share/mime/packages/lynvault.xml"
 
-OUT="/mnt/c/Users/Administrator/Desktop/Projects/LynVault/LynVault 3.0.0/release-artifacts/lyn-vault_${VERSION}_amd64.deb"
+OUT="$SRC/lyn-vault_${VERSION}_amd64.deb"
 dpkg-deb --build --root-owner-group "$STAGE" "$OUT"
 dpkg-deb --info "$OUT" | head -12
 echo "=== DONE: $OUT ==="

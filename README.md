@@ -481,8 +481,8 @@ sudo dpkg -i lyn-vault_2.7.0_amd64.deb   # 若提示依赖缺失，执行 sudo a
 **Windows**
 - Windows 10 1803+
 - WebView2 Runtime（Win 10 1803+ 通常已预装）
-- 构建产物：`target/release/LynVault.exe`（workspace 根目录 target）
+- 构建产物：`target/release/LynVault.exe`（workspace 根目录 target）；**发布产物复制到仓库根目录**（`LynVault-<版本>-win64.exe`，32 位为 `-win32.exe`）
 
 **Linux**
 - 面向 Debian/Ubuntu 的 `.deb`，运行时依赖 `libwebkit2gtk-4.1-0`、`libgtk-3-0`（3.0.0 起切换到 webkit2gtk-4.1；安装包已声明，apt 自动解析）
-- 构建产物：`target/release/bundle/deb/lyn-vault_<版本>_amd64.deb`
+- 构建产物：`target/release/bundle/deb/lyn-vault_<版本>_amd64.deb`；或用仓库根目录的 `build-deb.sh` 手工组装（.deb 输出到仓库根目录）
