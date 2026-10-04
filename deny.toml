@@ -38,7 +38,9 @@ allow = [
 multiple-versions = "warn"
 
 # ── 来源校验 ──────────────────────────────────────────────────────────
-# 只允许 crates.io 与官方 registry，禁止 git 直引等不可审计来源：
+# 只允许 crates.io 与官方 registry，禁止 git 直引等不可审计来源。
+# 键名以 cargo-deny 当前 schema 为准（unknown-source 已不存在，git 来源
+# 对应 unknown-git）：
 [sources]
 unknown-registry = "deny"
-unknown-source = "deny"
+unknown-git = "deny"

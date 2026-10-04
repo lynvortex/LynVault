@@ -1,6 +1,6 @@
 // LynVault 3.0.0 - Tauri 2 Frontend
 // 等 Tauri 注入完毕再执行
-let invoke, tauriOpen, tauriSave, tauriMessage, tauriAsk;
+let invoke, tauriOpen, tauriSave;
 
 function initTauri() {
     // 诊断信息
@@ -18,8 +18,6 @@ function initTauri() {
             invoke = window.__TAURI__.core.invoke;
             tauriOpen = window.__TAURI__.dialog.open;
             tauriSave = window.__TAURI__.dialog.save;
-            tauriMessage = window.__TAURI__.dialog.message;
-            tauriAsk = window.__TAURI__.dialog.ask;
             console.log('[LynVault] API via __TAURI__ (v2 core)');
             return true;
         }
@@ -31,8 +29,6 @@ function initTauri() {
             invoke = window.__TAURI__.tauri.invoke;
             tauriOpen = window.__TAURI__.dialog.open;
             tauriSave = window.__TAURI__.dialog.save;
-            tauriMessage = window.__TAURI__.dialog.message;
-            tauriAsk = window.__TAURI__.dialog.ask;
             console.log('[LynVault] API via __TAURI__ (v1 tauri)');
             return true;
         }
@@ -44,8 +40,6 @@ function initTauri() {
             // 3.0.0（Tauri 2）：插件命令的参数包在 options 字段内
             tauriOpen = (opts) => invoke('plugin:dialog|open', { options: opts || {} });
             tauriSave = (opts) => invoke('plugin:dialog|save', { options: opts || {} });
-            tauriMessage = (msg, opts) => invoke('plugin:dialog|message', { options: { message: msg, ...(opts || {}) } });
-            tauriAsk = (msg, opts) => invoke('plugin:dialog|ask', { options: { message: msg, ...(opts || {}) } });
             console.log('[LynVault] API via __TAURI_INTERNALS__');
             return true;
         }
@@ -539,7 +533,7 @@ function showInlineInputError(msg) {
         el.textContent = msg;
     } else {
         // fallback：如果找不到内联错误区域，用原生消息框（不破坏 DOM）
-        try { tauriMessage(String(msg), { title: '错误', type: 'error' }); } catch (e) { /* ignore */ }
+        try { uiMessage(String(msg), { title: '错误', type: 'error' }); } catch (e) { /* ignore */ }
     }
     // Q7：清空输入框并重新聚焦
     const inp = $('dlg-input');
@@ -549,11 +543,81 @@ function showInlineInputError(msg) {
     }
 }
 
+// 3.0.0：内置确认 / 消息对话框 —— 替代 tauriAsk / tauriMessage（原生
+// MessageBox 每次弹出自带 Windows 系统提示音）。支持嵌套：打开前快照
+// 当前 #dialog（若在别的对话框 action 内被调用），结束后恢复原界面；
+// 消息文本统一转义，换行符渲染为 <br>。
+function _uiBody(msg, icon) {
+    const safe = escapeHtml(String(msg)).split(String.fromCharCode(10)).join('<br>');
+    return '<p style="white-space:pre-wrap;margin:0 0 8px"><b style="font-size:15px">' + icon + '</b>' + safe + '</p>';
+}
+
+function uiAsk(msg, opts = {}) {
+    return new Promise(resolve => {
+        const prev = {
+            title: $('dialog-title').textContent,
+            body: $('dialog-body').innerHTML,
+            visible: !$('dialog').classList.contains('hidden'),
+            buttons: [...$('dialog-buttons').querySelectorAll('button')].map(b => ({
+                text: b.textContent, cls: b.className, onclick: b.onclick, disabled: b.disabled,
+            })),
+        };
+        const finish = (val) => {
+            if (prev.visible && prev.buttons.length) {
+                showDialog(prev.title, prev.body, prev.buttons.map(b => ({
+                    text: b.text,
+                    cls: b.cls,
+                    action: b.onclick ? () => b.onclick({ preventDefault() {} }) : undefined,
+                })));
+                [...$('dialog-buttons').querySelectorAll('button')].forEach((b, i) => {
+                    if (prev.buttons[i]) b.disabled = prev.buttons[i].disabled;
+                });
+            } else {
+                hideDialog();
+            }
+            resolve(val);
+        };
+        const icon = opts.type === 'error' ? '❌ ' : opts.type === 'warning' ? '⚠️ ' : '';
+        showDialog((opts.title || '确认'), _uiBody(msg, icon), [
+            { text: '确定', cls: 'btn-ok', action: () => { finish(true); } },
+            { text: '取消', cls: 'btn-cancel', action: () => { finish(false); } },
+        ]);
+    });
+}
+
+function uiMessage(msg, opts = {}) {
+    return new Promise(resolve => {
+        const prev = {
+            title: $('dialog-title').textContent,
+            body: $('dialog-body').innerHTML,
+            visible: !$('dialog').classList.contains('hidden'),
+            buttons: [...$('dialog-buttons').querySelectorAll('button')].map(b => ({
+                text: b.textContent, cls: b.className, onclick: b.onclick, disabled: b.disabled,
+            })),
+        };
+        const finish = () => {
+            if (prev.visible && prev.buttons.length) {
+                showDialog(prev.title, prev.body, prev.buttons.map(b => ({
+                    text: b.text,
+                    cls: b.cls,
+                    action: b.onclick ? () => b.onclick({ preventDefault() {} }) : undefined,
+                })));
+                [...$('dialog-buttons').querySelectorAll('button')].forEach((b, i) => {
+                    if (prev.buttons[i]) b.disabled = prev.buttons[i].disabled;
+                });
+            } else {
+                hideDialog();
+            }
+            resolve();
+        };
+        showDialog((opts.title || '提示'), _uiBody(msg, opts.type === 'error' ? '❌ ' : ''), [
+            { text: '确定', cls: 'btn-ok', action: () => { finish(); } },
+        ]);
+    });
+}
+
 function showError(msg) {
-    const pre = document.createElement('pre');
-    pre.style.color = '#ff6666';
-    pre.textContent = msg;
-    showDialog('错误', pre.outerHTML, [{ text: '确定', cls: 'btn-ok' }]);
+    uiMessage(msg, { title: '错误', type: 'error' });
 }
 
 // 2.8.2（P2-20）：密码框回车确认 —— 此前密码框未包 <form> 也未绑 Enter，
@@ -1002,7 +1066,7 @@ async function extractAllFiles() {
     try {
         const check = data_of(await invoke('check_extract_all_dest', { destParentFolder: dest, token: pick.token }));
         if (check && check.exists) {
-            const ok = await tauriAsk(
+            const ok = await uiAsk(
                 `目标文件夹已存在：
 ${check.dest_name}
 
@@ -1038,7 +1102,7 @@ ${check.dest_name}
 async function deleteSelected() {
     if (!state.selectedItems.length) return;
     const names = state.selectedItems.map(i => i.name).join('\n');
-    const ok = await tauriAsk(`确认安全删除以下项目？\n\n${names}\n\n此操作不可撤销（DoD 7-pass 擦除）。`, { title: '确认删除', type: 'warning' });
+    const ok = await uiAsk(`确认安全删除以下项目？\n\n${names}\n\n此操作不可撤销（DoD 7-pass 擦除）。`, { title: '确认删除', type: 'warning' });
     if (!ok) return;
     setBusy(true);
     try {
@@ -1096,7 +1160,7 @@ async function promptEncryptedOffice(vpath, fileName) {
                 showError(msg);
                 return null;
             }
-            const retry = await tauriAsk('密码错误，是否重试？', { title: '口令验证失败', type: 'warning' });
+            const retry = await uiAsk('密码错误，是否重试？', { title: '口令验证失败', type: 'warning' });
             if (!retry) return null;
         }
     }
@@ -1839,7 +1903,7 @@ async function openSettings() {
                 }
             }},
             { text: '关闭持久化', cls: 'btn-cancel', action: async () => {
-                const ok = await tauriAsk('关闭并删除配置文件？所有设置将恢复默认。', { title: '确认', type: 'warning' });
+                const ok = await uiAsk('关闭并删除配置文件？所有设置将恢复默认。', { title: '确认', type: 'warning' });
                 if (!ok) return false;
                 try {
                     await invoke('disable_persistence');
@@ -2059,9 +2123,9 @@ function bindSearch() {
 }
 
 async function destroyVault() {
-    const ok = await tauriAsk('此操作将不可逆地销毁当前保险柜及其所有数据！\n\n确定继续？', { title: '销毁保险箱', type: 'warning' });
+    const ok = await uiAsk('此操作将不可逆地销毁当前保险柜及其所有数据！\n\n确定继续？', { title: '销毁保险箱', type: 'warning' });
     if (!ok) return;
-    const ok2 = await tauriAsk('再次确认：销毁整个保险柜？', { title: '最终确认', type: 'error' });
+    const ok2 = await uiAsk('再次确认：销毁整个保险柜？', { title: '最终确认', type: 'error' });
     if (!ok2) return;
     try {
         await invoke('destroy_vault');
@@ -2115,12 +2179,12 @@ async function _inputPassword(title, label) {
 }
 
 async function _confirmDuressTwice() {
-    const ok1 = await tauriAsk(
+    const ok1 = await uiAsk(
         '即将把该分区标记为胁迫分区。\n之后用该分区密码开柜时，其他所有分区的数据将被永久销毁（不可找回）。\n确定继续？',
         { title: '胁迫密码设置', type: 'warning' }
     );
     if (!ok1) return false;
-    const ok2 = await tauriAsk('最终确认：我已理解触发后其他分区的数据无法恢复。', { title: '最终确认', type: 'error' });
+    const ok2 = await uiAsk('最终确认：我已理解触发后其他分区的数据无法恢复。', { title: '最终确认', type: 'error' });
     return ok2;
 }
 
@@ -2339,7 +2403,7 @@ async function invokeOpenVault(filePath, pwd) {
             present = !!(st && st.present);
         } catch (_) { /* 探测失败按无钥匙处理 */ }
         if (!present) throw e;
-        const useKey = await tauriAsk(
+        const useKey = await uiAsk(
             '检测到硬件密钥（YubiKey）。\n\n是否用硬件密钥重试开柜？（启用硬件密钥二因子的分区需要；将请求触摸密钥）',
             { title: '硬件密钥', type: 'info' }
         );
@@ -2405,7 +2469,7 @@ function openVaultFromExternal(filePath) {
     // 2.7.1 安全修复：先把完整目标路径显示给用户确认，拒绝即不采集口令 ——
     // 单实例端口接受任意本地进程连接，路径由对端指定；不确认就让用户输入口令，
     // 恶意进程可用候选口令预建 .lyt 来验证用户口令（口令验证预言机）。
-    tauriAsk(
+    uiAsk(
         `收到打开保险柜的请求：\n${filePath}\n\n是否打开该保险柜？\n若非您本人的操作，请选择「否」。`,
         { title: '打开保险柜请求', type: 'warning' }
     ).then(ok => {
