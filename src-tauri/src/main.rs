@@ -10,13 +10,15 @@ mod clipboard_guard;
 mod file_assoc;
 mod settings;
 mod single_instance;
+// 3.0.0：可选硬件密钥二因子 —— PC/SC 直连 YubiKey HMAC-SHA1 挑战-响应
 #[cfg(windows)]
 mod system_events;
+mod yubikey;
 
 use std::fs::OpenOptions;
 
-/// 2.8.0：窗口标题版本号单一来源（2.8.2/I3：与其他三处版本号统一）
-const APP_VERSION: &str = "2.8.2";
+/// 2.8.0：窗口标题版本号单一来源（与其他三处版本号统一）
+const APP_VERSION: &str = "3.0.0";
 
 /// 2.8.0：防截屏开关（对主窗口应用 SetWindowDisplayAffinity）。
 /// - 开启：WDA_EXCLUDEFROMCAPTURE（Win10 2004+，截屏/录屏/远程共享中窗口直接消失）；
@@ -35,19 +37,18 @@ pub fn apply_anti_screenshot(app: &tauri::AppHandle, enable: bool) -> bool {
         } else {
             windows::Win32::UI::WindowsAndMessaging::WDA_NONE
         };
-        let Some(win) = app.get_window("main") else {
+        let Some(win) = app.get_webview_window("main") else {
             return false;
         };
         let Ok(h) = win.hwnd() else {
             return false;
         };
-        // tauri 1.x 的 hwnd() 返回其内部 windows 版本的 HWND（isize 语义），
-        // 按数值转换到本 crate 的 windows 0.57 HWND
-        let hwnd = HWND(h.0);
-        if unsafe {
-            windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(hwnd, want)
-        }
-        .is_ok()
+        // 3.0.0（Tauri 2）：hwnd() 返回 Tauri 内部 windows 版本的 HWND，
+        // 与本 crate 的 windows 0.57 类型不同 —— 按底层值显式转换
+        //（无论内部表示是 isize 还是裸指针，`as _` 都收敛到本 crate 的表示）
+        let hwnd = HWND(h.0 as _);
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(hwnd, want) }
+            .is_ok()
         {
             return true;
         }
@@ -141,10 +142,10 @@ impl log::Log for FileLogger {
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&self.path)
             {
-            // 硬链接数须为 1（std 的 number_of_links 在 stable 不可用，
-            // 走 GetFileInformationByHandle）；重解析点拒绝
-            use std::os::windows::fs::MetadataExt;
-            use std::os::windows::io::AsRawHandle;
+                // 硬链接数须为 1（std 的 number_of_links 在 stable 不可用，
+                // 走 GetFileInformationByHandle）；重解析点拒绝
+                use std::os::windows::fs::MetadataExt;
+                use std::os::windows::io::AsRawHandle;
                 use windows::Win32::Foundation::HANDLE;
                 use windows::Win32::Storage::FileSystem::{
                     GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -259,7 +260,12 @@ fn utc_timestamp() -> String {
     let (y, m, d) = civil_from_days(days);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
-        y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
     )
 }
 
@@ -289,7 +295,12 @@ fn fatal_startup_error(title: &str, msg: &str) {
     let t = to_wide(title);
     let m = to_wide(msg);
     unsafe {
-        MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), MB_OK | MB_ICONERROR);
+        MessageBoxW(
+            None,
+            PCWSTR(m.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
@@ -324,14 +335,23 @@ fn webview2_data_dir_candidates() -> Vec<std::path::PathBuf> {
 /// 创建主窗口。`transparent` 失败时由调用方降级重试（透明 → 不透明）。
 /// 2.7.1 起窗口由代码创建（tauri.conf.json 的 windows 置空），启动失败可控。
 /// 2.8.0：窗口尺寸支持从设置持久化读取（无配置时 960×620 默认值）。
-fn create_main_window(app: &tauri::App, transparent: bool, width: f64, height: f64) -> Result<(), String> {
-    tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::default())
+/// 3.0.0（Tauri 2）：WindowBuilder → WebviewWindowBuilder，URL 类型同步更名。
+fn create_main_window(
+    app: &tauri::App,
+    transparent: bool,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
         .title(format!("LynVault {}", APP_VERSION))
         .inner_size(width, height)
         .resizable(true)
         .fullscreen(false)
         .decorations(false)
         .transparent(transparent)
+        // 3.0.0：必须关闭 DWM 阴影 —— Windows 对无边框窗口默认保留 1px 非客户区
+        // 描边，它不参与透明，会作为一圈白/灰线悬在圆角卡片外（实测顶边呈白线）
+        .shadow(false)
         .build()
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -374,9 +394,14 @@ fn idle_lock_watchdog(app: tauri::AppHandle) {
 }
 
 /// 系统级空闲毫秒数（距最后一次键鼠输入）
+/// 3.0.0（L-5 审计修复）：GetTickCount → GetTickCount64 —— 32 位 tick 在系统
+/// 连续运行 49.7 天后回绕，回绕点附近 `saturating_sub` 会算出接近 u32::MAX 的
+/// 假空闲时长，触发用户正在使用时的误关柜（每 49.7 天一次、持续约 2 分钟窗口）。
+/// GetTickCount64 的 64 位时基在实用时间内不回绕；dwTime（32 位）与 64 位
+/// 现值的差按 u32 回绕语义正确折算。
 #[cfg(windows)]
 fn last_input_idle_ms() -> u64 {
-    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::System::SystemInformation::GetTickCount64;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
     unsafe {
         let mut info = LASTINPUTINFO {
@@ -384,7 +409,11 @@ fn last_input_idle_ms() -> u64 {
             dwTime: 0,
         };
         if GetLastInputInfo(&mut info).as_bool() {
-            GetTickCount().saturating_sub(info.dwTime) as u64
+            // dwTime 是 32 位时基：先取模对齐到同一回绕窗口再作差（u32 减法
+            // 的回绕语义天然正确，结果落在 0..2^32 毫秒 ≈ 49.7 天内 ——
+            // 真实空闲不可能超过它，误判方向只会是「已回绕的新输入」→ 0 附近）
+            let now32 = (GetTickCount64() & 0xFFFF_FFFF) as u32;
+            now32.wrapping_sub(info.dwTime) as u64
         } else {
             0 // 查询失败不触发锁定（前端定时器仍在）
         }
@@ -426,6 +455,30 @@ fn main() {
     // 失败依次降级重试：透明 → 不透明 → 换备用 WebView2 数据目录 → 不透明；
     // 仍失败才记日志并弹系统消息框告之原因。
     let app = match tauri::Builder::default()
+        // 3.0.0（Tauri 2）：对话框与外部链接改为官方插件（v1 为内置 API）
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        // 3.0.0（优化2）：媒体流式预览自定义协议 —— <video>/<audio> 的 Range
+        // 请求映射到分块解密（明文仅存在于内存，no-store 禁止磁盘缓存）
+        .register_asynchronous_uri_scheme_protocol(
+            "lynvault-media",
+            move |_ctx, request, responder| {
+                let app = _ctx.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let response = tauri::async_runtime::spawn_blocking(move || {
+                        commands::media_stream_response(&app, &request)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        tauri::http::Response::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap()
+                    });
+                    responder.respond(response);
+                });
+            },
+        )
         .manage(commands::AppState::new())
         .setup(|app| {
             // 首实例：启动单实例监听线程（持有端口监听器直到进程退出）
@@ -449,18 +502,15 @@ fn main() {
         })
         // 2.8.2（H2）：记录主进程侧真实拖放载荷 —— 导入命令要求传入路径
         // 与该载荷完全一致，WebView 伪造的字符串不再被信任。
-        // 全局窗口事件处理器挂在 Builder 上（App/Window 级 API 在 Tauri 1.x
-        // 的形态不同，全局处理器覆盖全部窗口且在窗口创建前生效）。
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::FileDrop(drop_event) = event.event() {
-                // tauri 1.x：tauri::FileDropEvent::Dropped(Vec<PathBuf>)
-                if let tauri::FileDropEvent::Dropped(paths) = drop_event {
-                    let strs: Vec<String> = paths
-                        .iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect();
-                    commands::record_dropped_paths(strs);
-                }
+        // 全局窗口事件处理器挂在 Builder 上（覆盖全部窗口且在窗口创建前生效）。
+        // 3.0.0（Tauri 2）：FileDrop 事件并入 WindowEvent::DragDrop(DragDropEvent)。
+        .on_window_event(|_app, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                let strs: Vec<String> = paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                commands::record_dropped_paths(strs);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -486,17 +536,14 @@ fn main() {
             commands::preview_office_file,
             // 2.5.1 新增：txt 预览直接编辑保存
             commands::update_file_content,
-
             commands::scan_vault_files,
             commands::check_extract_all_dest,
             commands::extract_all_files,
             commands::get_file_icon,
-
             // 2.4.1 新增：.lyt 自动识别 + 前端就绪通知
             commands::check_vault_file,
             commands::get_launch_vault_arg,
             commands::frontend_ready,
-
             // 2.8.0 新增：改密码 / 移动 / 搜索 / 审计 / 体检 / 锁定信息 / 设置
             commands::change_password,
             commands::move_items,
@@ -509,11 +556,23 @@ fn main() {
             commands::enable_persistence,
             commands::disable_persistence,
             commands::save_settings,
-
             // 2.8.2（H2）新增：对话框令牌化 —— 文件/目录选择改由后端弹出，
             // 所选路径登记进一次性令牌表，导入/提取命令凭令牌取路径
             commands::dialog_pick_files,
             commands::dialog_pick_folder,
+            commands::dialog_pick_save,
+            // 3.0.0 新增：胁迫密码（标记 / 解除 / 状态 / 演练）
+            commands::set_duress_mark,
+            commands::clear_duress_mark,
+            commands::get_duress_status,
+            commands::duress_rehearsal,
+            // 3.0.0 新增：硬件密钥二因子（可选，YubiKey HMAC-SHA1 挑战-响应）
+            commands::enable_yubikey_2fa,
+            commands::disable_yubikey_2fa,
+            commands::yubikey_status,
+            commands::yubikey_challenge,
+            // 3.0.0（优化2）：媒体流式预览令牌
+            commands::mint_media_token,
         ])
         .build(tauri::generate_context!())
     {
@@ -539,7 +598,23 @@ fn main() {
     // 2.8.0：窗口尺寸 / 防截屏从设置持久化读取（未启用时用默认值，防截屏默认开启）
     let (cfg_w, cfg_h, anti_screenshot) = match settings::load_active() {
         Some((_, s)) => (s.window_width, s.window_height, s.anti_screenshot),
-        None => (960.0, 620.0, true),
+        None => {
+            // 3.0.0：无持久化时按主显示器自适应（与前端 adaptiveWindowSize 同一公式）
+            // 注：primary_monitor 在 Tauri 2 是 App 的固有方法，无需 Manager trait
+            let (w, h) = app
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| {
+                    let scale = m.scale_factor();
+                    settings::adaptive_window_size(
+                        m.size().width as f64 / scale,
+                        m.size().height as f64 / scale,
+                    )
+                })
+                .unwrap_or((1024.0, 675.0));
+            (w, h, true)
+        }
     };
     let data_dirs = webview2_data_dir_candidates();
     let attempts: Vec<Option<&std::path::Path>> = if data_dirs.is_empty() {
@@ -560,7 +635,11 @@ fn main() {
                     break 'outer;
                 }
                 Err(e) => {
-                    log::warn!("主窗口创建失败（transparent={}，降级重试）: {}", transparent, e);
+                    log::warn!(
+                        "主窗口创建失败（transparent={}，降级重试）: {}",
+                        transparent,
+                        e
+                    );
                     last_err = Some(e);
                 }
             }
@@ -583,7 +662,8 @@ fn main() {
 
     // 2.8.0：按设置应用防截屏（默认开启）。
     // 2.8.1：仅在实际未生效且用户要求开启时告警（旧判断恰好写反）
-    let applied = apply_anti_screenshot(&app.handle(), anti_screenshot);
+    // 3.0.0（Tauri 2）：handle() 返回 &AppHandle，直接传引用
+    let applied = apply_anti_screenshot(app.handle(), anti_screenshot);
     if anti_screenshot && !applied {
         log::warn!("防截屏保护未生效（系统不支持或窗口句柄异常）");
     }

@@ -1,8 +1,37 @@
+use crate::audit::AuditEntry;
+use crate::VaultError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use crate::audit::AuditEntry;
-use crate::VaultError;
+
+/// 3.0.0（v6）：文件密文的块布局。
+///
+/// - `Legacy`：整段一次 GCM（`nonce(12) || ct || tag(16)`）—— v4/v5 全部文件、
+///   以及 v6 中导入时为空文件（0 字节无分块收益）的条目。
+/// - `Chunked`：按 CHUNK_SIZE_V6（4 MiB）明文分块，每块独立
+///   `nonce(12) || ct || tag(16)`，AAD 为 [`crate::crypto::chunk_aad`]。
+///
+/// 序列化兼容：旧索引（≤2.8.2）没有 `layout` 字段 → `#[serde(default)]` 得到
+/// Legacy，行为与历史版本逐字节一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum ChunkLayout {
+    #[default]
+    Legacy,
+    Chunked {
+        chunk_size: u64,
+        chunk_count: u64,
+    },
+}
+
+impl ChunkLayout {
+    fn legacy() -> Self {
+        ChunkLayout::Legacy
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self, ChunkLayout::Legacy)
+    }
+}
 
 /// 文件元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,14 +50,28 @@ pub struct FileMeta {
     /// 旧索引没有该字段 → `None`，读取时回退到当前 vpath（与历史行为一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aad_tag: Option<String>,
+    /// 3.0.0（v6）：密文块布局（缺省 Legacy，向后兼容旧索引）。
+    #[serde(
+        default = "ChunkLayout::legacy",
+        skip_serializing_if = "ChunkLayout::is_legacy"
+    )]
+    pub layout: ChunkLayout,
 }
 
 /// 索引结构（序列化为 JSON 后加密存储）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Index {
-    pub files: HashMap<String, FileMeta>,     // vpath -> meta
-    pub folders: HashMap<String, bool>,       // vpath -> true
+    pub files: HashMap<String, FileMeta>, // vpath -> meta
+    pub folders: HashMap<String, bool>,   // vpath -> true
     pub audit: Vec<AuditEntry>,
+    /// 3.0.0（胁迫密码）：本分区的胁迫触发标记。
+    ///
+    /// 标记只存在于该分区自己的加密索引内 —— 头部、文件布局与普通分区完全
+    /// 无差异，不持有该分区密码就无法观测。为 true 时：用本分区密码开柜成功
+    /// 后，**其他所有分区**的头部条目被随机覆写（数据永久不可达）。
+    /// 旧索引无此字段 → serde default 得到 false，行为与历史一致。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub duress: bool,
 }
 
 impl Index {
@@ -37,6 +80,7 @@ impl Index {
             files: HashMap::new(),
             folders: HashMap::new(),
             audit: Vec::new(),
+            duress: false,
         }
     }
 
@@ -95,9 +139,7 @@ impl Index {
             }
             if seg == ".." {
                 // 不允许跳出根：越界即拒绝（2.8.2 收紧）
-                if parts.pop().is_none() {
-                    return None;
-                }
+                parts.pop()?;
                 continue;
             }
             if seg.chars().any(|c| (c as u32) < 0x20) {
@@ -134,7 +176,14 @@ impl<'a> IndexManager<'a> {
         Self { vault }
     }
 
-    pub fn add_file(&mut self, vpath: &str, name: &str, size: u64, offset: u64, length: u64) -> Result<(), VaultError> {
+    pub fn add_file(
+        &mut self,
+        vpath: &str,
+        name: &str,
+        size: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), VaultError> {
         let vpath = Index::normalize_vpath(vpath)
             .filter(|p| Index::validate_vpath(p))
             .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
@@ -148,22 +197,35 @@ impl<'a> IndexManager<'a> {
         }
         if index.folders.contains_key(&vpath) {
             return Err(VaultError::Other(format!(
-                "目标路径已存在同名文件夹，无法创建为文件: {}", vpath
+                "目标路径已存在同名文件夹，无法创建为文件: {}",
+                vpath
             )));
         }
-        index.files.insert(vpath.clone(), FileMeta {
-            name: name.into(),
-            size,
-            offset,
-            length,
-            // 约定：调用方加密文件数据时以 vpath 为 AAD（见 read_decrypt_file_data 文档），
-            // 此处把该 vpath 冻结下来，此后重命名不会再影响解密
-            aad_tag: Some(vpath.clone()),
-        });
+        index.files.insert(
+            vpath.clone(),
+            FileMeta {
+                name: name.into(),
+                size,
+                offset,
+                length,
+                // 约定：调用方加密文件数据时以 vpath 为 AAD（见 read_decrypt_file_data 文档），
+                // 此处把该 vpath 冻结下来，此后重命名不会再影响解密
+                aad_tag: Some(vpath.clone()),
+                layout: ChunkLayout::Legacy,
+            },
+        );
         // 自动创建父文件夹
+        // I11（审计修复）：与 import_file_into_index 同一防线 —— 父路径已是
+        // **文件**时为 file/folder 同键碰撞，明确拒绝而非静默制造含混状态
         if let Some(parent) = vpath.rfind('/') {
             if parent > 0 {
                 let parent = &vpath[..parent];
+                if index.files.contains_key(parent) {
+                    return Err(VaultError::Other(format!(
+                        "目标路径已存在同名文件，无法创建为文件夹: {}",
+                        parent
+                    )));
+                }
                 index.folders.insert(parent.into(), true);
             }
         }
@@ -206,7 +268,8 @@ impl<'a> IndexManager<'a> {
         // 2.8.1：交叉命名空间碰撞防护（同 add_file）
         if index.files.contains_key(&vpath) {
             return Err(VaultError::Other(format!(
-                "目标路径已存在同名文件，无法创建为文件夹: {}", vpath
+                "目标路径已存在同名文件，无法创建为文件夹: {}",
+                vpath
             )));
         }
         index.folders.insert(vpath.clone(), true);
@@ -219,7 +282,9 @@ impl<'a> IndexManager<'a> {
         let mut index = self.vault.load_index()?;
         // 删除文件夹及其下所有文件和子文件夹
         let prefix = format!("{}/", vpath);
-        let files_to_remove: Vec<String> = index.files.keys()
+        let files_to_remove: Vec<String> = index
+            .files
+            .keys()
             .filter(|f| f.starts_with(&prefix))
             .cloned()
             .collect();
@@ -230,7 +295,9 @@ impl<'a> IndexManager<'a> {
                 wiped_ranges.push((meta.offset, meta.length));
             }
         }
-        let dirs_to_remove: Vec<String> = index.folders.keys()
+        let dirs_to_remove: Vec<String> = index
+            .folders
+            .keys()
             .filter(|d| d.starts_with(&prefix))
             .cloned()
             .collect();
@@ -270,7 +337,9 @@ impl<'a> IndexManager<'a> {
             return Err(VaultError::Other("新文件名非法".into()));
         }
         let mut index = self.vault.load_index()?;
-        let mut meta = index.files.remove(old_vpath)
+        let mut meta = index
+            .files
+            .remove(old_vpath)
             .ok_or(VaultError::Other("文件不存在".into()))?;
         // AAD 冻结：旧索引（导入早于该修复）没有 aad_tag，而密文是用「重命名前的
         // vpath」做 AAD 加密的 —— 必须在改 key 之前把它固定下来，否则改完 key
@@ -293,11 +362,15 @@ impl<'a> IndexManager<'a> {
             index.files.insert(old_vpath.to_string(), meta);
             return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
         }
-        index.files.insert(new_vpath.clone(), FileMeta {
-            name: new_name.into(),
-            ..meta
-        });
-        self.vault.log_event(&format!("重命名 '{}' -> '{}'", old_vpath, new_vpath));
+        index.files.insert(
+            new_vpath.clone(),
+            FileMeta {
+                name: new_name.into(),
+                ..meta
+            },
+        );
+        self.vault
+            .log_event(&format!("重命名 '{}' -> '{}'", old_vpath, new_vpath));
         self.vault.save_index(index)?;
         Ok(())
     }
@@ -333,7 +406,8 @@ impl<'a> IndexManager<'a> {
         index.files = new_files;
         index.folders = new_folders;
 
-        self.vault.log_event(&format!("重命名文件夹 '{}' -> '{}'", old_vpath, new_vpath));
+        self.vault
+            .log_event(&format!("重命名文件夹 '{}' -> '{}'", old_vpath, new_vpath));
         self.vault.save_index(index)?;
         Ok(())
     }
@@ -343,7 +417,8 @@ impl<'a> IndexManager<'a> {
     pub fn move_file(&mut self, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
         let mut index = self.vault.load_index()?;
         move_file_in_index(&mut index, old_vpath, dest_dir)?;
-        self.vault.log_event(&format!("移动 '{}'（文件）", old_vpath));
+        self.vault
+            .log_event(&format!("移动 '{}'（文件）", old_vpath));
         self.vault.save_index(index)?;
         Ok(())
     }
@@ -353,7 +428,8 @@ impl<'a> IndexManager<'a> {
     pub fn move_folder(&mut self, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
         let mut index = self.vault.load_index()?;
         move_folder_in_index(&mut index, old_vpath, dest_dir)?;
-        self.vault.log_event(&format!("移动文件夹 '{}'（含子树）", old_vpath));
+        self.vault
+            .log_event(&format!("移动文件夹 '{}'（含子树）", old_vpath));
         self.vault.save_index(index)?;
         Ok(())
     }
@@ -409,7 +485,11 @@ impl<'a> IndexManager<'a> {
 }
 
 /// 2.8.1：移动文件的纯索引变换（不做 load/save，单项与批量路径共用）。
-fn move_file_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
+fn move_file_in_index(
+    index: &mut Index,
+    old_vpath: &str,
+    dest_dir: &str,
+) -> Result<(), VaultError> {
     let dest_dir = Index::normalize_vpath(dest_dir)
         .filter(|p| Index::validate_vpath(p))
         .ok_or_else(|| VaultError::Other("目标目录非法".into()))?;
@@ -454,7 +534,8 @@ fn move_file_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Res
     if index.folders.contains_key(&new_vpath) {
         index.files.insert(old_vpath.to_string(), meta);
         return Err(VaultError::Other(format!(
-            "目标路径已存在同名文件夹，无法移动为文件: {}", new_vpath
+            "目标路径已存在同名文件夹，无法移动为文件: {}",
+            new_vpath
         )));
     }
     index.files.insert(new_vpath, meta);
@@ -462,7 +543,11 @@ fn move_file_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Res
 }
 
 /// 2.8.1：移动文件夹的纯索引变换（不做 load/save，单项与批量路径共用）。
-fn move_folder_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> Result<(), VaultError> {
+fn move_folder_in_index(
+    index: &mut Index,
+    old_vpath: &str,
+    dest_dir: &str,
+) -> Result<(), VaultError> {
     let dest_dir = Index::normalize_vpath(dest_dir)
         .filter(|p| Index::validate_vpath(p))
         .ok_or_else(|| VaultError::Other("目标目录非法".into()))?;
@@ -490,7 +575,9 @@ fn move_folder_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> R
     }
     // 不能移入自身 / 自身子目录（否则 key 改写会产生环）
     if new_vpath.starts_with(&format!("{}/", old_vpath)) {
-        return Err(VaultError::Other("不能把文件夹移动到它自身或其子目录内".into()));
+        return Err(VaultError::Other(
+            "不能把文件夹移动到它自身或其子目录内".into(),
+        ));
     }
     if index.folders.contains_key(&new_vpath) || index.files.contains_key(&new_vpath) {
         return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
@@ -510,12 +597,15 @@ fn move_folder_in_index(index: &mut Index, old_vpath: &str, dest_dir: &str) -> R
 /// （folders 记录缺失的遗留索引状态）。HashMap 的 insert 会**静默覆盖**旧元数据
 /// （原文件密文变孤儿、内容丢失），因此用「键数量不变」作为冲突锚点：
 /// 任何一次碰撞都会让 map 变小。
+/// rewrite_folder_keys 的返回：改写后的文件表与文件夹表
+type RewrittenIndexMaps = (HashMap<String, FileMeta>, HashMap<String, bool>);
+
 fn rewrite_folder_keys(
     files: &HashMap<String, FileMeta>,
     folders: &HashMap<String, bool>,
     old_vpath: &str,
     new_vpath: &str,
-) -> Result<(HashMap<String, FileMeta>, HashMap<String, bool>), VaultError> {
+) -> Result<RewrittenIndexMaps, VaultError> {
     let mut new_files = HashMap::new();
     let mut new_folders = HashMap::new();
     let old_prefix = format!("{}/", old_vpath);
@@ -576,23 +666,41 @@ mod tests {
 
     #[test]
     fn test_normalize_vpath() {
-        assert_eq!(Index::normalize_vpath("/foo/bar").as_deref(), Some("/foo/bar"));
-        assert_eq!(Index::normalize_vpath("/foo//bar").as_deref(), Some("/foo/bar"));
-        assert_eq!(Index::normalize_vpath("/foo/./bar").as_deref(), Some("/foo/bar"));
-        assert_eq!(Index::normalize_vpath("/foo/bar/").as_deref(), Some("/foo/bar"));
+        assert_eq!(
+            Index::normalize_vpath("/foo/bar").as_deref(),
+            Some("/foo/bar")
+        );
+        assert_eq!(
+            Index::normalize_vpath("/foo//bar").as_deref(),
+            Some("/foo/bar")
+        );
+        assert_eq!(
+            Index::normalize_vpath("/foo/./bar").as_deref(),
+            Some("/foo/bar")
+        );
+        assert_eq!(
+            Index::normalize_vpath("/foo/bar/").as_deref(),
+            Some("/foo/bar")
+        );
         assert_eq!(Index::normalize_vpath("/").as_deref(), Some("/"));
         assert_eq!(Index::normalize_vpath("///").as_deref(), Some("/"));
         // 2.8.2：越过根的 '..' 拒绝而非静默重定向到根内路径
         assert_eq!(Index::normalize_vpath("/../evil.txt"), None);
         assert_eq!(Index::normalize_vpath("/../.."), None);
         // 段内的 '..' 仍正常折叠
-        assert_eq!(Index::normalize_vpath("/foo/../bar").as_deref(), Some("/bar"));
+        assert_eq!(
+            Index::normalize_vpath("/foo/../bar").as_deref(),
+            Some("/bar")
+        );
     }
 
     // 2.8.2：clean_vpath 组合语义
     #[test]
     fn test_clean_vpath() {
-        assert_eq!(Index::clean_vpath("/foo//bar/").as_deref(), Some("/foo/bar"));
+        assert_eq!(
+            Index::clean_vpath("/foo//bar/").as_deref(),
+            Some("/foo/bar")
+        );
         assert_eq!(Index::clean_vpath("/foo/../.."), None);
         // 归一化补全前导斜杠是历史行为（"plain.txt" → "/plain.txt"，导入路径兼容）
         assert_eq!(Index::clean_vpath("foo").as_deref(), Some("/foo"));
@@ -603,15 +711,26 @@ mod tests {
     fn test_move_file_rejects_folder_collision() {
         let mut idx = Index::new();
         idx.folders.insert("/x/notes".into(), true);
-        idx.files.insert("/notes".into(), FileMeta {
-            name: "notes".into(), size: 1, offset: 0, length: 10, aad_tag: None,
-        });
+        idx.files.insert(
+            "/notes".into(),
+            FileMeta {
+                name: "notes".into(),
+                size: 1,
+                offset: 0,
+                length: 10,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
         // 把文件 /notes 移入 /x：目标 /x/notes 已是文件夹 → 必须拒绝，
         // 且源条目保持原位（回滚）
         let r = super::move_file_in_index(&mut idx, "/notes", "/x");
         assert!(r.is_err(), "移动成已有文件夹的名字必须被拒绝");
         assert!(idx.files.contains_key("/notes"), "拒绝后源文件不得丢失");
-        assert!(!idx.files.contains_key("/x/notes"), "不得产生 file/folder 同键碰撞");
+        assert!(
+            !idx.files.contains_key("/x/notes"),
+            "不得产生 file/folder 同键碰撞"
+        );
     }
 
     // 2.8.2：文件夹改名的子树键冲突检测（键数量锚点）
@@ -619,28 +738,55 @@ mod tests {
     fn test_rename_folder_subtree_collision_is_rejected() {
         // 构造「folders 缺少 /b 记录」的遗留形态索引：/b/c.txt 存在但没有 /b 文件夹
         let mut idx = Index::new();
-        idx.files.insert("/b/c.txt".into(), FileMeta {
-            name: "c.txt".into(), size: 1, offset: 0, length: 10, aad_tag: None,
-        });
+        idx.files.insert(
+            "/b/c.txt".into(),
+            FileMeta {
+                name: "c.txt".into(),
+                size: 1,
+                offset: 0,
+                length: 10,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
         idx.folders.insert("/a".into(), true);
-        idx.files.insert("/a/d.txt".into(), FileMeta {
-            name: "d.txt".into(), size: 1, offset: 5, length: 10, aad_tag: None,
-        });
+        idx.files.insert(
+            "/a/d.txt".into(),
+            FileMeta {
+                name: "d.txt".into(),
+                size: 1,
+                offset: 5,
+                length: 10,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
         idx.folders.insert("/a/sub".into(), true);
         // /a 改名为 /b：/a/d.txt → /b/d.txt 不冲突，但 /a/sub → /b/sub 与
         // 隐含的 /b 子树无冲突，而 /b/c.txt 保持 —— 顶层 /b 未被 folders 记录，
         // 旧实现顶层检查放行；子树改写键数不变则允许（无碰撞）
         // 这里验证的是「有碰撞时拒绝」：让 /a 下有 /a/c.txt 与既有 /b/c.txt 相撞
-        idx.files.insert("/a/c.txt".into(), FileMeta {
-            name: "c.txt".into(), size: 2, offset: 99, length: 10, aad_tag: None,
-        });
+        idx.files.insert(
+            "/a/c.txt".into(),
+            FileMeta {
+                name: "c.txt".into(),
+                size: 2,
+                offset: 99,
+                length: 10,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
         // 改名 /a → /b：/a/c.txt → /b/c.txt 与既有 /b/c.txt 相撞 → 必须拒绝
         let r = super::rewrite_folder_keys(&idx.files, &idx.folders, "/a", "/b");
         assert!(r.is_err(), "子树键碰撞必须被拒绝（否则静默覆盖丢数据）");
-        assert_eq!(idx.files.get("/b/c.txt").unwrap().offset, 0, "既有 /b/c.txt 不得被覆盖");
+        assert_eq!(
+            idx.files.get("/b/c.txt").unwrap().offset,
+            0,
+            "既有 /b/c.txt 不得被覆盖"
+        );
         assert!(idx.files.contains_key("/a/c.txt"), "源子树保持原状");
         // 无碰撞的改名照常通过
         assert!(super::rewrite_folder_keys(&idx.files, &idx.folders, "/a", "/c").is_ok());
     }
-
 }

@@ -9,7 +9,9 @@
 }
 
 /* ───────────────── 2.8.0：主题系统 ─────────────────
-   蓝色渐变（历史配色）为默认；紫 / 金 / 青为同款透明渐变模子的新主题。
+   蓝色渐变（历史配色）为默认；紫 / 金 / 青为同款透明渐变模子的新主题；
+   vivid 取自 3.0.0 新版图标配色 —— accent 走图标的绿→青→蓝色带
+   （#7cb456 → #037dd7），背景浅蓝/浅青/浅橙，选中高亮用蓝+橙对比色对。
    切换即改 body 的 theme-* class（app.js applyTheme），由设置界面持久化。 */
 body.theme-blue {
     --grad-a: #d9f4f1;
@@ -66,6 +68,20 @@ body.theme-cyan {
     --sd-hover-2: #e4f4fd;
     --accent-start: #0aa2a8;
     --accent-end: #1899c2;
+}
+body.theme-vivid {
+    --grad-a: #e3f2fd;
+    --grad-b: #dff7fa;
+    --grad-c: #fdefe2;
+    --tint-hover: rgba(14, 171, 206, 0.13);
+    --tint-sel-1: rgba(3, 125, 215, 0.18);
+    --tint-sel-2: rgba(250, 112, 4, 0.16);
+    --ctx-hover-1: #e3f1fd;
+    --ctx-hover-2: #def6fb;
+    --sd-hover-1: #e3f1fd;
+    --sd-hover-2: #def6fb;
+    --accent-start: #7cb456;
+    --accent-end: #037dd7;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -215,7 +231,7 @@ button.danger:hover:not(:disabled) { background: #fff0f3; color: #ad2945; }
 #file-list.drag-over { outline: 3px dashed rgba(16, 151, 166, 0.65); outline-offset: -9px; background: rgba(221, 250, 245, 0.84); }
 #status-bar { flex-shrink: 0; padding: 6px 14px 8px; color: #60768a; font-size: 12px; }
 
-#overlay { position: fixed; inset: 0; z-index: 100; background: rgba(19, 38, 61, 0.3); backdrop-filter: blur(3px); }
+#overlay { position: fixed; inset: 8px; z-index: 100; border-radius: 16px; background: rgba(19, 38, 61, 0.3); backdrop-filter: blur(3px); }
 #overlay.hidden { display: none; }
 #overlay.startup-modal { z-index: 300; background: rgba(19, 35, 56, 0.52); pointer-events: auto; }
 body.has-modal #toolbar,
@@ -426,6 +442,7 @@ body.has-modal #status-bar { filter: grayscale(0.55) brightness(0.76); pointer-e
 .swatch-purple { background: linear-gradient(135deg, #f3e8fb, #efe9ff 48%, #fdeaf6); }
 .swatch-gold { background: linear-gradient(135deg, #fbf3e2, #fdf6e8 48%, #fbeee0); }
 .swatch-cyan { background: linear-gradient(135deg, #e0f7f5, #e4f6fd 48%, #e8fbee); }
+.swatch-vivid { background: linear-gradient(135deg, #e3f2fd, #dff7fa 48%, #fdefe2); }
 .persist-btn {
     display: block;
     width: 100%;

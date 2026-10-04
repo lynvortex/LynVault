@@ -1,0 +1,7 @@
+# 钉死工具链版本：本地开发与 CI（.github/workflows/ci.yml）使用同一版本，
+# 保证构建可复现。升级 Rust 时同步修改两处。
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+# 门禁所需组件随工具链一起钉死，本地与 CI 一致
+components = ["rustfmt", "clippy"]

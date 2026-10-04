@@ -1,0 +1,39 @@
+# LynVault Fuzz 冒烟（3.0.0 优化4）
+#
+# 每周定时 + 手动触发：nightly + cargo-fuzz，每靶 60 秒。
+# 发现崩溃时把 fuzz/artifacts 目录（含崩溃输入）作为 artifact 上传。
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [office_parse, header_probe, index_json]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            fuzz
+      - name: Fuzz (${{ matrix.target }}, 60s smoke)
+        working-directory: fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2560
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

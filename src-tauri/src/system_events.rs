@@ -71,7 +71,7 @@ fn trigger_lock() {
         guard.clone()
     };
     if let Some(app) = app {
-        if app.get_window("main").is_none() {
+        if app.get_webview_window("main").is_none() {
             LOCK_IN_FLIGHT.store(false, Ordering::SeqCst);
             return; // 应用已退出中
         }
@@ -200,7 +200,10 @@ fn event_loop() {
         }
         rebuilds += 1;
         if rebuilds > 60 {
-            log::error!("系统事件窗口反复异常退出（{} 次），放弃本会话重建", rebuilds);
+            log::error!(
+                "系统事件窗口反复异常退出（{} 次），放弃本会话重建",
+                rebuilds
+            );
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));

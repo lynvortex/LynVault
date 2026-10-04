@@ -1,4 +1,4 @@
-// LynVault 2.8.2 - Tauri Frontend
+// LynVault 3.0.0 - Tauri 2 Frontend
 // 等 Tauri 注入完毕再执行
 let invoke, tauriOpen, tauriSave, tauriMessage, tauriAsk;
 
@@ -11,6 +11,21 @@ function initTauri() {
     console.log('[LynVault] __TAURI__:', hasTauri, tauriKeys);
     console.log('[LynVault] __TAURI_INTERNALS__:', hasInternals, internalsKeys);
 
+    // 3.0.0（Tauri 2）：v2 的全局注入为 __TAURI__.core.invoke（v1 是 __TAURI__.tauri.invoke）；
+    // dialog 插件全局仍在 __TAURI__.dialog（open/save/message/ask 同名）
+    try {
+        if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+            invoke = window.__TAURI__.core.invoke;
+            tauriOpen = window.__TAURI__.dialog.open;
+            tauriSave = window.__TAURI__.dialog.save;
+            tauriMessage = window.__TAURI__.dialog.message;
+            tauriAsk = window.__TAURI__.dialog.ask;
+            console.log('[LynVault] API via __TAURI__ (v2 core)');
+            return true;
+        }
+    } catch (e) { console.warn('__TAURI__ failed:', e); }
+
+    // 兼容保留：v1 注入形态（理论上 Tauri 2 后不再出现，防降级环境）
     try {
         if (window.__TAURI__ && window.__TAURI__.tauri && window.__TAURI__.tauri.invoke) {
             invoke = window.__TAURI__.tauri.invoke;
@@ -18,7 +33,7 @@ function initTauri() {
             tauriSave = window.__TAURI__.dialog.save;
             tauriMessage = window.__TAURI__.dialog.message;
             tauriAsk = window.__TAURI__.dialog.ask;
-            console.log('[LynVault] API via __TAURI__');
+            console.log('[LynVault] API via __TAURI__ (v1 tauri)');
             return true;
         }
     } catch (e) { console.warn('__TAURI__ failed:', e); }
@@ -26,10 +41,11 @@ function initTauri() {
     try {
         if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
             invoke = window.__TAURI_INTERNALS__.invoke;
-            tauriOpen = (opts) => invoke('plugin:dialog|open', opts || {});
-            tauriSave = (opts) => invoke('plugin:dialog|save', opts || {});
-            tauriMessage = (msg, opts) => invoke('plugin:dialog|message', { message: msg, ...(opts || {}) });
-            tauriAsk = (msg, opts) => invoke('plugin:dialog|ask', { message: msg, ...(opts || {}) });
+            // 3.0.0（Tauri 2）：插件命令的参数包在 options 字段内
+            tauriOpen = (opts) => invoke('plugin:dialog|open', { options: opts || {} });
+            tauriSave = (opts) => invoke('plugin:dialog|save', { options: opts || {} });
+            tauriMessage = (msg, opts) => invoke('plugin:dialog|message', { options: { message: msg, ...(opts || {}) } });
+            tauriAsk = (msg, opts) => invoke('plugin:dialog|ask', { options: { message: msg, ...(opts || {}) } });
             console.log('[LynVault] API via __TAURI_INTERNALS__');
             return true;
         }
@@ -47,8 +63,24 @@ function initTauri() {
 }
 
 // ───────────────── 状态 ─────────────────
+const IDLE_DEFAULT_MINUTES = 2;
+let _idleTimer = null;
+let _lastActivity = 0;
+let _searchDebounce = null;
+let _searchSeq = 0; // 2.8.1：慢查询晚到不得覆盖新结果
+let _startupProcessing = false;
+const VAULT_FILTERS = [
+    { name: 'LynVault', extensions: ['lyt'] },
+    { name: 'LynVault (旧版)', extensions: ['vault'] },
+];
+const VAULT_OPEN_FILTERS = [
+    { name: 'LynVault 保险柜', extensions: ['lyt', 'vault'] },
+];
+
 const state = {
     vaultOpen: false,
+    // 3.0.0：当前保险柜文件路径（硬件密钥挑战需要 —— 挑战由公开盐派生）
+    vaultPath: null,
     currentFolder: '/',
     selectedItems: [],
     searchMode: false, // 2.8.0：当前列表为搜索结果（清空搜索或导航后恢复目录视图）
@@ -56,7 +88,9 @@ const state = {
 
 // ───────────────── 2.8.0：设置（持久化） ─────────────────
 let settingsEnabled = false;
-let appSettings = { theme: 'blue', autolock_minutes: 2, window_width: 960, window_height: 620, anti_screenshot: true };
+// 3.0.0：默认主题 = vivid（图标配色）；未启用持久化 / 关闭持久化时还原到这份默认
+const DEFAULT_SETTINGS = { theme: 'vivid', autolock_minutes: 2, window_width: 1024, window_height: 675, anti_screenshot: true };
+let appSettings = { ...DEFAULT_SETTINGS };
 
 async function loadSettings() {
     try {
@@ -69,10 +103,10 @@ async function loadSettings() {
     }
 }
 
-const KNOWN_THEMES = ['blue', 'purple', 'gold', 'cyan'];
+const KNOWN_THEMES = ['blue', 'purple', 'gold', 'cyan', 'vivid'];
 function applyTheme(name) {
     document.body.classList.remove(...KNOWN_THEMES.map(t => 'theme-' + t));
-    const theme = KNOWN_THEMES.includes(name) ? name : 'blue';
+    const theme = KNOWN_THEMES.includes(name) ? name : DEFAULT_SETTINGS.theme;
     document.body.classList.add('theme-' + theme);
 }
 
@@ -80,11 +114,25 @@ function applyWindowSize(w, h) {
     try {
         const tw = window.__TAURI__ && window.__TAURI__.window;
         if (!tw) return;
-        const appWin = tw.getCurrent();
+        const appWin = (tw.getCurrentWindow || tw.getCurrent).call(tw);
         if (tw.LogicalSize) appWin.setSize(new tw.LogicalSize(w, h));
         else appWin.setSize({ width: w, height: h });
         appWin.center();
     } catch (e) { console.warn('[LynVault] 应用窗口尺寸失败:', e); }
+}
+
+// 3.0.0：默认窗口尺寸的自适应公式（主显示器逻辑像素：宽 ≤ 60% 屏宽且 ≤1024，
+// 高 ≤ 80% 屏高，高度受限时按 3:2 反推宽度）—— 启动未持久化 / 还原默认 /
+// 关闭持久化 / 后端 enable_persistence 与启动兜底共用同一语义
+function adaptiveWindowSize() {
+    const sw = window.screen.width;
+    const sh = window.screen.height;
+    let width = Math.floor(Math.min(sw * 0.6, 1024));
+    let height = Math.floor(Math.min(width * 0.66, sh * 0.8));
+    if (height < Math.floor(width * 0.66)) {
+        width = Math.floor(height * 1.5); // 高度受限时按 3:2 反推宽度
+    }
+    return { width, height };
 }
 
 // ───────────────── DOM ─────────────────
@@ -97,7 +145,7 @@ function toggleUI(open) {
     // 2.8.0：修改密码 / 操作记录 / 完整性体检 同为开柜后可用
     const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
         'btn-import-folder', 'btn-newfolder', 'btn-extract-all', 'btn-defrag', 'btn-destroy',
-        'btn-change-pwd', 'btn-audit', 'btn-verify'];
+        'btn-change-pwd', 'btn-audit', 'btn-verify', 'btn-duress', 'btn-yk'];
     ids.forEach(id => { const el = $(id); if (el) el.disabled = !open; });
     $('btn-create').disabled = open;
     $('btn-open').disabled = open;
@@ -289,26 +337,35 @@ function showDialog(title, bodyHtml, buttons, wide) {
         btn.textContent = b.text;
         if (b.cls) btn.className = b.cls;
         btn.onclick = () => {
-            // Q6 修复：异步 action 期间禁用所有按钮，防止重复点击
+            // Q6 修复：异步 action 期间禁用所有按钮，防止重复点击。
+            // 3.0.0（实测修复）：按钮快照必须在 action() **之前**获取 ——
+            // action 内部打开子对话框（showInput/showDialog 重写同一 #dialog
+            // 的按钮区）时，action() 返回 Promise 后再查询 DOM 会捕获到
+            // **子对话框的新按钮**并把它们全部禁用 → 确认/取消点不动（死锁）。
+            // 快照前置后，禁用的永远是本对话框自己的按钮实例。
+            const ownButtons = [...btnContainer.querySelectorAll('button')];
             if (b.action) {
                 // N3 修复：如果 action 返回 false 或 Promise<false>，则不关闭对话框
                 // 用于密码错误后保留密码框让用户重试
                 const ret = b.action();
                 if (ret && typeof ret.then === 'function') {
-                    // 异步执行期间禁用按钮
-                    const allBtns = btnContainer.querySelectorAll('button');
-                    allBtns.forEach(x => x.disabled = true);
+                    // 异步执行期间禁用本对话框按钮
+                    ownButtons.forEach(x => x.disabled = true);
                     ret.then(shouldClose => {
                         if (shouldClose === false) {
                             // 重试：重新启用按钮
-                            allBtns.forEach(x => x.disabled = false);
+                            ownButtons.forEach(x => x.disabled = false);
                         } else {
                             _activeCancelHandler = null;
-                            hideDialog();
+                            // action 内部开过子对话框时，本按钮已脱离 DOM ——
+                            // 此刻显示的是别的对话框，不得误关
+                            if (ownButtons.length === 0 || ownButtons[0].isConnected) {
+                                hideDialog();
+                            }
                         }
                     }).catch(() => {
                         // 异常：重新启用按钮让用户重试
-                        allBtns.forEach(x => x.disabled = false);
+                        ownButtons.forEach(x => x.disabled = false);
                     });
                 } else if (ret !== false) {
                     _activeCancelHandler = null;
@@ -708,7 +765,8 @@ function setBusy(on) {
     _busyCount += on ? 1 : -1;
     if (_busyCount < 0) _busyCount = 0;
     const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
-        'btn-import-folder', 'btn-newfolder', 'btn-extract-all', 'btn-defrag', 'btn-destroy'];
+        'btn-import-folder', 'btn-newfolder', 'btn-extract-all', 'btn-defrag', 'btn-destroy',
+        'btn-duress', 'btn-yk'];
     ids.forEach(id => { const el = $(id); if (el) el.disabled = on || !state.vaultOpen; });
 }
 
@@ -780,11 +838,19 @@ async function navigateTo(vpath) {
 }
 
 async function createVault() {
-    const filePath = await tauriSave({
-        title: '选择保险柜保存位置',
-        filters: VAULT_FILTERS,
-    });
-    if (!filePath) return;
+    // 3.0.0（H-1 审计修复）：保存对话框改由后端弹出并签发一次性令牌 ——
+    // 覆盖分支（目标已存在）在 create_vault 命令侧强制核对令牌，
+    // 被攻陷的 WebView 无法再绕过用户确认直接清零任意可写文件。
+    let picked;
+    try {
+        picked = data_of(await invoke('dialog_pick_save'));
+    } catch (e) {
+        showError(String(e));
+        return;
+    }
+    if (!picked || !picked.paths || picked.paths.length === 0) return;
+    const filePath = picked.paths[0];
+    const saveToken = picked.token;
     showInput('创建保险柜', '输入主密码：', '', async (pwd) => {
         if (!pwd) {
             // 2.7.1 修复：空密码点确定不再静默关闭对话框 —— 内联提示并保留
@@ -793,7 +859,7 @@ async function createVault() {
             return false;
         }
         try {
-            await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null });
+            await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null, token: saveToken });
             toggleUI(true);
             await listFolder('/');
             setStatus('保险柜已创建');
@@ -818,7 +884,7 @@ async function openVault() {
             return false;
         }
         try {
-            await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
+            await invokeOpenVault(filePath, pwd);
             toggleUI(true);
             await listFolder('/');
             setStatus('保险柜已打开');
@@ -1036,6 +1102,42 @@ async function promptEncryptedOffice(vpath, fileName) {
     }
 }
 
+// ───────────────── 3.0.0（优化2）：媒体流式预览 ─────────────────
+// URL 安全 base64（vpath 可能含中文 —— 先转 UTF-8 字节再编码）
+function _b64url(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// 自定义协议 URL：Windows 走 http://<scheme>.localhost，其他平台走 <scheme>://
+function _mediaUrl(token, vpathB64) {
+    const payload = token + '/' + vpathB64;
+    const isWin = navigator.userAgent.includes('Windows');
+    return isWin
+        ? 'http://lynvault-media.localhost/' + payload
+        : 'lynvault-media://localhost/' + payload;
+}
+
+async function previewMedia(vpath, fileName, ext) {
+    let token;
+    try {
+        token = await invoke('mint_media_token', { vpath });
+    } catch (e) {
+        showError(String(e));
+        return;
+    }
+    const url = _mediaUrl(token, _b64url(vpath));
+    const isAudio = ['mp3', 'ogg', 'oga', 'opus', 'wav', 'flac', 'm4a', 'aac'].includes(ext);
+    const media = isAudio
+        ? `<audio controls autoplay style="width:100%" src="${escapeAttr(url)}"></audio>`
+        : `<video controls style="width:100%;max-height:70vh" src="${escapeAttr(url)}"></video>`;
+    const html = '<div style="text-align:center">' + media +
+        '<p class="audit-note">流式预览：内容按需解密播放，全程不落盘、不完整加载（拖动进度条仅解密所需片段）</p></div>';
+    showDialog('🎬 ' + fileName, html, [{ text: '关闭', cls: 'btn-ok' }], true);
+}
+
 let _viewBusy = false; // 2.8.2：文件双击防抖 —— 快速双击触发两次全量 base64 传输
 async function viewFile(vpath, fileName) {
     if (_viewBusy) return;
@@ -1052,8 +1154,17 @@ async function viewFileInner(vpath, fileName) {
     const imgExts = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'tif'];
     const textExts = ['txt', 'md', 'py', 'log', 'json', 'csv', 'xml', 'ini', 'cfg', 'yaml', 'yml', 'rs', 'js', 'go', 'toml', 'html', 'css', 'sh', 'bat', 'ps1'];
     const officeExts = ['docx', 'doc', 'xlsx', 'xls'];
+    // 3.0.0（优化2）：流式预览的音视频白名单（与后端 media_mime 一致）
+    const mediaExts = ['mp4', 'm4v', 'webm', 'mkv', 'mov', 'mp3', 'ogg', 'oga', 'opus', 'wav', 'flac', 'm4a', 'aac'];
 
     try {
+        // 3.0.0（优化2）：音视频流式预览 —— 自定义协议 + Range 请求，
+        // 按需分块解密，明文仅存在于播放器内存（no-store 禁止磁盘缓存）
+        if (mediaExts.includes(ext)) {
+            await previewMedia(vpath, fileName, ext);
+            return;
+        }
+
         if (officeExts.includes(ext)) {
             let text;
             try {
@@ -1282,428 +1393,56 @@ async function removePartition() {
     }
 }
 
-async function destroyVault() {
-    const ok = await tauriAsk('此操作将不可逆地销毁当前保险柜及其所有数据！\n\n确定继续？', { title: '销毁保险箱', type: 'warning' });
-    if (!ok) return;
-    const ok2 = await tauriAsk('再次确认：销毁整个保险柜？', { title: '最终确认', type: 'error' });
-    if (!ok2) return;
-    try {
-        await invoke('destroy_vault');
-        toggleUI(false);
-        setStatus('保险柜已销毁');
-    } catch (e) {
-        showError(String(e));
-    }
-}
-
-// ───────────────── 2.8.0：文件名搜索 ─────────────────
-let _searchDebounce = null;
-let _searchSeq = 0; // 2.8.1：慢查询晚到不得覆盖新结果
-
-function bindSearch() {
-    const input = $('search-input');
-    if (!input) return;
-    input.addEventListener('input', () => {
-        clearTimeout(_searchDebounce);
-        _searchDebounce = setTimeout(runSearch, 300);
-    });
-    input.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-            input.value = '';
-            runSearch();
-        } else if (e.key === 'Enter') {
-            clearTimeout(_searchDebounce);
-            runSearch();
-        }
-    });
-}
-
-async function runSearch() {
-    const q = $('search-input').value.trim();
-    if (!q) {
-        if (state.searchMode) {
-            state.searchMode = false;
-            await listFolder(state.currentFolder);
-        }
-        return;
-    }
-    if (!state.vaultOpen) return;
-    const seq = ++_searchSeq;
-    try {
-        const hits = await invoke('search_files', { query: q, limit: 200 });
-        if (seq !== _searchSeq) return; // 已有更新的查询发出，丢弃过期结果
-        state.searchMode = true;
-        renderSearchResults(hits);
-    } catch (e) {
-        if (seq === _searchSeq) showError(String(e));
-    }
-}
-
-function renderSearchResults(hits) {
-    const list = $('file-list');
+function renderStartupList(items) {
+    const list = $('startup-list');
     list.innerHTML = '';
-    state.selectedItems = [];
-    if (!hits || !hits.length) {
-        list.innerHTML = '<div class="empty-hint"><span>无匹配结果</span></div>';
-        setStatus('搜索：无匹配结果');
+    if (!items || items.length === 0) {
+        list.innerHTML = '<div class="sd-empty">当前目录下未发现保险柜文件<br>请选择「新建保险柜」或「打开其他保险柜」</div>';
         return;
     }
-    // 2.8.1：与 renderList 相同的 fragment + 委托模式（交互由 bindListDelegation 统一处理）
-    const frag = document.createDocumentFragment();
-    for (const f of hits) {
-        const isFolder = !!f.is_dir;
+    for (const it of items) {
         const div = document.createElement('div');
-        div.className = 'file-item';
-        div.dataset.vpath = f.vpath;
-        div.dataset.type = isFolder ? 'folder' : 'file';
-        div.dataset.name = f.name;
-        const fallbackEmoji = isFolder ? '📁' : getIcon(f.name, false);
-        // 搜索结果两行展示：名称 + 完整 vpath
-        div.innerHTML = `<span class="fi-icon"></span>` +
-            `<span class="fi-main"><span class="fi-name">${escapeHtml(f.name)}</span><span class="fi-path">${escapeHtml(f.vpath)}</span></span>` +
-            `<span class="fi-size">${isFolder ? '-' : formatSize(f.size)}</span>`;
-        const iconSpan = div.querySelector('.fi-icon');
-        if (isFolder) iconSpan.textContent = fallbackEmoji;
-        else applySysIcon(iconSpan, f.name, fallbackEmoji);
-        frag.appendChild(div);
-    }
-    list.appendChild(frag);
-    setStatus(`搜索：${hits.length} 个匹配（双击进入目录 / 打开文件）`);
-}
-
-// ───────────────── 2.8.0：移动到其他文件夹 ─────────────────
-async function moveSelected() {
-    if (!state.selectedItems.length) return;
-    const count = state.selectedItems.length;
-    let folders = [];
-    try {
-        folders = await invoke('list_all_folders');
-    } catch (e) {
-        showError(String(e));
-        return;
-    }
-    const options = ['<option value="/">/（根目录）</option>']
-        .concat((folders || []).map(f => `<option value="${escapeAttr(f)}">${escapeHtml(f)}</option>`))
-        .join('');
-    showDialog('移动到…',
-        `<label>目标文件夹（${count} 项）：</label><select id="dlg-move-select">${options}</select>` +
-        `<div id="dlg-move-preview" style="color:#657589;font-size:12px;margin-top:2px;"></div>`,
-        [
-            { text: '移动', cls: 'btn-ok', action: async () => {
-                const dest = $('dlg-move-select').value;
-                const vpaths = state.selectedItems.map(i => i.vpath);
-                try {
-                    const raw = await invoke('move_items', { vpaths, destFolder: dest });
-                    const res = data_of(raw);
-                    await listFolder(state.currentFolder);
-                    setStatus(res.fail > 0
-                        ? `移动完成: 成功 ${res.ok} 个，失败 ${res.fail} 个`
-                        : `已移动 ${res.ok} 个项目 → ${dest}`);
-                    if (res.fail > 0 && res.errors && res.errors.length) showError(res.errors.join('\n'));
-                    return true;
-                } catch (e) {
-                    showError(String(e));
-                    return false;
-                }
-            }},
-            { text: '取消', cls: 'btn-cancel' },
-        ]
-    );
-    const sel = $('dlg-move-select');
-    const preview = $('dlg-move-preview');
-    const updatePreview = () => {
-        const dest = sel.value;
-        const names = state.selectedItems.map(i => dest === '/' ? '/' + i.name : dest + '/' + i.name);
-        preview.textContent = '→ ' + names.join('，');
-    };
-    sel.onchange = updatePreview;
-    updatePreview();
-}
-
-// ───────────────── 2.8.0：操作记录（审计日志查看器） ─────────────────
-async function showAuditLog() {
-    try {
-        const raw = await invoke('get_audit_log', { limit: 500 });
-        const entries = data_of(raw);
-        let body;
-        if (!entries || !entries.length) {
-            body = '<p class="audit-note">暂无记录</p>';
-        } else {
-            const rows = entries.map(e => {
-                const d = new Date((e.ts || 0) * 1000);
-                return `<div class="audit-row"><span class="audit-ts">${escapeHtml(d.toLocaleString('zh-CN'))}</span><span class="audit-event">${escapeHtml(e.event)}</span></div>`;
-            }).join('');
-            body = `<div class="audit-list">${rows}</div>`;
-        }
-        showDialog('操作记录（最近 500 条，最新在前）',
-            body + '<p class="audit-note">记录由链式 HMAC 保护：任何篡改都会被检测并截断。</p>',
-            [{ text: '关闭', cls: 'btn-ok' }], true);
-    } catch (e) {
-        showError(String(e));
+        div.className = 'sd-item';
+        const d = new Date((it.mtime || 0) * 1000);
+        const ts = d.toLocaleString('zh-CN');
+        const sizeStr = formatSize(it.size || 0);
+        // 转义防止 XSS
+        const safeName = escapeHtml(it.name);
+        const safePath = escapeAttr(it.path);
+        div.innerHTML = `<span class="sd-icon">🔒</span>` +
+            `<div class="sd-info">` +
+            `<div class="sd-name" title="${safePath}">${safeName}</div>` +
+            `<div class="sd-meta">${ts} · ${sizeStr}</div>` +
+            `</div>`;
+        div.onclick = () => {
+            // N10 修复：防重入，处理中时忽略后续点击
+            if (_startupProcessing) return;
+            _startupProcessing = true;
+            openVaultFromStartup(it.path);
+        };
+        list.appendChild(div);
     }
 }
 
-// ───────────────── 2.8.0：全库完整性体检 ─────────────────
-async function verifyIntegrity() {
-    showDialog('完整性体检',
-        '<div class="verify-box"><div id="verify-status">正在逐文件校验认证标签…（大保险柜需要一些时间）</div>' +
-        '<div class="progress-track"><div id="verify-bar" class="progress-fill" style="width:0%"></div></div></div>' +
-        '<p class="audit-note">体检为只读操作，期间其他保险柜操作将排队等待扫描完成。</p>',
-        [{ text: '关闭', cls: 'btn-cancel', action: () => true }]);
-    try {
-        const raw = await invoke('verify_vault_integrity');
-        const res = data_of(raw);
-        const box = document.querySelector('#dialog-body .verify-box');
-        if (!box) return; // 对话框已被用户关闭
-        if (!res.broken || !res.broken.length) {
-            box.innerHTML = `<div class="verify-ok">✓ 全部 ${res.total} 个文件校验通过，未发现损坏</div>`;
-        } else {
-            const rows = res.broken.map(b =>
-                `<div class="audit-row"><span class="audit-event">${escapeHtml(b.vpath)}</span><span class="audit-ts">${escapeHtml(b.reason)}</span></div>`
-            ).join('');
-            box.innerHTML = `<div class="verify-bad">✗ 发现 ${res.broken.length} / ${res.total} 个文件异常：</div><div class="audit-list">${rows}</div>` +
-                '<p class="audit-note">异常文件可能已损坏（位腐 / 云同步冲突），建议从外部备份重新导入。请勿删除保险柜文件。</p>';
-        }
-    } catch (e) {
-        const box = document.querySelector('#dialog-body .verify-box');
-        if (box) box.innerHTML = `<div class="verify-bad">体检失败：${escapeHtml(String(e))}</div>`;
-    }
+function hideStartupModal() {
+    document.body.classList.remove('has-modal');
+    $('overlay').classList.remove('startup-modal');
+    $('overlay').classList.add('hidden');
+    $('startup-dialog').classList.add('hidden');
+    // 恢复 overlay 的正常行为
+    $('overlay').onclick = hideDialog;
 }
 
-// ───────────────── 2.8.0：修改保险柜密码 ─────────────────
-async function changePassword() {
-    showDialog('修改保险柜密码',
-        `<label>当前密码：</label><input type="password" id="cp-current">` +
-        `<label>新密码（至少 12 位）：</label><input type="password" id="cp-new">` +
-        `<label>确认新密码：</label><input type="password" id="cp-new2">` +
-        `<div id="cp-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>` +
-        `<p class="audit-note">新格式（v5）保险柜仅重写头部，瞬间完成；旧格式（v4）保险柜将自动升级并全库重加密（需要一些时间）。升级后旧版本 LynVault 将无法打开该保险柜。</p>`,
-        [
-            { text: '修改', cls: 'btn-ok', action: async () => {
-                const cur = $('cp-current').value;
-                const np = $('cp-new').value;
-                const np2 = $('cp-new2').value;
-                const err = $('cp-error');
-                if (!cur || !np) { err.textContent = '请填写完整'; return false; }
-                if (np !== np2) { err.textContent = '两次输入的新密码不一致'; return false; }
-                if ([...np].length < 12) { err.textContent = '新密码长度至少 12 位（按字符计）'; return false; }
-                try {
-                    setStatus('正在修改密码…（v4 老保险柜会自动升级并重加密，可能耗时较长）');
-                    await invoke('change_password', { currentPassword: cur, newPassword: np, keyFilePath: null });
-                    setStatus('密码修改成功');
-                    return true;
-                } catch (e) {
-                    err.textContent = String(e);
-                    return false;
-                }
-            }},
-            { text: '取消', cls: 'btn-cancel' },
-        ]
-    );
-    setTimeout(() => { const el = $('cp-current'); if (el) el.focus(); }, 50);
+function showStartupModal() {
+    document.body.classList.add('has-modal');
+    $('overlay').classList.add('startup-modal');
+    $('overlay').classList.remove('hidden');
+    $('startup-dialog').classList.remove('hidden');
+    // N9 修复：启动弹窗显示时，遮罩不绑定 hideDialog（保持不可关闭）
+    $('overlay').onclick = null;
+    _startupProcessing = false;
 }
 
-// ───────────────── 2.8.0：设置（持久化 + 主题 / 自动锁定 / 窗口尺寸） ─────────────────
-async function openSettings() {
-    let data;
-    try {
-        data = await invoke('get_settings');
-    } catch (e) {
-        showError(String(e));
-        return;
-    }
-    if (!data.enabled) {
-        // 未启用持久化：按设计只显示「启动持久化」入口
-        showDialog('设置',
-            '<div class="settings-persist-hint">当前未启用设置持久化 —— 主题、窗口尺寸、自动锁定时长不会保存。<br>启用后配置写入你选择的位置（U 盘便携 / 固定安装二选一）。</div>' +
-            '<button id="btn-enable-persist" class="persist-btn">启动持久化</button>',
-            [{ text: '关闭', cls: 'btn-cancel' }]
-        );
-        $('btn-enable-persist').onclick = () => showEnablePersistence();
-        return;
-    }
-    const s = data.settings;
-    const themeSwatches = KNOWN_THEMES.map(t =>
-        `<label class="theme-swatch" title="${t}"><input type="radio" name="cfg-theme" value="${t}" ${s.theme === t ? 'checked' : ''}><span class="swatch swatch-${t}"></span></label>`
-    ).join('');
-    showDialog('设置',
-        `<div class="settings-path">配置文件：${escapeHtml(data.path)}</div>` +
-        `<div class="settings-row"><label>主题：</label><div class="theme-swatches">${themeSwatches}</div></div>` +
-        `<div class="settings-row"><label>自动锁定（分钟，0=禁用）：</label><input type="text" id="cfg-autolock" value="${escapeAttr(String(s.autolock_minutes))}"></div>` +
-        `<div class="settings-row"><label>窗口尺寸：</label><span class="win-size"><input type="text" id="cfg-w" value="${escapeAttr(String(Math.round(s.window_width)))}"> × <input type="text" id="cfg-h" value="${escapeAttr(String(Math.round(s.window_height)))}"></span></div>` +
-        `<div class="settings-row"><label>防截屏保护：</label><input type="checkbox" id="cfg-anti" ${s.anti_screenshot ? 'checked' : ''}></div>` +
-        `<div id="cfg-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>` +
-        '<p class="audit-note">防截屏：开启后本窗口不会出现在截屏 / 录屏 / 远程共享画面中（Win10 2004+ 完全隐藏，旧系统显示为黑块；无法阻止物理拍摄）。</p>',
-        [
-            { text: '保存', cls: 'btn-ok', action: async () => {
-                const err = $('cfg-error');
-                const w = parseFloat($('cfg-w').value);
-                const h = parseFloat($('cfg-h').value);
-                const mins = parseInt($('cfg-autolock').value, 10);
-                if (!Number.isFinite(w) || w < 480 || w > 3840 || !Number.isFinite(h) || h < 360 || h > 2160) {
-                    err.textContent = '窗口尺寸无效（允许 480-3840 × 360-2160）';
-                    return false;
-                }
-                if (!Number.isFinite(mins) || mins < 0 || mins > 240) {
-                    err.textContent = '自动锁定时长无效（0-240 分钟）';
-                    return false;
-                }
-                const checked = document.querySelector('input[name="cfg-theme"]:checked');
-                const newSettings = {
-                    theme: checked ? checked.value : 'blue',
-                    autolock_minutes: mins,
-                    window_width: w,
-                    window_height: h,
-                    anti_screenshot: $('cfg-anti').checked,
-                };
-                try {
-                    await invoke('save_settings', { settings: newSettings });
-                    settingsEnabled = true;
-                    appSettings = newSettings;
-                    applyTheme(newSettings.theme);
-                    applyWindowSize(newSettings.window_width, newSettings.window_height);
-                    resetIdleTimer();
-                    setStatus('设置已保存');
-                    return true;
-                } catch (e) {
-                    err.textContent = String(e);
-                    return false;
-                }
-            }},
-            { text: '关闭持久化', cls: 'btn-cancel', action: async () => {
-                const ok = await tauriAsk('关闭并删除配置文件？所有设置将恢复默认。', { title: '确认', type: 'warning' });
-                if (!ok) return false;
-                try {
-                    await invoke('disable_persistence');
-                    settingsEnabled = false;
-                    setStatus('已关闭持久化');
-                    setTimeout(() => openSettings(), 50); // 关闭后回到「未启用」视图
-                    return true;
-                } catch (e) {
-                    showError(String(e));
-                    return false;
-                }
-            }},
-            { text: '取消', cls: 'btn-cancel' },
-        ]
-    );
-}
-
-function showEnablePersistence() {
-    showDialog('启动持久化',
-        '<p style="margin-bottom:6px;">选择配置文件存放位置：</p>' +
-        '<label class="persist-option"><input type="radio" name="persist-loc" value="portable" checked>' +
-        '<span><b>当前路径</b>（程序所在目录，配置随程序移动 —— 适配 U 盘 / 便携使用）</span></label>' +
-        '<label class="persist-option"><input type="radio" name="persist-loc" value="appdata">' +
-        '<span><b>用户文件夹</b>（%APPDATA%\\LynVault —— 适配固定安装 / 程序目录只读时）</span></label>' +
-        '<div id="persist-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>',
-        [
-            { text: '启动', cls: 'btn-ok', action: async () => {
-                const checked = document.querySelector('input[name="persist-loc"]:checked');
-                try {
-                    const path = await invoke('enable_persistence', { location: checked ? checked.value : 'portable' });
-                    settingsEnabled = true;
-                    setStatus('已启用持久化：' + path);
-                    setTimeout(() => openSettings(), 50); // 回到完整设置界面
-                    return true;
-                } catch (e) {
-                    $('persist-error').textContent = String(e);
-                    return false;
-                }
-            }},
-            { text: '取消', cls: 'btn-cancel' },
-        ]
-    );
-}
-
-// ───────────────── 2.8.0：空闲自动锁定（默认 2 分钟） ─────────────────
-const IDLE_DEFAULT_MINUTES = 2;
-let _idleTimer = null;
-let _lastActivity = 0;
-
-function idleMinutes() {
-    const m = Number(appSettings && appSettings.autolock_minutes);
-    return Number.isFinite(m) && m >= 0 ? m : IDLE_DEFAULT_MINUTES;
-}
-
-function resetIdleTimer() {
-    if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
-    const mins = idleMinutes();
-    if (!state.vaultOpen || mins <= 0) return;
-    _idleTimer = setTimeout(autoLockVault, mins * 60 * 1000);
-}
-
-function noteActivity() {
-    // mousemove 高频触发：仅每 5 秒真正重置一次计时器
-    const now = Date.now();
-    if (_idleTimer && now - _lastActivity < 5000) return;
-    _lastActivity = now;
-    resetIdleTimer();
-}
-
-// 空闲触发：先自动保存未保存的编辑（用户要求），再关闭并回到启动弹窗
-async function autoLockVault() {
-    if (!state.vaultOpen) return;
-    _idleTimer = null;
-    // 2.8.1：触发前复查最近 30 秒内是否有过活动（noteActivity 的 5 秒节流
-    // 存在理论上漏记的可能）—— 有则顺延计时而不是关柜
-    if (Date.now() - _lastActivity < 30000) {
-        resetIdleTimer();
-        return;
-    }
-    let savedNote = '';
-    const ta = document.querySelector('#dialog-body textarea.txt-editor');
-    if (ta && !ta.readOnly && ta.dataset.vpath && ta.value !== ta.dataset.original) {
-        try {
-            const enc = new TextEncoder().encode(ta.value);
-            let binStr = '';
-            const CHUNK = 0x8000;
-            for (let i = 0; i < enc.length; i += CHUNK) {
-                binStr += String.fromCharCode.apply(null, enc.subarray(i, i + CHUNK));
-            }
-            await invoke('update_file_content', { vpath: ta.dataset.vpath, contentB64: btoa(binStr) });
-            savedNote = '（编辑内容已自动保存）';
-        } catch (e) {
-            // 2.8.2：自动保存失败 → 不关柜（旧实现仅状态栏一句话就继续关柜，
-            // 未保存编辑直接丢失）。柜保持打开，60 秒后重试（含保存）。
-            setStatus('空闲自动锁定暂停：编辑内容自动保存失败（' + e + '），60 秒后重试');
-            _idleTimer = setTimeout(autoLockVault, 60 * 1000);
-            return;
-        }
-    }
-    try {
-        await invoke('close_vault');
-        toggleUI(false);
-        hideDialog();
-        hideCtxMenu();
-        setStatus(`空闲超时，保险柜已自动锁定${savedNote}`);
-        // 回到启动弹窗（快速重新打开）
-        detectAndShowStartup();
-    } catch (e) {
-        // 2.8.2：关柜失败不再让 _idleTimer 悬空（旧实现失败后无人重建计时器，
-        // 柜保持打开但失去自动锁，直到下一次用户活动才恢复）
-        showError(String(e));
-        resetIdleTimer();
-    }
-}
-
-// ───────────────── 窗口控制 ─────────────────
-function bindWindowControls() {
-    const tauriWindow = window.__TAURI__ && window.__TAURI__.window;
-    if (!tauriWindow) return;
-    const appWindow = tauriWindow.getCurrent();
-
-    $('btn-minimize').onclick = () => appWindow.minimize();
-    $('btn-window-close').onclick = () => appWindow.close();
-    $('btn-maximize').onclick = async () => {
-        try {
-            if (await appWindow.isMaximized()) await appWindow.unmaximize();
-            else await appWindow.maximize();
-        } catch (e) { console.warn('[LynVault] Window maximize failed:', e); }
-    };
-}
-
-// ───────────────── 事件绑定 ─────────────────
 function bindEvents() {
     bindWindowControls();
     // 2.4.1：标题栏右侧开源仓库链接 —— 调系统默认浏览器打开。
@@ -1713,13 +1452,14 @@ function bindEvents() {
     if (repoLink) {
         repoLink.onclick = async (e) => {
             const url = repoLink.href;
+            // 3.0.0（Tauri 2）：shell → opener 插件（capabilities 白名单限定 GitHub 仓库 URL）
             try {
-                if (window.__TAURI__ && window.__TAURI__.shell && window.__TAURI__.shell.open) {
+                if (window.__TAURI__ && window.__TAURI__.opener && window.__TAURI__.opener.openUrl) {
                     e.preventDefault();
-                    await window.__TAURI__.shell.open(url);
+                    await window.__TAURI__.opener.openUrl(url);
                 } else {
                     e.preventDefault();
-                    await invoke('plugin:shell|open', { url });
+                    await invoke('plugin:opener|open_url', { url });
                 }
             } catch (err) {
                 console.warn('打开外部链接失败（保留默认行为）:', err);
@@ -1735,6 +1475,9 @@ function bindEvents() {
     $('btn-extract-all').onclick = extractAllFiles;
     $('btn-defrag').onclick = defragmentVault;
     $('btn-destroy').onclick = destroyVault;
+    // 3.0.0：胁迫密码 / 硬件密钥管理
+    $('btn-duress').onclick = manageDuress;
+    $('btn-yk').onclick = manageYubikey;
     $('btn-add-part').onclick = addPartition;
     $('btn-del-part').onclick = removePartition;
     // 2.8.0：改密码 / 操作记录 / 完整性体检 / 设置
@@ -1848,11 +1591,13 @@ function bindEvents() {
 
     // 用 Tauri Window API 捕获 dropped 文件路径（比 event.listen 更可靠）
     if (window.__TAURI__ && window.__TAURI__.window) {
-        const appWindow = window.__TAURI__.window.getCurrent();
-        appWindow.onFileDropEvent(async (evt) => {
+        const appWindow = (window.__TAURI__.window.getCurrentWindow || window.__TAURI__.window.getCurrent).call(window.__TAURI__.window);
+        // 3.0.0（Tauri 2）：onFileDropEvent → onDragDropEvent（hover 拆分为 enter/over），
+        // 回调载荷同构（{ payload: { type, paths } }）—— 优先 v2 API，退回 v1
+        const dragHandler = async (evt) => {
             const p = evt.payload;
             try {
-                if (p.type === 'hover') {
+                if (p.type === 'enter' || p.type === 'over') {
                     if (state.vaultOpen) fileList.classList.add('drag-over');
                 } else if (p.type === 'drop') {
                     fileList.classList.remove('drag-over');
@@ -1904,78 +1649,709 @@ function bindEvents() {
                 showError(String(e));
                 await listFolder(state.currentFolder);
             }
-        });
+        };
+        if (typeof appWindow.onDragDropEvent === 'function') {
+            appWindow.onDragDropEvent(dragHandler);
+        } else if (typeof appWindow.onFileDropEvent === 'function') {
+            appWindow.onFileDropEvent(dragHandler);
+        }
     }
 }
 
-// ───────────────── 启动检测弹窗 ─────────────────
-// 弹窗不可关闭，背景窗口变灰。仅在选择打开/新建后才会隐藏。
+function bindWindowControls() {
+    const tauriWindow = window.__TAURI__ && window.__TAURI__.window;
+    if (!tauriWindow) return;
+    const appWindow = (tauriWindow.getCurrentWindow || tauriWindow.getCurrent).call(tauriWindow);
 
-// N13 修复：过滤器配置提取为常量，避免重复
-const VAULT_FILTERS = [
-    { name: 'LynVault', extensions: ['lyt'] },
-    { name: 'LynVault (旧版)', extensions: ['vault'] },
-];
-const VAULT_OPEN_FILTERS = [
-    { name: 'LynVault', extensions: ['lyt', 'vault'] },
-];
-
-// N10 修复：列表项防重入标志，防止快速双击弹出多个密码框
-let _startupProcessing = false;
-
-function showStartupModal() {
-    document.body.classList.add('has-modal');
-    $('overlay').classList.add('startup-modal');
-    $('overlay').classList.remove('hidden');
-    $('startup-dialog').classList.remove('hidden');
-    // N9 修复：启动弹窗显示时，遮罩不绑定 hideDialog（保持不可关闭）
-    $('overlay').onclick = null;
-    _startupProcessing = false;
+    $('btn-minimize').onclick = () => appWindow.minimize();
+    // I12（审计修复）：直接关窗前先正常关闭保险柜 —— 未落盘的审计条目
+    //（audit_dirty）随 close_vault 补写；锁屏/睡眠/注销路径已由后端覆盖
+    $('btn-window-close').onclick = async () => {
+        try {
+            if (state.vaultOpen) await invoke('close_vault');
+        } catch (e) { console.warn('关柜失败（仍将关闭窗口）:', e); }
+        appWindow.close();
+    };
+    $('btn-maximize').onclick = async () => {
+        try {
+            if (await appWindow.isMaximized()) await appWindow.unmaximize();
+            else await appWindow.maximize();
+        } catch (e) { console.warn('[LynVault] Window maximize failed:', e); }
+    };
 }
 
-function hideStartupModal() {
-    document.body.classList.remove('has-modal');
-    $('overlay').classList.remove('startup-modal');
-    $('overlay').classList.add('hidden');
-    $('startup-dialog').classList.add('hidden');
-    // 恢复 overlay 的正常行为
-    $('overlay').onclick = hideDialog;
-}
-
-function renderStartupList(items) {
-    const list = $('startup-list');
-    list.innerHTML = '';
-    if (!items || items.length === 0) {
-        list.innerHTML = '<div class="sd-empty">当前目录下未发现保险柜文件<br>请选择「新建保险柜」或「打开其他保险柜」</div>';
+async function autoLockVault() {
+    if (!state.vaultOpen) return;
+    _idleTimer = null;
+    // 2.8.1：触发前复查最近 30 秒内是否有过活动（noteActivity 的 5 秒节流
+    // 存在理论上漏记的可能）—— 有则顺延计时而不是关柜
+    if (Date.now() - _lastActivity < 30000) {
+        resetIdleTimer();
         return;
     }
-    for (const it of items) {
-        const div = document.createElement('div');
-        div.className = 'sd-item';
-        const d = new Date((it.mtime || 0) * 1000);
-        const ts = d.toLocaleString('zh-CN');
-        const sizeStr = formatSize(it.size || 0);
-        // 转义防止 XSS
-        const safeName = escapeHtml(it.name);
-        const safePath = escapeAttr(it.path);
-        div.innerHTML = `<span class="sd-icon">🔒</span>` +
-            `<div class="sd-info">` +
-            `<div class="sd-name" title="${safePath}">${safeName}</div>` +
-            `<div class="sd-meta">${ts} · ${sizeStr}</div>` +
-            `</div>`;
-        div.onclick = () => {
-            // N10 修复：防重入，处理中时忽略后续点击
-            if (_startupProcessing) return;
-            _startupProcessing = true;
-            openVaultFromStartup(it.path);
-        };
-        list.appendChild(div);
+    let savedNote = '';
+    const ta = document.querySelector('#dialog-body textarea.txt-editor');
+    if (ta && !ta.readOnly && ta.dataset.vpath && ta.value !== ta.dataset.original) {
+        try {
+            const enc = new TextEncoder().encode(ta.value);
+            let binStr = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < enc.length; i += CHUNK) {
+                binStr += String.fromCharCode.apply(null, enc.subarray(i, i + CHUNK));
+            }
+            await invoke('update_file_content', { vpath: ta.dataset.vpath, contentB64: btoa(binStr) });
+            savedNote = '（编辑内容已自动保存）';
+        } catch (e) {
+            // 2.8.2：自动保存失败 → 不关柜（旧实现仅状态栏一句话就继续关柜，
+            // 未保存编辑直接丢失）。柜保持打开，60 秒后重试（含保存）。
+            setStatus('空闲自动锁定暂停：编辑内容自动保存失败（' + e + '），60 秒后重试');
+            _idleTimer = setTimeout(autoLockVault, 60 * 1000);
+            return;
+        }
+    }
+    try {
+        await invoke('close_vault');
+        toggleUI(false);
+        hideDialog();
+        hideCtxMenu();
+        setStatus(`空闲超时，保险柜已自动锁定${savedNote}`);
+        // 回到启动弹窗（快速重新打开）
+        detectAndShowStartup();
+    } catch (e) {
+        // 2.8.2：关柜失败不再让 _idleTimer 悬空（旧实现失败后无人重建计时器，
+        // 柜保持打开但失去自动锁，直到下一次用户活动才恢复）
+        showError(String(e));
+        resetIdleTimer();
     }
 }
 
-// R1+R2 修复：取消时通过 onCancel 重置 _startupProcessing；
-// 密码错误时用 showInlineInputError 不销毁密码框，让用户重试
-// Q2 修复：onCancel 时若启动弹窗已隐藏（来自 sd-open-other 流程），重新显示
+function noteActivity() {
+    // mousemove 高频触发：仅每 5 秒真正重置一次计时器
+    const now = Date.now();
+    if (_idleTimer && now - _lastActivity < 5000) return;
+    _lastActivity = now;
+    resetIdleTimer();
+}
+
+function resetIdleTimer() {
+    if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+    const mins = idleMinutes();
+    if (!state.vaultOpen || mins <= 0) return;
+    _idleTimer = setTimeout(autoLockVault, mins * 60 * 1000);
+}
+
+function idleMinutes() {
+    const m = Number(appSettings && appSettings.autolock_minutes);
+    return Number.isFinite(m) && m >= 0 ? m : IDLE_DEFAULT_MINUTES;
+}
+
+function showEnablePersistence() {
+    showDialog('启动持久化',
+        '<p style="margin-bottom:6px;">选择配置文件存放位置：</p>' +
+        '<label class="persist-option"><input type="radio" name="persist-loc" value="portable" checked>' +
+        '<span><b>当前路径</b>（程序所在目录，配置随程序移动 —— 适配 U 盘 / 便携使用）</span></label>' +
+        '<label class="persist-option"><input type="radio" name="persist-loc" value="appdata">' +
+        '<span><b>用户文件夹</b>（%APPDATA%\\LynVault —— 适配固定安装 / 程序目录只读时）</span></label>' +
+        '<div id="persist-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>',
+        [
+            { text: '启动', cls: 'btn-ok', action: async () => {
+                const checked = document.querySelector('input[name="persist-loc"]:checked');
+                try {
+                    const path = await invoke('enable_persistence', { location: checked ? checked.value : 'portable' });
+                    settingsEnabled = true;
+                    setStatus('已启用持久化：' + path);
+                    setTimeout(() => openSettings(), 50); // 回到完整设置界面
+                    return true;
+                } catch (e) {
+                    $('persist-error').textContent = String(e);
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+}
+
+async function openSettings() {
+    let data;
+    try {
+        data = await invoke('get_settings');
+    } catch (e) {
+        showError(String(e));
+        return;
+    }
+    if (!data.enabled) {
+        // 未启用持久化：按设计只显示「启动持久化」入口
+        showDialog('设置',
+            '<div class="settings-persist-hint">当前未启用设置持久化 —— 主题、窗口尺寸、自动锁定时长不会保存。<br>启用后配置写入你选择的位置（U 盘便携 / 固定安装二选一）。</div>' +
+            '<button id="btn-enable-persist" class="persist-btn">启动持久化</button>',
+            [{ text: '关闭', cls: 'btn-cancel' }]
+        );
+        $('btn-enable-persist').onclick = () => showEnablePersistence();
+        return;
+    }
+    const s = data.settings;
+    const themeSwatches = KNOWN_THEMES.map(t =>
+        `<label class="theme-swatch" title="${t}"><input type="radio" name="cfg-theme" value="${t}" ${s.theme === t ? 'checked' : ''}><span class="swatch swatch-${t}"></span></label>`
+    ).join('');
+    showDialog('设置',
+        `<div class="settings-path">配置文件：${escapeHtml(data.path)}</div>` +
+        `<div class="settings-row"><label>主题：</label><div class="theme-swatches">${themeSwatches}</div></div>` +
+        `<div class="settings-row"><label>自动锁定（分钟，0=禁用）：</label><input type="text" id="cfg-autolock" value="${escapeAttr(String(s.autolock_minutes))}"></div>` +
+        `<div class="settings-row"><label>窗口尺寸：</label><span class="win-size"><input type="text" id="cfg-w" value="${escapeAttr(String(Math.round(s.window_width)))}"> × <input type="text" id="cfg-h" value="${escapeAttr(String(Math.round(s.window_height)))}"></span></div>` +
+        `<div class="settings-row"><label>防截屏保护：</label><input type="checkbox" id="cfg-anti" ${s.anti_screenshot ? 'checked' : ''}></div>` +
+        `<div id="cfg-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>` +
+        '<p class="audit-note">防截屏：开启后本窗口不会出现在截屏 / 录屏 / 远程共享画面中（Win10 2004+ 完全隐藏，旧系统显示为黑块；无法阻止物理拍摄）。</p>',
+        [
+            { text: '保存', cls: 'btn-ok', action: async () => {
+                const err = $('cfg-error');
+                const w = parseFloat($('cfg-w').value);
+                const h = parseFloat($('cfg-h').value);
+                const mins = parseInt($('cfg-autolock').value, 10);
+                if (!Number.isFinite(w) || w < 480 || w > 3840 || !Number.isFinite(h) || h < 360 || h > 2160) {
+                    err.textContent = '窗口尺寸无效（允许 480-3840 × 360-2160）';
+                    return false;
+                }
+                if (!Number.isFinite(mins) || mins < 0 || mins > 240) {
+                    err.textContent = '自动锁定时长无效（0-240 分钟）';
+                    return false;
+                }
+                const checked = document.querySelector('input[name="cfg-theme"]:checked');
+                const newSettings = {
+                    theme: checked ? checked.value : 'blue',
+                    autolock_minutes: mins,
+                    window_width: w,
+                    window_height: h,
+                    anti_screenshot: $('cfg-anti').checked,
+                };
+                try {
+                    await invoke('save_settings', { settings: newSettings });
+                    settingsEnabled = true;
+                    appSettings = newSettings;
+                    applyTheme(newSettings.theme);
+                    applyWindowSize(newSettings.window_width, newSettings.window_height);
+                    resetIdleTimer();
+                    setStatus('设置已保存');
+                    return true;
+                } catch (e) {
+                    err.textContent = String(e);
+                    return false;
+                }
+            }},
+            { text: '关闭持久化', cls: 'btn-cancel', action: async () => {
+                const ok = await tauriAsk('关闭并删除配置文件？所有设置将恢复默认。', { title: '确认', type: 'warning' });
+                if (!ok) return false;
+                try {
+                    await invoke('disable_persistence');
+                    settingsEnabled = false;
+                    setStatus('已关闭持久化');
+                    setTimeout(() => openSettings(), 50); // 关闭后回到「未启用」视图
+                    return true;
+                } catch (e) {
+                    showError(String(e));
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+}
+
+async function changePassword() {
+    showDialog('修改保险柜密码',
+        `<label>当前密码：</label><input type="password" id="cp-current">` +
+        `<label>新密码（至少 12 位）：</label><input type="password" id="cp-new">` +
+        `<label>确认新密码：</label><input type="password" id="cp-new2">` +
+        `<div id="cp-error" style="color:#ff6666;font-size:12px;min-height:14px;"></div>` +
+        `<p class="audit-note">v5/v6 保险柜仅重写头部，瞬间完成（v5 会同时升级为 v6）；旧格式（v4）保险柜将自动升级并全库重加密（需要一些时间）。升级后旧版本 LynVault 将无法打开该保险柜。</p>`,
+        [
+            { text: '修改', cls: 'btn-ok', action: async () => {
+                const cur = $('cp-current').value;
+                const np = $('cp-new').value;
+                const np2 = $('cp-new2').value;
+                const err = $('cp-error');
+                if (!cur || !np) { err.textContent = '请填写完整'; return false; }
+                if (np !== np2) { err.textContent = '两次输入的新密码不一致'; return false; }
+                if ([...np].length < 12) { err.textContent = '新密码长度至少 12 位（按字符计）'; return false; }
+                try {
+                    setStatus('正在修改密码…（v4 老保险柜会自动升级并重加密，可能耗时较长）');
+                    // 3.0.0（M-4）：二因子分区需携带硬件密钥响应（由后端设备挑战）
+                    const yk = await _ykResponseIfEnabled();
+                    await invoke('change_password', { currentPassword: cur, newPassword: np, keyFilePath: null, ykResponse: yk });
+                    setStatus('密码修改成功');
+                    return true;
+                } catch (e) {
+                    err.textContent = String(e);
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+    setTimeout(() => { const el = $('cp-current'); if (el) el.focus(); }, 50);
+}
+
+async function verifyIntegrity() {
+    showDialog('完整性体检',
+        '<div class="verify-box"><div id="verify-status">正在逐文件校验认证标签…（大保险柜需要一些时间）</div>' +
+        '<div class="progress-track"><div id="verify-bar" class="progress-fill" style="width:0%"></div></div></div>' +
+        '<p class="audit-note">体检为只读操作，期间其他保险柜操作将排队等待扫描完成。</p>',
+        [{ text: '关闭', cls: 'btn-cancel', action: () => true }]);
+    try {
+        const raw = await invoke('verify_vault_integrity');
+        const res = data_of(raw);
+        const box = document.querySelector('#dialog-body .verify-box');
+        if (!box) return; // 对话框已被用户关闭
+        if (!res.broken || !res.broken.length) {
+            box.innerHTML = `<div class="verify-ok">✓ 全部 ${res.total} 个文件校验通过，未发现损坏</div>`;
+        } else {
+            const rows = res.broken.map(b =>
+                `<div class="audit-row"><span class="audit-event">${escapeHtml(b.vpath)}</span><span class="audit-ts">${escapeHtml(b.reason)}</span></div>`
+            ).join('');
+            box.innerHTML = `<div class="verify-bad">✗ 发现 ${res.broken.length} / ${res.total} 个文件异常：</div><div class="audit-list">${rows}</div>` +
+                '<p class="audit-note">异常文件可能已损坏（位腐 / 云同步冲突），建议从外部备份重新导入。请勿删除保险柜文件。</p>';
+        }
+    } catch (e) {
+        const box = document.querySelector('#dialog-body .verify-box');
+        if (box) box.innerHTML = `<div class="verify-bad">体检失败：${escapeHtml(String(e))}</div>`;
+    }
+}
+
+async function showAuditLog() {
+    try {
+        const raw = await invoke('get_audit_log', { limit: 500 });
+        const entries = data_of(raw);
+        let body;
+        if (!entries || !entries.length) {
+            body = '<p class="audit-note">暂无记录</p>';
+        } else {
+            const rows = entries.map(e => {
+                const d = new Date((e.ts || 0) * 1000);
+                return `<div class="audit-row"><span class="audit-ts">${escapeHtml(d.toLocaleString('zh-CN'))}</span><span class="audit-event">${escapeHtml(e.event)}</span></div>`;
+            }).join('');
+            body = `<div class="audit-list">${rows}</div>`;
+        }
+        showDialog('操作记录（最近 500 条，最新在前）',
+            body + '<p class="audit-note">记录由链式 HMAC 保护：任何篡改都会被检测并截断。</p>',
+            [{ text: '关闭', cls: 'btn-ok' }], true);
+    } catch (e) {
+        showError(String(e));
+    }
+}
+
+async function moveSelected() {
+    if (!state.selectedItems.length) return;
+    const count = state.selectedItems.length;
+    let folders = [];
+    try {
+        folders = await invoke('list_all_folders');
+    } catch (e) {
+        showError(String(e));
+        return;
+    }
+    const options = ['<option value="/">/（根目录）</option>']
+        .concat((folders || []).map(f => `<option value="${escapeAttr(f)}">${escapeHtml(f)}</option>`))
+        .join('');
+    showDialog('移动到…',
+        `<label>目标文件夹（${count} 项）：</label><select id="dlg-move-select">${options}</select>` +
+        `<div id="dlg-move-preview" style="color:#657589;font-size:12px;margin-top:2px;"></div>`,
+        [
+            { text: '移动', cls: 'btn-ok', action: async () => {
+                const dest = $('dlg-move-select').value;
+                const vpaths = state.selectedItems.map(i => i.vpath);
+                try {
+                    const raw = await invoke('move_items', { vpaths, destFolder: dest });
+                    const res = data_of(raw);
+                    await listFolder(state.currentFolder);
+                    setStatus(res.fail > 0
+                        ? `移动完成: 成功 ${res.ok} 个，失败 ${res.fail} 个`
+                        : `已移动 ${res.ok} 个项目 → ${dest}`);
+                    if (res.fail > 0 && res.errors && res.errors.length) showError(res.errors.join('\n'));
+                    return true;
+                } catch (e) {
+                    showError(String(e));
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+    const sel = $('dlg-move-select');
+    const preview = $('dlg-move-preview');
+    const updatePreview = () => {
+        const dest = sel.value;
+        const names = state.selectedItems.map(i => dest === '/' ? '/' + i.name : dest + '/' + i.name);
+        preview.textContent = '→ ' + names.join('，');
+    };
+    sel.onchange = updatePreview;
+    updatePreview();
+}
+
+function renderSearchResults(hits) {
+    const list = $('file-list');
+    list.innerHTML = '';
+    state.selectedItems = [];
+    if (!hits || !hits.length) {
+        list.innerHTML = '<div class="empty-hint"><span>无匹配结果</span></div>';
+        setStatus('搜索：无匹配结果');
+        return;
+    }
+    // 2.8.1：与 renderList 相同的 fragment + 委托模式（交互由 bindListDelegation 统一处理）
+    const frag = document.createDocumentFragment();
+    for (const f of hits) {
+        const isFolder = !!f.is_dir;
+        const div = document.createElement('div');
+        div.className = 'file-item';
+        div.dataset.vpath = f.vpath;
+        div.dataset.type = isFolder ? 'folder' : 'file';
+        div.dataset.name = f.name;
+        const fallbackEmoji = isFolder ? '📁' : getIcon(f.name, false);
+        // 搜索结果两行展示：名称 + 完整 vpath
+        div.innerHTML = `<span class="fi-icon"></span>` +
+            `<span class="fi-main"><span class="fi-name">${escapeHtml(f.name)}</span><span class="fi-path">${escapeHtml(f.vpath)}</span></span>` +
+            `<span class="fi-size">${isFolder ? '-' : formatSize(f.size)}</span>`;
+        const iconSpan = div.querySelector('.fi-icon');
+        if (isFolder) iconSpan.textContent = fallbackEmoji;
+        else applySysIcon(iconSpan, f.name, fallbackEmoji);
+        frag.appendChild(div);
+    }
+    list.appendChild(frag);
+    setStatus(`搜索：${hits.length} 个匹配（双击进入目录 / 打开文件）`);
+}
+
+async function runSearch() {
+    const q = $('search-input').value.trim();
+    if (!q) {
+        if (state.searchMode) {
+            state.searchMode = false;
+            await listFolder(state.currentFolder);
+        }
+        return;
+    }
+    if (!state.vaultOpen) return;
+    const seq = ++_searchSeq;
+    try {
+        const hits = await invoke('search_files', { query: q, limit: 200 });
+        if (seq !== _searchSeq) return; // 已有更新的查询发出，丢弃过期结果
+        state.searchMode = true;
+        renderSearchResults(hits);
+    } catch (e) {
+        if (seq === _searchSeq) showError(String(e));
+    }
+}
+
+function bindSearch() {
+    const input = $('search-input');
+    if (!input) return;
+    input.addEventListener('input', () => {
+        clearTimeout(_searchDebounce);
+        _searchDebounce = setTimeout(runSearch, 300);
+    });
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            input.value = '';
+            runSearch();
+        } else if (e.key === 'Enter') {
+            clearTimeout(_searchDebounce);
+            runSearch();
+        }
+    });
+}
+
+async function destroyVault() {
+    const ok = await tauriAsk('此操作将不可逆地销毁当前保险柜及其所有数据！\n\n确定继续？', { title: '销毁保险箱', type: 'warning' });
+    if (!ok) return;
+    const ok2 = await tauriAsk('再次确认：销毁整个保险柜？', { title: '最终确认', type: 'error' });
+    if (!ok2) return;
+    try {
+        await invoke('destroy_vault');
+        toggleUI(false);
+        setStatus('保险柜已销毁');
+    } catch (e) {
+        showError(String(e));
+    }
+}
+
+// ───────────────── 3.0.0：胁迫密码 ─────────────────
+// 标记存于胁迫分区自己的加密索引（外部不可见）。设置流程：在当前会话中
+// 「新建胁迫分区」或「标记已有分区」—— 后端用目标分区口令解写其索引内的
+// 标记，无需先打开该分区。设置/触发不写审计。
+async function manageDuress() {
+    let status;
+    try {
+        status = data_of(await invoke('get_duress_status'));
+    } catch (e) {
+        showError(String(e));
+        return;
+    }
+    if (!status) {
+        showError('状态查询失败');
+        return;
+    }
+    const parts = status.partitions || [];
+    const active = status.active || '';
+    const html =
+        '<p>分区列表：<b>' + (parts.length ? parts.map(escapeHtml).join('、') : '无') + '</b></p>' +
+        '<p style="color:var(--danger,#e05555)">被标记为「胁迫分区」的密码在被胁迫交出后：其他所有分区的数据将被<b>永久销毁</b>，' +
+        '胁迫分区正常呈现（诱饵），操作记录不留痕迹。标记对外完全不可见。</p>' +
+        '<p><b>注意：</b>请选择/新建一个专门用作诱饵的分区 —— 若误标存放真实数据的分区，正常开柜即触发销毁。</p>';
+    const buttons = [];
+    if (parts.length >= 1) {
+        buttons.push({ text: '新建胁迫分区', cls: 'btn-ok', action: flowNewDuress });
+        if (parts.length >= 2) {
+            buttons.push({ text: '标记已有分区', cls: 'btn-ok', action: () => flowMarkExisting(parts, active) });
+            buttons.push({ text: '解除标记', cls: 'btn-cancel', action: () => flowClearDuress(parts) });
+            buttons.push({ text: '演练触发', cls: 'btn-cancel', action: () => flowRehearseDuress(parts) });
+        }
+    }
+    buttons.push({ text: '关闭', cls: 'btn-cancel' });
+    showDialog('胁迫密码管理', html, buttons);
+}
+
+async function _inputPassword(title, label) {
+    return new Promise(resolve => {
+        showInput(title, label, '', resolve, true, () => resolve(null));
+    });
+}
+
+async function _confirmDuressTwice() {
+    const ok1 = await tauriAsk(
+        '即将把该分区标记为胁迫分区。\n之后用该分区密码开柜时，其他所有分区的数据将被永久销毁（不可找回）。\n确定继续？',
+        { title: '胁迫密码设置', type: 'warning' }
+    );
+    if (!ok1) return false;
+    const ok2 = await tauriAsk('最终确认：我已理解触发后其他分区的数据无法恢复。', { title: '最终确认', type: 'error' });
+    return ok2;
+}
+
+// 新建胁迫分区：别名 + 密码 → add_partition → 标记 → 引导添加诱饵文件
+// 3.0.0（M-4）：二因子分区的敏感操作需要响应时按需取 —— 由后端对在位
+// 钥匙现场挑战（真硬件），未启用或无设备时返回 null（零打扰）。
+async function _ykResponseIfEnabled() {
+    try {
+        const st = data_of(await invoke('yubikey_status'));
+        if (!(st && st.enabled && st.present)) return null;
+        const ch = data_of(await invoke('yubikey_challenge', { path: state.vaultPath }));
+        return (ch && ch.response) || null;
+    } catch (_) {
+        return null; // 探测失败按未启用走（后端会给出准确报错）
+    }
+}
+
+// 3.0.0：硬件密钥管理（当前分区启用 / 解除）。
+// L2（审计修复）：响应由后端对在位钥匙现场计算 —— IPC 不传响应字节，
+// 「用自选响应排他锁出他人分区」的路径不存在。
+async function manageYubikey() {
+    let status;
+    try {
+        status = data_of(await invoke('yubikey_status'));
+    } catch (e) {
+        showError(String(e));
+        return;
+    }
+    const enabled = !!(status && status.enabled);
+    const present = !!(status && status.present);
+    const html =
+        '<p>设备：<b>' + (present ? 'YubiKey 在位' : '未检测到（请插入后重试）') + '</b></p>' +
+        '<p>当前分区：<b>' + (enabled ? '已启用硬件密钥二因子' : '未启用') + '</b></p>' +
+        '<p>启用后打开本分区需要物理钥匙（槽 2 HMAC-SHA1 挑战-响应）参与验证：' +
+        '口令 + 钥匙两段独立因子。<b>钥匙丢失且无法复现响应时本分区数据无法打开</b>' +
+        '（其他分区不受影响）。前提：YubiKey 槽 2 已配置为挑战-响应凭证' +
+        '（<code>ykman otp chresp -H 2</code> 或个人化工具）。</p>';
+    const buttons = [];
+    if (!enabled) {
+        buttons.push({ text: '为当前分区启用', cls: 'btn-ok', action: enableYk2fa });
+    } else {
+        buttons.push({ text: '解除当前分区', cls: 'btn-ok', action: disableYk2fa });
+    }
+    buttons.push({ text: '关闭', cls: 'btn-cancel' });
+    showDialog('硬件密钥（YubiKey）', html, buttons);
+}
+
+async function enableYk2fa() {
+    const pwd = await new Promise(resolve => {
+        showInput('验证当前分区密码', '输入当前分区密码：', '', resolve, true, () => resolve(null));
+    });
+    if (!pwd) return;
+    setStatus('请触摸 YubiKey 完成验证…');
+    try {
+        await invoke('enable_yubikey_2fa', { confirmPassword: pwd, keyFilePath: null });
+        setStatus('硬件密钥二因子已启用（本分区）');
+    } catch (e) {
+        showError(String(e));
+    }
+}
+
+async function disableYk2fa() {
+    const pwd = await new Promise(resolve => {
+        showInput('验证当前分区密码', '输入当前分区密码：', '', resolve, true, () => resolve(null));
+    });
+    if (!pwd) return;
+    setStatus('请触摸 YubiKey 完成验证…');
+    try {
+        await invoke('disable_yubikey_2fa', { confirmPassword: pwd, keyFilePath: null });
+        setStatus('硬件密钥二因子已解除（本分区）');
+    } catch (e) {
+        showError(String(e));
+    }
+}
+
+async function flowNewDuress() {
+    const alias = await new Promise(resolve => {
+        showInput('新建胁迫分区（1/3）', '分区别名（字母/数字/_- ，≤16 字符）：', '', resolve, false, () => resolve(null));
+    });
+    if (!alias) return;
+    if (!/^[A-Za-z0-9_\- ]{1,16}$/.test(alias)) {
+        showError('别名只能包含字母、数字、下划线、短横线和空格（1-16 字符）');
+        return;
+    }
+    const pwd = await _inputPassword('新建胁迫分区（2/3）', '设置胁迫分区密码（至少 12 位）：');
+    if (!pwd) return;
+    if ([...pwd].length < 12) {
+        showError('胁迫分区密码长度至少 12 位');
+        return;
+    }
+    if (!(await _confirmDuressTwice())) return;
+    try {
+        await invoke('add_partition', { alias, password: pwd, keyFilePath: null });
+        // 3.0.0（M-4 兼容）：二因子分区的验证需要响应（由后端设备挑战）
+        const yk = await _ykResponseIfEnabled();
+        await invoke('set_duress_mark', { targetAlias: alias, targetPassword: pwd, keyFilePath: null, ykResponse: yk });
+        setStatus('胁迫分区已创建并标记');
+        showDialog('胁迫分区已就绪',
+            '<p>分区 <b>' + escapeHtml(alias) + '</b> 已创建并标记为胁迫分区。</p>' +
+            '<p>下一步：<b>关闭保险柜，用刚设置的胁迫密码打开它</b>，往里面放入经受得起检查的诱饵文件 ' +
+            '（普通文档/照片等）。之后对外只交出胁迫密码即可。</p>',
+            [{ text: '知道了', cls: 'btn-ok' }]);
+    } catch (e) {
+        showError(String(e));
+    }
+}
+
+// 标记已有分区（排除当前活跃分区）：选择 + 该分区密码 + 双确认
+async function flowMarkExisting(parts, active) {
+    // 允许标记当前分区（打开诱饵分区原地标记是自然流程）
+    const candidates = parts;
+    if (candidates.length === 0) {
+        showError('没有可标记的其他分区');
+        return;
+    }
+    const options = candidates.map(a => `<option value="${escapeAttr(a)}">${escapeHtml(a)}</option>`).join('');
+    showDialog('标记胁迫分区（1/3）',
+        '<label>选择要作为胁迫分区的分区：</label>' +
+        `<select id="dlg-duress-target">${options}</select>`,
+        [
+            { text: '下一步', cls: 'btn-ok', action: async () => {
+                const target = $('dlg-duress-target').value;
+                const pwd = await _inputPassword('标记胁迫分区（2/3）', `输入「${target}」分区的密码：`);
+                if (!pwd) return false;
+                if (!(await _confirmDuressTwice())) return false;
+                try {
+                    const yk = await _ykResponseIfEnabled();
+                    await invoke('set_duress_mark', { targetAlias: target, targetPassword: pwd, keyFilePath: null, ykResponse: yk });
+                    setStatus(`分区「${target}」已标记为胁迫分区`);
+                } catch (e) {
+                    showError(String(e));
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+}
+
+// 解除标记：选择分区 + 该分区密码（不是胁迫分区会明确报错）
+async function flowClearDuress(parts) {
+    const options = parts.map(a => `<option value="${escapeAttr(a)}">${escapeHtml(a)}</option>`).join('');
+    showDialog('解除胁迫标记',
+        '<label>选择分区：</label>' +
+        `<select id="dlg-duress-target">${options}</select>`,
+        [
+            { text: '下一步', cls: 'btn-ok', action: async () => {
+                const target = $('dlg-duress-target').value;
+                const pwd = await _inputPassword('解除胁迫标记', `输入「${target}」分区的密码：`);
+                if (!pwd) return false;
+                try {
+                    const yk = await _ykResponseIfEnabled();
+                    await invoke('clear_duress_mark', { targetAlias: target, targetPassword: pwd, keyFilePath: null, ykResponse: yk });
+                    setStatus(`分区「${target}」的胁迫标记已解除`);
+                } catch (e) {
+                    showError(String(e));
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+}
+
+// 演练：选择分区 + 胁迫密码（副本上完整触发，原件零接触）
+async function flowRehearseDuress(parts) {
+    const options = parts.map(a => `<option value="${escapeAttr(a)}">${escapeHtml(a)}</option>`).join('');
+    showDialog('胁迫演练（1/2）',
+        '<label>胁迫分区：</label>' +
+        `<select id="dlg-duress-target">${options}</select>` +
+        '<p class="audit-note">演练对保险柜临时副本执行完整触发（真实开柜 + 真实覆写 + 重开验证），' +
+        '副本用后安全擦除，原件零接触。大保险柜耗时较长。</p>',
+        [
+            { text: '下一步', cls: 'btn-ok', action: async () => {
+                const target = $('dlg-duress-target').value;
+                const pwd = await _inputPassword('胁迫演练（2/2）', `输入「${target}」分区的密码：`);
+                if (!pwd) return false;
+                setStatus('演练进行中：创建临时副本并完整触发…');
+                try {
+                    const yk = await _ykResponseIfEnabled();
+                    // 演练无需指定目标：副本开柜时「带标记的分区」自动触发；
+                    // 若所选分区未带标记，验证阶段会明确报错
+                    const r = data_of(await invoke('duress_rehearsal', {
+                        duressPassword: pwd,
+                        keyFilePath: null,
+                        ykResponse: yk,
+                    }));
+                    showDialog('演练完成',
+                        '<p>机制验证通过：副本上 <b>' + (r ? r.wiped : '?') + '</b> 个其他分区条目已被随机覆写' +
+                        '（重开副本仅剩胁迫分区可开）。</p><p>演练副本已安全擦除，原件未受任何影响。</p>',
+                        [{ text: '确定', cls: 'btn-ok' }]);
+                    setStatus('胁迫演练完成（原件未受影响）');
+                } catch (e) {
+                    showError(String(e));
+                    return false;
+                }
+            }},
+            { text: '取消', cls: 'btn-cancel' },
+        ]
+    );
+}
+
+// ───────────────── 3.0.0：硬件密钥（YubiKey，可选二因子）─────────────────
+// 统一的开柜调用：先走普通口令；失败且检测到 YubiKey 时引导触摸钥匙重试
+//（启用二因子的分区需要；未启用的分区两种路径都可开）。零格式变更设计。
+async function invokeOpenVault(filePath, pwd) {
+    try {
+        const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null, ykResponse: null });
+        state.vaultPath = filePath;
+        return r;
+    } catch (e) {
+        // 未检测到 YubiKey 时直接按原错误走（密码错误内联提示）
+        let present = false;
+        try {
+            const st = data_of(await invoke('yubikey_status'));
+            present = !!(st && st.present);
+        } catch (_) { /* 探测失败按无钥匙处理 */ }
+        if (!present) throw e;
+        const useKey = await tauriAsk(
+            '检测到硬件密钥（YubiKey）。\n\n是否用硬件密钥重试开柜？（启用硬件密钥二因子的分区需要；将请求触摸密钥）',
+            { title: '硬件密钥', type: 'info' }
+        );
+        if (!useKey) throw e;
+        const ch = data_of(await invoke('yubikey_challenge', { path: filePath }));
+        if (!ch || !ch.response) throw e;
+        const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null, ykResponse: ch.response });
+        state.vaultPath = filePath;
+        return r;
+    }
+}
+
 function openVaultFromStartup(filePath) {
     if (!filePath) { _startupProcessing = false; return; }
     showInput('打开保险柜', '输入主密码：', '', async (pwd) => {
@@ -1989,7 +2365,7 @@ function openVaultFromStartup(filePath) {
             return true;
         }
     try {
-        await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
+        await invokeOpenVault(filePath, pwd);
         hideStartupModal();
         toggleUI(true);
         await listFolder('/');
@@ -2094,15 +2470,9 @@ window.addEventListener('DOMContentLoaded', async () => {
         try {
             const w = window.__TAURI__ && window.__TAURI__.window;
             if (w) {
-                const appWin = w.getCurrent();
+                const appWin = (w.getCurrentWindow || w.getCurrent).call(w);
                 const LogicalSize = w.LogicalSize;
-                const sw = window.screen.width;
-                const sh = window.screen.height;
-                let width = Math.floor(Math.min(sw * 0.6, 1024));
-                let height = Math.floor(Math.min(width * 0.66, sh * 0.8));
-                if (height < Math.floor(width * 0.66)) {
-                    width = Math.floor(height * 1.5); // 高度受限时按 3:2 反推宽度
-                }
+                const { width, height } = adaptiveWindowSize();
                 if (LogicalSize) {
                     appWin.setSize(new LogicalSize(width, height));
                 } else {
@@ -2123,16 +2493,19 @@ window.addEventListener('DOMContentLoaded', async () => {
         if (_startupProcessing) return;
         _startupProcessing = true;
         hideStartupModal();
-        let filePath;
+        // L6（审计修复）：改走后端 dialog_pick_save —— 保存对话框由后端弹出
+        // 并签发一次性令牌，与主界面「新建保险柜」同一令牌体系；旧实现前端
+        // tauriSave 直调游离在令牌体系外，目标已存在时被后端 H-1 校验拒绝，
+        // 用户看到莫名其妙的「缺少对话框令牌」
+        let picked = null;
         try {
-            filePath = await tauriSave({
-                title: '选择保险柜保存位置',
-                filters: VAULT_FILTERS,
-            });
+            picked = data_of(await invoke('dialog_pick_save'));
         } catch (e) {
-            console.warn('tauriSave 失败:', e);
-            filePath = null;
+            console.warn('dialog_pick_save 失败:', e);
+            picked = null;
         }
+        const filePath = picked && picked.paths && picked.paths[0];
+        const saveToken = picked ? picked.token : null;
         if (!filePath) {
             // 用户取消 / 对话框失败：复位标志并重新显示启动弹窗
             //（2.8.2：旧实现裸 await，invoke reject 时 _startupProcessing
@@ -2149,7 +2522,7 @@ window.addEventListener('DOMContentLoaded', async () => {
                 return true; // 空密码等同于取消，回到启动弹窗
             }
             try {
-                await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null });
+                await invoke('create_vault', { path: filePath, password: pwd, keyFilePath: null, token: saveToken });
                 hideStartupModal();
                 toggleUI(true);
                 await listFolder('/');
@@ -2211,6 +2584,15 @@ window.addEventListener('DOMContentLoaded', async () => {
                 detectAndShowStartup();
             });
             // 2.8.0：完整性体检进度（verify-bar 元素存在时刷新）
+            // 3.0.0（优化1）：导入 / 提取进度事件 → 状态栏
+            await window.__TAURI__.event.listen('import-progress', (evt) => {
+                const p = evt.payload || {};
+                if (p.filesTotal) setStatus(`正在导入 ${p.filesDone || 0} / ${p.filesTotal}…`);
+            });
+            await window.__TAURI__.event.listen('extract-progress', (evt) => {
+                const p = evt.payload || {};
+                if (p.filesTotal) setStatus(`正在提取 ${p.filesDone || 0} / ${p.filesTotal}…`);
+            });
             await window.__TAURI__.event.listen('integrity-progress', (evt) => {
                 const p = evt.payload || {};
                 const bar = $('verify-bar');

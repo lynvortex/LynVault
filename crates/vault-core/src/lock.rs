@@ -76,8 +76,9 @@ impl LockState {
                 .as_secs_f64()
                 + LOCKOUT_SECONDS;
             // 同时记录单调时钟，防止系统时钟被回拨绕过
-            self.lock_until_monotonic =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECONDS as u64));
+            self.lock_until_monotonic = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECONDS as u64),
+            );
         }
     }
 

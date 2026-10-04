@@ -3,11 +3,11 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::Path;
 use zeroize::Zeroize;
 
 /// DoD 7-pass 擦除模式枚举（替代原 Box<dyn Fn> 堆分配）
@@ -59,8 +59,10 @@ pub(crate) fn dod_overwrite_range_progress(
     }
     // 2.3.0 修复：32 位平台上 u64 → usize 会截断导致只擦除部分数据，显式拒绝
     if length > usize::MAX as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "擦除区间超出本平台地址空间"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "擦除区间超出本平台地址空间",
+        ));
     }
     const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
     let length = length as usize;
@@ -111,8 +113,10 @@ pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::
     // 先检查是否为符号链接，确认文件长度
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "拒绝删除符号链接，跳过"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "拒绝删除符号链接，跳过",
+        ));
     }
     let length = meta.len();
 
@@ -122,11 +126,15 @@ pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::
 
     // 打开文件（Unix: O_NOFOLLOW, Windows: FILE_FLAG_OPEN_REPARSE_POINT）
     #[cfg(unix)]
-    let mut file = OpenOptions::new().write(true).truncate(false)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(false)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     #[cfg(windows)]
-    let mut file = OpenOptions::new().write(true).truncate(false)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(false)
         .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
         .open(path)?;
     #[cfg(not(any(unix, windows)))]
@@ -156,7 +164,11 @@ pub fn dod_erase(path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::
 /// 删除，不经路径，失败时回退 `remove_file`）；非 Windows 回退
 /// `remove_file`（此时数据已被覆写，残余风险仅为删除目标被替换，
 /// 无法造成保险柜内容泄露）。
-pub fn dod_erase_handle(file: File, path: &Path, progress_callback: Option<&dyn Fn(usize)>) -> io::Result<()> {
+pub fn dod_erase_handle(
+    file: File,
+    path: &Path,
+    progress_callback: Option<&dyn Fn(usize)>,
+) -> io::Result<()> {
     let length = file.metadata()?.len();
     let mut file = file;
     if length > 0 {

@@ -45,8 +45,7 @@ static GUARD_HWND: AtomicIsize = AtomicIsize::new(0);
 #[cfg_attr(not(windows), allow(dead_code))]
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg_attr(not(windows), allow(dead_code))]
-static THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(None);
+static THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 // 2.8.2（L6）防抖状态
 #[cfg_attr(not(windows), allow(dead_code))]
 static PENDING_CLEAR: AtomicBool = AtomicBool::new(false);
@@ -151,7 +150,8 @@ fn event_loop() {
             destroy_guard_window(hwnd);
             return;
         }
-        if unsafe { windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd) }.is_err()
+        if unsafe { windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd) }
+            .is_err()
         {
             log::warn!("AddClipboardFormatListener 失败，剪贴板保护未生效");
             destroy_guard_window(hwnd);
@@ -202,7 +202,10 @@ fn event_loop() {
         // start() 的死亡检测重新武装）
         rebuilds += 1;
         if rebuilds > 60 {
-            log::error!("剪贴板监听窗口反复异常退出（{} 次），放弃本会话重建", rebuilds);
+            log::error!(
+                "剪贴板监听窗口反复异常退出（{} 次），放弃本会话重建",
+                rebuilds
+            );
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -364,8 +367,7 @@ fn create_message_window() -> Result<windows::Win32::Foundation::HWND, String> {
     }
 
     // 类名随机化（pid + 启动纳秒 + 序号），销毁时按同名反注册
-    let class_name = guard_class_name();
-    let class_name = class_name; // Vec<u16>，NUL 结尾
+    let class_name = guard_class_name(); // Vec<u16>，NUL 结尾
     let class_name = PCWSTR(class_name.as_ptr());
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),

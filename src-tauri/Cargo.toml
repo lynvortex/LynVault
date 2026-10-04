@@ -1,30 +1,26 @@
 [package]
 name = "LynVault"
-version = "2.8.2"
+version = "3.0.0"
 edition = "2021"
 
 # 2.7.1：包名 lynvault-rs → LynVault —— 裸 `cargo build --release` 直接产出
 # target/release/LynVault.exe（此前为 lynvault-rs.exe，只有走 bundler 才会被
-# 重命名）。tauri-cli v1 的 app_binary_path() 按包名定位二进制，包名与产物名
-# 一致后该链路不受影响（bundler 的 rename_app 变为同名 no-op）。
+# 重命名）。
+
+# 3.0.0：Tauri 1.x → 2.x 迁移。
+# 权限模型变更：v1 的 allowlist feature 门控全部移除，改由
+# capabilities/default.json 声明（core / dialog / opener 三组权限集）。
+# 对话框与外部链接打开改走官方插件（v1 是内置 API）：
+# - tauri-plugin-dialog —— 文件/目录选择、消息框（后端 blocking API）
+# - tauri-plugin-opener —— 系统默认浏览器打开 GitHub 链接（替代 shell-open）
 
 [build-dependencies]
-tauri-build = { version = "1", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [
-    "dialog", "dialog-all",
-    "shell-open",
-    "window-center",
-    "window-close",
-    "window-maximize",
-    "window-minimize",
-    "window-start-dragging",
-    "window-unmaximize",
-    "window-set-resizable",
-    "window-set-size",
-    "window-set-title",
-] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 vault-core = { path = "../crates/vault-core" }
@@ -32,6 +28,9 @@ zeroize = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = { version = "0.4", features = ["std"] }
+# 3.0.0：可选硬件密钥二因子 —— PC/SC 封装（Windows winscard / Linux pcsc-lite），
+# YubiKey HMAC-SHA1 挑战-响应直连（见 src/yubikey.rs 的协议注释）
+pcsc = "2"
 # 2.8.2（L2/H2）：单实例令牌与对话框令牌的随机生成（OsRng）
 rand = "0.8"
 
@@ -40,6 +39,8 @@ rand = "0.8"
 # - Win32_System_DataExchange / Win32_System_Com —— 剪贴板保护（监听 + 即时清空）
 # - ApplicationModel_DataTransfer / Foundation —— WinRT Clipboard::ClearHistory（清 Win+V 历史）
 # - Win32_System_Power / Win32_System_RemoteDesktop —— 睡眠 / 锁屏 / 注销事件监听
+# 说明：本 crate 的 windows 0.57 与 Tauri 2 内部的 windows 版本并行共存
+#（cargo 允许 semver 不兼容多版本），HWND/HANDLE 跨版本转换在 main.rs 显式处理
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [
     "Win32_Foundation",
@@ -57,6 +58,10 @@ windows = { version = "0.57", features = [
     "Foundation",
 ] }
 winreg = "0.52"
+
+# 3.0.0（L-9）：配置临时文件的 O_NOFOLLOW 加固打开（Unix 侧）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 
 [features]

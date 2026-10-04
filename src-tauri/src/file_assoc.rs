@@ -50,7 +50,10 @@ pub fn register_if_absent() {
     let classes = match hkcu.open_subkey_with_flags("Software\\Classes", KEY_READ | KEY_WRITE) {
         Ok(k) => k,
         Err(e) => {
-            log::warn!("[LynVault] 打开注册表 Classes 失败，跳过 .lyt 关联注册: {}", e);
+            log::warn!(
+                "[LynVault] 打开注册表 Classes 失败，跳过 .lyt 关联注册: {}",
+                e
+            );
             return;
         }
     };
@@ -63,10 +66,9 @@ pub fn register_if_absent() {
     if let Ok(dot) = classes.open_subkey_with_flags(".lyt", KEY_READ) {
         if let Ok(existing) = dot.get_value::<String, _>("") {
             if existing.eq_ignore_ascii_case(PROG_ID) {
-                if let Ok(cmd_key) = classes.open_subkey_with_flags(
-                    format!("{}\\shell\\open\\command", PROG_ID),
-                    KEY_READ,
-                ) {
+                if let Ok(cmd_key) = classes
+                    .open_subkey_with_flags(format!("{}\\shell\\open\\command", PROG_ID), KEY_READ)
+                {
                     if let Ok(cmd) = cmd_key.get_value::<String, _>("") {
                         if cmd == format!("\"{}\" \"%1\"", exe_str) {
                             return;

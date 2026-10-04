@@ -1,0 +1,38 @@
+[package]
+name = "lynvault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+vault-core = { path = "../crates/vault-core" }
+
+# 防止 fuzz 产物被 workspace 配置干扰
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "office_parse"
+path = "fuzz_targets/office_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_probe"
+path = "fuzz_targets/header_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_json"
+path = "fuzz_targets/index_json.rs"
+test = false
+doc = false
+bench = false

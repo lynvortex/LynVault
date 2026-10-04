@@ -12,6 +12,9 @@ Thumbs.db
 .vscode/
 *.swp
 
+# Tauri 2 构建生成物（capabilities schema 快照）
+src-tauri/gen/
+
 # 打包产物 / 临时文件
 *.zip
 *.tar.gz
@@ -26,6 +29,9 @@ LynVault-*-linux-amd64
 # 本地保险柜与碎片整理临时文件
 *.lyt
 *.vault
+# 兼容性测试夹具例外（受版本控制的回归守卫）
+!crates/vault-core/tests/fixtures/v4_vault.lyt
+!crates/vault-core/tests/fixtures/v5_vault.lyt
 *.lyt.tmp.*
 *.vault.tmp.*
 *.lyt.bak.*

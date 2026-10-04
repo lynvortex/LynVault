@@ -1,0 +1,84 @@
+# LynVault CI 门禁
+#
+# 每次 push / PR 自动执行四道检查，任何一道失败即整次提交不合格：
+#   1. rustfmt   — 格式不规范（cargo fmt --check）
+#   2. clippy    — 隐患写法（-D warnings，警告即失败）
+#   3. test      — 全量测试（vault-core 在 Linux+Windows 双平台，
+#                  src-tauri 仅 Windows —— Tauri 1.x 在 Linux 需要
+#                  libwebkit2gtk-4.0，ubuntu-latest(24.04) 已无此包）
+#   4. deny      — 依赖漏洞（RustSEC）与许可证合规
+#
+# 工具链版本与 rust-toolchain.toml 保持一致，升级时两处同步修改。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            # Linux 无 webkit2gtk-4.0，只测纯 Rust 的 vault-core
+            cargo-args: "-p vault-core"
+          - os: windows-latest
+            # Windows 全 workspace（含 src-tauri 单元测试）
+            cargo-args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked ${{ matrix.cargo-args }}
+
+  deny:
+    name: Cargo-deny (advisories + licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.96.0"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # --offline 不适用（需拉取 advisory DB）；--locked 保证按提交的 lockfile 检查
+      - run: cargo deny --locked check advisories licenses sources

@@ -1,6 +1,6 @@
 [package]
 name = "vault-core"
-version = "2.8.2"
+version = "3.0.0"
 edition = "2021"
 
 [dependencies]
@@ -16,7 +16,12 @@ rand_chacha = "0.3"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# 3.0.0（审计修复）：开启 float_roundtrip —— 审计条目的 ts 是 f64（epoch 秒），
+# 链式 HMAC 覆盖 ts.to_le_bytes()。serde_json 默认的浮点解析快速路径对部分
+# 十进制表示会差 1 ULP：写入的 ts 经 JSON 往返后位模式改变 → 该条目 mac 校验
+# 必然失败 → from_entries 从那里截断整条链（表现为历史审计记录间歇性丢失，
+# 实测约 12% 的开柜命中）。开启后解析正确舍入，f64 精确往返。
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "1"
 byteorder = "1"
 log = "0.4"
@@ -43,4 +48,6 @@ sha1 = "0.10"
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # 3.0.0（审计加固）：LockedKey 驻留内存（VirtualLock/VirtualUnlock）
+    "Win32_System_Memory",
 ] }

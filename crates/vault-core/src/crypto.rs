@@ -6,9 +6,9 @@ pub const SIGNED_LENGTH: usize = 887;
 pub const SIGNATURE_OFFSET: usize = 960;
 pub const SIGNATURE_SIZE: usize = 64;
 
-use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::KeyInit as AesKeyInit;
+use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -80,7 +80,10 @@ pub fn derive_legacy_lock_key(
     if let Err(e) = argon2.hash_password_into(&combined, &lock_salt, &mut master) {
         combined.zeroize();
         lock_salt.zeroize();
-        return Err(VaultError::Other(format!("Argon2id 派生 legacy lock_key 失败: {}", e)));
+        return Err(VaultError::Other(format!(
+            "Argon2id 派生 legacy lock_key 失败: {}",
+            e
+        )));
     }
 
     let hkdf = Hkdf::<Sha256>::new(None, &master);
@@ -217,11 +220,15 @@ pub fn derive_kek(
 
 /// AES-256-GCM 加密，返回 nonce(12) || ciphertext
 /// `aad`：关联认证数据（绑定的上下文），解密时必须传入相同值
-pub fn encrypt_gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8], nonce: Option<&[u8]>) -> Result<Vec<u8>, VaultError> {
+pub fn encrypt_gcm(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+    nonce: Option<&[u8]>,
+) -> Result<Vec<u8>, VaultError> {
     // 2.5.1 修复：expect 改为错误传播（32 字节密钥实际恒有效，但保持加密
     // 关键路径零 panic 的纪律，避免任何上游重构引入长度错误时直接崩进程）
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|_| VaultError::EncryptFailed)?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| VaultError::EncryptFailed)?;
     let nonce = match nonce {
         Some(n) => Nonce::from_slice(n).to_owned(),
         None => {
@@ -230,8 +237,13 @@ pub fn encrypt_gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8], nonce: Option<&
             Nonce::from(n)
         }
     };
-    let payload = Payload { msg: plaintext, aad };
-    let ciphertext = cipher.encrypt(&nonce, payload).map_err(|_| VaultError::EncryptFailed)?;
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
+    let ciphertext = cipher
+        .encrypt(&nonce, payload)
+        .map_err(|_| VaultError::EncryptFailed)?;
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&ciphertext);
@@ -278,6 +290,7 @@ pub fn unwrap_data_key(kek: &[u8; 32], wrapped: &[u8], aad: &[u8]) -> Option<[u8
 /// 输出与 `decrypt_gcm` 完全一致的明文；认证失败返回 None（缓冲内容不再可信）。
 pub fn decrypt_into(key: &[u8; 32], mut data: Vec<u8>, aad: &[u8]) -> Option<Vec<u8>> {
     use aes_gcm::aead::AeadInPlace;
+    use zeroize::Zeroize;
     if data.len() < 12 + 16 {
         return None;
     }
@@ -286,7 +299,16 @@ pub fn decrypt_into(key: &[u8; 32], mut data: Vec<u8>, aad: &[u8]) -> Option<Vec
     let (ct, tag_bytes) = rest.split_at_mut(rest.len() - 16);
     let tag = aes_gcm::Tag::from_slice(tag_bytes);
     let nonce_arr: [u8; 12] = nonce.try_into().expect("nonce 长度已在上方检查为 12");
-    cipher.decrypt_in_place_detached((&nonce_arr).into(), aad, ct, tag).ok()?;
+    // L5（审计修复）：aes-gcm 先经 CTR 变换再验标签 —— 认证失败时缓冲**已含
+    // 明文等价的 keystream 输出**，直接 drop 会残留；就地清零后再返回 None
+    //（这恰是最该干净的路径：密文被篡改 / 密钥错误）。
+    if cipher
+        .decrypt_in_place_detached((&nonce_arr).into(), aad, ct, tag)
+        .is_err()
+    {
+        data.zeroize();
+        return None;
+    }
     // 就地收缩为明文：截掉尾部 tag、移除头部 nonce（一次前移拷贝）
     let plain_len = ct.len();
     data.truncate(12 + plain_len);
@@ -297,11 +319,7 @@ pub fn decrypt_into(key: &[u8; 32], mut data: Vec<u8>, aad: &[u8]) -> Option<Vec
 /// 2.8.1：消费明文缓冲就地加密，输出 `nonce(12) || ciphertext || tag(16)` ——
 /// 与 `encrypt_gcm` 的线格式逐字节一致（AAD/密钥相同时可互换），
 /// 但省去一次全尺寸密文拷贝（明文缓冲被移动复用）。
-pub fn encrypt_into(
-    key: &[u8; 32],
-    mut plain: Vec<u8>,
-    aad: &[u8],
-) -> Result<Vec<u8>, VaultError> {
+pub fn encrypt_into(key: &[u8; 32], mut plain: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, VaultError> {
     use aes_gcm::aead::AeadInPlace;
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| VaultError::EncryptFailed)?;
     let mut nonce = [0u8; 12];
@@ -322,14 +340,16 @@ pub fn encrypt_into(
 /// 兼容打开 2.6.1 之前创建的保险柜，并在首次成功打开时自动迁移。
 pub fn create_auth_tag(auth_key: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key)
-            .expect("HMAC-SHA256 接受任意长度密钥，构造不可失败");
+        .expect("HMAC-SHA256 接受任意长度密钥，构造不可失败");
     mac.update(b"AUTH_OK");
     mac.finalize().into_bytes().into()
 }
 
 /// 验证旧格式认证标签（恒定时间比较）
 pub fn verify_auth_tag(auth_key: &[u8], tag: &[u8]) -> bool {
-    if tag.len() < 32 { return false; }
+    if tag.len() < 32 {
+        return false;
+    }
     let expected = create_auth_tag(auth_key);
     // 恒定时间比较，防止计时攻击
     use subtle::ConstantTimeEq;
@@ -362,7 +382,7 @@ pub fn create_auth_tag_bound(
     entry_salt: &[u8],
 ) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key)
-            .expect("HMAC-SHA256 接受任意长度密钥，构造不可失败");
+        .expect("HMAC-SHA256 接受任意长度密钥，构造不可失败");
     mac.update(DOMAIN_AUTH_TAG_BOUND);
     mac.update(header_prefix);
     mac.update(entry_alias);
@@ -380,7 +400,9 @@ pub fn verify_auth_tag_bound(
     entry_salt: &[u8],
     tag: &[u8],
 ) -> bool {
-    if tag.len() < 32 { return false; }
+    if tag.len() < 32 {
+        return false;
+    }
     use subtle::ConstantTimeEq;
     let bound = create_auth_tag_bound(auth_key, header_prefix, entry_alias, entry_salt);
     let legacy = create_auth_tag(auth_key);
@@ -408,4 +430,58 @@ pub fn verify_header_signature(header: &[u8], sign_key: &[u8]) -> bool {
     let computed = compute_header_signature(payload, sign_key);
     use subtle::ConstantTimeEq;
     computed.ct_eq(stored_sig).into()
+}
+
+/// 3.0.0（v6 流式布局）：分块密文的 AAD ——
+/// 域分隔 || 冻结 vpath（导入时的 aad_tag）|| 块序号 u64_le || 总块数 u64_le。
+///
+/// v6 的每个文件按 [`crate::vault`] 的 CHUNK_SIZE_V6 分块，每块独立
+/// `nonce(12) || ct || tag(16)`。把块序号与总块数纳入 AAD 后：
+/// - 删除/截断任一块 → 解密该块后校验总块数与序号仍通过，但最终长度不匹配
+///   会失败（总块数参与每块 AAD，篡改任一块的计数都需要重写整文件全部标签）；
+/// - 块交换/块拼接（把 A 文件的块挪进 B 文件）→ 冻结 vpath 不匹配必然认证失败；
+/// - 与 Legacy 布局（整段 GCM，AAD = 冻结 vpath）域分离，两种布局互不可互换。
+pub fn chunk_aad(frozen_vpath: &str, chunk_index: u64, chunk_count: u64) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"LYNVAULT-CHUNK-V6";
+    let mut aad = Vec::with_capacity(DOMAIN.len() + frozen_vpath.len() + 16);
+    aad.extend_from_slice(DOMAIN);
+    aad.extend_from_slice(frozen_vpath.as_bytes());
+    aad.extend_from_slice(&chunk_index.to_le_bytes());
+    aad.extend_from_slice(&chunk_count.to_le_bytes());
+    aad
+}
+
+// ─────────────── 3.0.0（可选硬件密钥二因子）───────────────
+//
+// 设计（零格式变更）：
+// - 挑战不落盘 —— 从公开的保险柜盐 HKDF 派生（[`derive_yubikey_challenge`]），
+//   安全性完全落在「响应只有物理钥匙能算」（HMAC-SHA1 密钥存于 YubiKey 内部）；
+// - 响应不落盘 —— 启用二因子的分区，其 data_key 的包裹密钥在 KEK 之上再与
+//   响应混合（[`mix_kek_with_response`]，HKDF 域分离），即「双重包裹」的
+//   等效形态，头部条目结构不变；
+// - 打开时对每个条目先试「混合 KEK」（若提供了响应）再试「普通 KEK」——
+//   两次 GCM 解包开销可忽略，普通分区与二因子分区共存，无需任何标志位。
+
+/// 派生 YubiKey 挑战（64 字节 —— YubiKey HMAC-SHA1 挑战-响应的最大挑战长度）。
+/// 挑战由公开的保险柜盐确定派生：同一保险柜每次开柜挑战一致，响应由钥匙计算。
+pub fn derive_yubikey_challenge(vault_salt: &[u8; 32]) -> [u8; 64] {
+    let hkdf = Hkdf::<Sha256>::new(None, vault_salt);
+    let mut challenge = [0u8; 64];
+    hkdf.expand(b"lynvault-yubikey-challenge-v1", &mut challenge)
+        .expect("HKDF expand 64 字节恒在合法范围");
+    challenge
+}
+
+/// 把 YubiKey 响应（20 字节 HMAC-SHA1）混合进 KEK —— 启用二因子的分区
+/// 用混合后的 KEK 包裹 data_key。域分离确保与普通 KEK 派生不可混淆。
+pub fn mix_kek_with_response(kek: &[u8; 32], response: &[u8; 20]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha512>::new(None, kek);
+    // 响应拼入 info 域（域分隔 || 响应），与普通 KEK 扩展不可混淆
+    let mut info = Vec::with_capacity(23 + 20);
+    info.extend_from_slice(b"lynvault-yk-kek-mix-v1");
+    info.extend_from_slice(response);
+    let mut mixed = [0u8; 32];
+    hkdf.expand(&info, &mut mixed)
+        .expect("HKDF expand 32 字节恒在合法范围");
+    mixed
 }

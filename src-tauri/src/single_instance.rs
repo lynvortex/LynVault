@@ -144,9 +144,22 @@ fn si_config() -> SiConfig {
 /// （普通 UNC 或 `\\.\` 设备命名空间）即拒绝。`\\?\C:\...` verbatim 本地路径放行。
 pub fn is_remote_or_device_path(p: &str) -> bool {
     let t = p.trim().trim_matches('"');
-    let t = if t.contains('/') { t.replace('/', "\\") } else { t.to_string() };
+    let t = if t.contains('/') {
+        t.replace('/', "\\")
+    } else {
+        t.to_string()
+    };
     let t = t.strip_prefix(r"\\?\").unwrap_or(&t).to_string();
-    if t.len() >= 4 && t[..4].eq_ignore_ascii_case("UNC\\") {
+    // 2.8.2 后续修复：按字节比较 —— t[..4] 在多字节 UTF-8 路径（如中文目录）
+    // 上会切在字符边界内直接 panic；"UNC\" 全 ASCII，字节级忽略大小写比较等价
+    let b = t.as_bytes();
+    if b.len() >= 4 && b[..4].eq_ignore_ascii_case(b"UNC\\") {
+        return true;
+    }
+    // 3.0.0（L-12 审计修复）：GLOBALROOT 设备命名空间同样拒绝 ——
+    // `\\?\GLOBALROOT\Device\...` 剥掉 verbatim 前缀后剩 `GLOBALROOT\...`，
+    // 旧实现只查 UNC\ 与 \\ 开头会放行这条设备路径缝
+    if b.len() >= 10 && b[..10].eq_ignore_ascii_case(b"GLOBALROOT\\") {
         return true;
     }
     t.starts_with(r"\\")
@@ -159,7 +172,8 @@ fn looks_like_vault(p: &str) -> bool {
         return false;
     }
     let path = Path::new(p);
-    let ext_ok = path.extension()
+    let ext_ok = path
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("lyt") || e.eq_ignore_ascii_case("vault"))
         .unwrap_or(false);
@@ -191,7 +205,10 @@ pub fn acquire_or_forward(args: Vec<String>) -> bool {
             } else {
                 // 被无关程序占用 / 令牌不符 → 放弃单实例能力，正常启动
                 //（2.8.2/L2：令牌校验失败一律不发送路径并继续正常启动）
-                log::warn!("单实例端口 {} 被无关程序占用或握手失败，降级为普通启动", cfg.port);
+                log::warn!(
+                    "单实例端口 {} 被无关程序占用或握手失败，降级为普通启动",
+                    cfg.port
+                );
                 true
             }
         }
@@ -218,7 +235,11 @@ fn try_forward(args: &[String], cfg: &SiConfig) -> bool {
 
     // 2. 发送保险柜路径（无则空行）
     let vault = extract_vault_arg(args.iter().cloned()).unwrap_or_default();
-    if reader.get_mut().write_all(format!("{}\n", vault).as_bytes()).is_err() {
+    if reader
+        .get_mut()
+        .write_all(format!("{}\n", vault).as_bytes())
+        .is_err()
+    {
         return false;
     }
 
@@ -293,12 +314,21 @@ fn handle_connection(handle: &AppHandle, stream: TcpStream, expected_token: &str
     // 1. 握手：必须为 "PROTO_HELLO <token>" 且令牌逐字节一致
     //（(&mut reader) 显式借用 —— 直接 reader.take() 会移动 reader）
     let mut hello = String::new();
-    if (&mut reader).take(MAX_LINE_BYTES).read_line(&mut hello).is_err() {
+    if (&mut reader)
+        .take(MAX_LINE_BYTES)
+        .read_line(&mut hello)
+        .is_err()
+    {
         return;
     }
     let mut parts = hello.split_whitespace();
-    let proto_ok = parts.next() == Some(PROTO_HELLO);
-    let token_ok = parts.next() == Some(expected_token);
+    // 3.0.0（L-7）：令牌核对恒定时间（与对话框令牌同一整理）
+    let proto_ok = parts
+        .next()
+        .is_some_and(|p| crate::commands::ct_eq_str(p, PROTO_HELLO));
+    let token_ok = parts
+        .next()
+        .is_some_and(|t| crate::commands::ct_eq_str(t, expected_token));
     if !proto_ok || !token_ok {
         return; // 令牌不符直接断开（无回执、无路径）
     }
@@ -308,7 +338,11 @@ fn handle_connection(handle: &AppHandle, stream: TcpStream, expected_token: &str
 
     // 2. 读路径行（2.5.1：限制单行长度；(&mut reader) 显式借用避免移动）
     let mut path_line = String::new();
-    if (&mut reader).take(MAX_LINE_BYTES).read_line(&mut path_line).is_err() {
+    if (&mut reader)
+        .take(MAX_LINE_BYTES)
+        .read_line(&mut path_line)
+        .is_err()
+    {
         return;
     }
 
@@ -316,7 +350,11 @@ fn handle_connection(handle: &AppHandle, stream: TcpStream, expected_token: &str
     //    非法路径也回 OK，双击方拿「成功」回执退出后什么都没发生）。
     //    非法路径回 ERR → 对端降级为正常启动（窗口可见，不会静默消失）。
     let path = path_line.trim().to_string();
-    let reply = if path.is_empty() || looks_like_vault(&path) { "OK\n" } else { "ERR\n" };
+    let reply = if path.is_empty() || looks_like_vault(&path) {
+        "OK\n"
+    } else {
+        "ERR\n"
+    };
     let _ = reader.get_mut().write_all(reply.as_bytes());
     drop(reader);
 
@@ -334,7 +372,7 @@ fn handle_connection(handle: &AppHandle, stream: TcpStream, expected_token: &str
 /// Windows 下 `SetForegroundWindow` 对非前台进程有限制：先短暂置顶再聚焦后
 /// 取消，避免只闪任务栏图标。
 pub fn focus_existing_window(handle: &AppHandle) {
-    if let Some(win) = handle.get_window("main") {
+    if let Some(win) = handle.get_webview_window("main") {
         let _ = win.show();
         let _ = win.unminimize();
         #[cfg(windows)]
@@ -364,7 +402,7 @@ fn handle_vault_request(handle: &AppHandle, path: String) {
         return;
     }
     focus_existing_window(handle);
-    if let Err(e) = handle.emit_all("vault-file-requested", path) {
+    if let Err(e) = tauri::Emitter::emit(handle, "vault-file-requested", path) {
         log::warn!("发送 vault-file-requested 失败: {}", e);
     }
 }

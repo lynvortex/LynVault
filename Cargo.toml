@@ -16,3 +16,6 @@ members = [
 lto = "thin"
 strip = true
 codegen-units = 1
+# 3.0.0（R1 审计加固）：release 下整数溢出 panic 而非静默回绕 —— 安全产品中
+# 回绕的代价远高于检查开销；代码已有大量 checked/saturating，此为兜底保险
+overflow-checks = true

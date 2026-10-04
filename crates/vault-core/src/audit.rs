@@ -1,7 +1,7 @@
 //! 防篡改审计日志（链式 HMAC）
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use serde::{Serialize, Deserialize};
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,12 @@ impl AuditLog {
     /// 2.8.2：恢复时是否丢弃过尾部条目（打开路径据此告警）
     pub fn is_truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// 3.0.0（审计锚点）：外部校验（头部计数 vs 索引条目数）检出异常时置位
+    /// —— 与 HMAC 链断链共用同一告警通道。
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 
     pub fn add(&mut self, event: &str) {

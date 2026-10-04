@@ -1,0 +1,44 @@
+# cargo-deny 配置 —— CI 的第 4 道门禁（依赖漏洞 + 许可证 + 来源）
+# 文档：https://embarkstudios.github.io/cargo-deny/
+
+# ── 依赖安全公告（RustSEC）─────────────────────────────────────────────
+# yanked 的 crate 直接拒绝（lockfile 里出现已被撤回的版本说明依赖树有问题）。
+# 漏洞（vulnerability）类公告在所有版本中默认即为 deny，无需重复配置。
+# 如某条公告经评估不适用（如漏洞仅在未启用的 feature 中），在此列出并注明原因：
+[advisories]
+yanked = "deny"
+ignore = [
+  # 示例：
+  # { id = "RUSTSEC-0000-0000", reason = "仅影响未启用的 xxx feature" },
+]
+
+# ── 许可证合规 ────────────────────────────────────────────────────────
+# 本项目为 MIT。依赖树中允许出现的宽松许可证白名单：
+# 出现不在白名单内的许可证时 CI 报错，届时人工评估后决定加入或更换依赖。
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "0BSD",
+  "Zlib",
+  "BSL-1.0",
+  "CC0-1.0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+]
+
+# ── 重复依赖版本 ──────────────────────────────────────────────────────
+# 同一 crate 多版本并存只警告（依赖树常见且多数无害），不阻断：
+[bans]
+multiple-versions = "warn"
+
+# ── 来源校验 ──────────────────────────────────────────────────────────
+# 只允许 crates.io 与官方 registry，禁止 git 直引等不可审计来源：
+[sources]
+unknown-registry = "deny"
+unknown-source = "deny"

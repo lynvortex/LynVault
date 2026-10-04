@@ -16,7 +16,7 @@ pub const CONFIG_FILE_NAME: &str = "settings.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    /// 主题：blue（默认）/ purple / gold / cyan
+    /// 主题：vivid（默认，3.0.0 图标配色）/ blue / purple / gold / cyan
     #[serde(default = "default_theme")]
     pub theme: String,
     /// 空闲自动锁定时长（分钟，0 = 禁用）
@@ -32,16 +32,31 @@ pub struct Settings {
 }
 
 fn default_theme() -> String {
-    "blue".into()
+    "vivid".into()
 }
 fn default_autolock() -> u32 {
     2
 }
 fn default_width() -> f64 {
-    960.0
+    // 3.0.0：仅作 serde 缺字段兜底；全新配置 / 启动兜底的窗口尺寸一律走
+    // adaptive_window_size（主显示器自适应），与前端「还原默认」同一语义
+    1024.0
 }
 fn default_height() -> f64 {
-    620.0
+    675.0
+}
+
+/// 3.0.0：默认窗口尺寸的自适应公式 —— 与前端 app.js 的 adaptiveWindowSize()
+/// 逐字节同语义（入参为主显示器**逻辑**尺寸）：宽 = min(屏宽 60%, 1024)，
+/// 高 = min(宽 66%, 屏高 80%)，高度受限时按 3:2 反推宽度。
+/// 两端必须同步修改，否则「启用持久化后窗口尺寸跳变」会复发。
+pub fn adaptive_window_size(monitor_w: f64, monitor_h: f64) -> (f64, f64) {
+    let mut width = (monitor_w * 0.6).min(1024.0).floor();
+    let height = (width * 0.66).min(monitor_h * 0.8).floor();
+    if height < (width * 0.66).floor() {
+        width = (height * 1.5).floor();
+    }
+    (width, height)
 }
 fn default_true() -> bool {
     true
@@ -62,8 +77,11 @@ impl Default for Settings {
 impl Settings {
     /// 约束非法取值（窗口尺寸过小 / 时长越界 / 未知主题名一律回退默认）
     pub fn sanitized(mut self) -> Self {
-        if !matches!(self.theme.as_str(), "blue" | "purple" | "gold" | "cyan") {
-            self.theme = "blue".into();
+        if !matches!(
+            self.theme.as_str(),
+            "blue" | "purple" | "gold" | "cyan" | "vivid"
+        ) {
+            self.theme = "vivid".into();
         }
         if self.autolock_minutes > 240 {
             self.autolock_minutes = 240;
@@ -99,7 +117,8 @@ pub fn appdata_config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    base.map(|b| b.join("LynVault")).map(|d| d.join(CONFIG_FILE_NAME))
+    base.map(|b| b.join("LynVault"))
+        .map(|d| d.join(CONFIG_FILE_NAME))
 }
 
 /// 当前生效的配置路径（便携优先；都不存在时 None = 未启用持久化）。
@@ -129,20 +148,68 @@ pub fn load_active() -> Option<(PathBuf, Settings)> {
 /// 把配置写入指定位置（目录不存在则创建）。返回写入路径。
 pub fn save_to(location: ConfigLocation, settings: &Settings) -> Result<PathBuf, String> {
     let path = match location {
-        ConfigLocation::Portable => portable_config_path()
-            .ok_or_else(|| "无法确定程序所在目录".to_string())?,
+        ConfigLocation::Portable => {
+            portable_config_path().ok_or_else(|| "无法确定程序所在目录".to_string())?
+        }
         ConfigLocation::AppData => {
-            let dir = appdata_config_path()
-                .ok_or_else(|| "无法确定用户配置目录".to_string())?;
+            let dir = appdata_config_path().ok_or_else(|| "无法确定用户配置目录".to_string())?;
             if let Some(parent) = dir.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("创建配置目录失败: {}", e))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
             }
             dir
         }
     };
     save_at(&path, settings)?;
     Ok(path)
+}
+
+/// 3.0.0（L-9）：临时文件加固打开 —— 不跟随符号链接 + 句柄级校验
+/// 「非重解析点 + 硬链接数为 1」，校验失败放弃写入（防链接注入受害者文件）。
+#[cfg(windows)]
+fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(tmp)?;
+    // 句柄级确认（与 main.rs 日志写入同一套检查）
+    {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let ok =
+            unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle() as isize), &mut info) }
+                .map(|_| info.nNumberOfLinks == 1)
+                .unwrap_or(false);
+        let attrs = f.metadata().map(|m| m.file_attributes()).unwrap_or(0xFFFF);
+        if !ok || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "配置临时文件校验失败（疑似符号链接/硬链接注入）",
+            ));
+        }
+    }
+    Ok(f)
+}
+
+#[cfg(not(windows))]
+fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW：拒绝指向已有符号链接的目标
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(tmp)
 }
 
 /// 把配置写到指定路径（save_settings 更新现有配置时使用）
@@ -152,21 +219,31 @@ pub fn save_to(location: ConfigLocation, settings: &Settings) -> Result<PathBuf,
 pub fn save_at(path: &std::path::Path, settings: &Settings) -> Result<(), String> {
     use std::io::Write;
     let sanitized = settings.clone().sanitized();
-    let json = serde_json::to_string_pretty(&sanitized)
-        .map_err(|e| format!("序列化配置失败: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(&sanitized).map_err(|e| format!("序列化配置失败: {}", e))?;
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| format!("配置目录不可写（{}）。便携模式请把程序放到可写位置，或改用用户目录", e))?;
+        // 3.0.0（L-9 审计修复）：临时文件改为「不跟随符号链接」打开 + 句柄级校验
+        // 「非重解析点 + 硬链接数为 1」—— 与日志文件（main.rs M5）同一威胁模型：
+        // 预置符号链接/硬链接把配置写入（或 rename 覆盖）指向受害者文件。
+        // 固定名 + File::create（跟随链接）正是 M5 修过的原语。
+        let mut f = open_tmp_secure(&tmp).map_err(|e| {
+            format!(
+                "配置目录不可写（{}）。便携模式请把程序放到可写位置，或改用用户目录",
+                e
+            )
+        })?;
         f.write_all(json.as_bytes())
             .map_err(|e| format!("配置写入失败: {}", e))?;
-        f.sync_all()
-            .map_err(|e| format!("配置落盘失败: {}", e))?;
+        f.sync_all().map_err(|e| format!("配置落盘失败: {}", e))?;
     }
     // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖已存在目标
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("配置写入失败（{}）。便携模式请把程序放到可写位置，或改用用户目录", e)
+        format!(
+            "配置写入失败（{}）。便携模式请把程序放到可写位置，或改用用户目录",
+            e
+        )
     })
 }
 
@@ -191,7 +268,7 @@ mod tests {
             anti_screenshot: false,
         }
         .sanitized();
-        assert_eq!(s.theme, "blue");
+        assert_eq!(s.theme, "vivid");
         assert_eq!(s.autolock_minutes, 240);
         assert_eq!(s.window_width, 480.0);
         assert_eq!(s.window_height, 2160.0);
@@ -206,7 +283,8 @@ mod tests {
         let s = Settings::default();
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.theme, "blue");
-        assert_eq!(back.window_width, 960.0);
+        assert_eq!(back.theme, "vivid");
+        assert_eq!(back.window_width, 1024.0);
+        assert_eq!(back.window_height, 675.0);
     }
 }
