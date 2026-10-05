@@ -1,22 +1,31 @@
-# LynVault Fuzz 冒烟（3.0.0 优化4）
+# LynVault Fuzz（3.0.1 F25 重构）
 #
-# 每周定时 + 手动触发：nightly + cargo-fuzz，每靶 60 秒。
-# 发现崩溃时把 fuzz/artifacts 目录（含崩溃输入）作为 artifact 上传。
-
+# - 每周定时 + 手动：每靶 60 秒冒烟，发现崩溃上传 artifact
+# - PR 冒烟：index_layout（3.0.1 新增算术靶）30 秒，防算术回归入库
+# - 3.0.1 修复：从仓库根用 --fuzz-dir 运行，crash artifact 落在
+#   fuzz/artifacts/<target>/，与 upload path 严格匹配（旧实现 working-directory
+#   + 相对 path 的组合使崩溃输入从未被上传，if-no-files-found: ignore 掩盖了
+#   这一点）；工具链固定 + --locked 保证可复现
 name: fuzz
 
 on:
   schedule:
     - cron: "0 3 * * 1" # 每周一 03:00 UTC
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/vault-core/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
 
 jobs:
   fuzz:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [office_parse, header_probe, index_json]
+        target: [office_parse, header_probe, index_json, index_layout]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -28,12 +37,40 @@ jobs:
           workspaces: |
             fuzz
       - name: Fuzz (${{ matrix.target }}, 60s smoke)
-        working-directory: fuzz
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2560
+        run: |
+          # cargo-fuzz 自动使用并回填 fuzz/corpus/<target>（种子语料已入库）
+          cargo fuzz run ${{ matrix.target }} --fuzz-dir fuzz \
+            -- -max_total_time=60 -rss_limit_mb=2560
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts
-          if-no-files-found: ignore
+          if-no-files-found: warn
+
+  pr-smoke:
+    # PR 冒烟：只跑轻量算术靶（不依赖 nightly 长时间运行）
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            fuzz
+      - name: Fuzz smoke (index_layout, 30s)
+        run: |
+          cargo fuzz run index_layout --fuzz-dir fuzz \
+            -- -max_total_time=30 -rss_limit_mb=2560
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-index_layout
+          path: fuzz/artifacts
+          if-no-files-found: warn

@@ -36,3 +36,10 @@ path = "fuzz_targets/index_json.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "index_layout"
+path = "fuzz_targets/index_layout.rs"
+test = false
+doc = false
+bench = false

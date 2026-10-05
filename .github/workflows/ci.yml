@@ -3,9 +3,10 @@
 # 每次 push / PR 自动执行四道检查，任何一道失败即整次提交不合格：
 #   1. rustfmt   — 格式不规范（cargo fmt --check）
 #   2. clippy    — 隐患写法（-D warnings，警告即失败）
-#   3. test      — 全量测试（vault-core 在 Linux+Windows 双平台，
-#                  src-tauri 仅 Windows —— Tauri 1.x 在 Linux 需要
-#                  libwebkit2gtk-4.0，ubuntu-latest(24.04) 已无此包）
+#   3. test      — 全量测试（vault-core 在 Linux+Windows 双平台；
+#                  3.0.1（F25）：Linux 门禁升级 webkit2gtk-4.1（Tauri 2），
+#                  src-tauri 在 Linux 恢复编译与测试 —— 旧说明按 Tauri 1.x
+#                  的 4.0 包写，属过期门禁，src-tauri 曾在 Linux 完全无测试）
 #   4. deny      — 依赖漏洞（RustSEC）与许可证合规
 #
 # 工具链版本与 rust-toolchain.toml 保持一致，升级时两处同步修改。
@@ -55,10 +56,8 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            # Linux 无 webkit2gtk-4.0，只测纯 Rust 的 vault-core
-            cargo-args: "-p vault-core"
+            cargo-args: ""
           - os: windows-latest
-            # Windows 全 workspace（含 src-tauri 单元测试）
             cargo-args: ""
     runs-on: ${{ matrix.os }}
     steps:
@@ -66,11 +65,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: "1.96.0"
+      - name: Install Linux system deps (Tauri 2 / webkit2gtk-4.1)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked ${{ matrix.cargo-args }}
 
   deny:
-    name: Cargo-deny (advisories + licenses)
+    name: Cargo-deny (advisories + bans + licenses)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,4 +85,6 @@ jobs:
         with:
           tool: cargo-deny
       # --offline 不适用（需拉取 advisory DB）；--locked 保证按提交的 lockfile 检查
-      - run: cargo deny --locked check advisories licenses sources
+      # 3.0.1（F25）：补上 bans 检查 —— deny.toml 已配置 multiple-versions
+      # 策略但从未被执行
+      - run: cargo deny --locked check advisories bans licenses sources
