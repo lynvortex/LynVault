@@ -7,16 +7,20 @@
 # 如某条公告经评估不适用（如漏洞仅在未启用的 feature 中），在此列出并注明原因：
 [advisories]
 yanked = "deny"
+# 3.0.1 CI 修复：ignore 一律用**纯字符串**形式，忽略原因写在上方注释 ——
+# map 形式（{ id = ..., reason = ... }）依赖较新的 cargo-deny schema，
+# 旧版 cargo-deny 直接反序列化失败（TOML parse error: invalid type: map,
+# expected a string），字符串形式则新旧版本通用。
 ignore = [
-  # proc-macro-error 失维护（RUSTSEC-2024-0370）：无可用升级，仅经
+  # RUSTSEC-2024-0370（proc-macro-error 失维护）：无可用升级，仅经
   # glib-macros → gtk 传入（Tauri 2 的 Linux/GTK 构建专属依赖链），
   # Windows 发布产物不受影响；待 gtk-rs/tauri 上游换用替代宏库后移除。
-  { id = "RUSTSEC-2024-0370", reason = "仅 Linux GTK 链路传入，无可用升级，上游跟进中" },
-  # glib 0.18.5 unsound（RUSTSEC-2024-0429）：3.0.1（#41）补记录 —— 无可用
-  # 升级（0.18 系列无修复版），仅经 Tauri 2 的 Linux/GTK 链路传入（glib →
+  "RUSTSEC-2024-0370",
+  # RUSTSEC-2024-0429（glib 0.18.5 unsound）：#41 补记录 —— 无可用升级
+  #（0.18 系列无修复版），仅经 Tauri 2 的 Linux/GTK 链路传入（glib →
   # gtk），Windows 发布产物不受影响；soundness 缺陷在本项目的使用面
   #（信号/对象包装）未触及。跟踪 gtk-rs 上游升级后移除。
-  { id = "RUSTSEC-2024-0429", reason = "glib 0.18 无修复版，仅 Linux GTK 链路，使用面未触及缺陷" },
+  "RUSTSEC-2024-0429",
 ]
 
 # ── 许可证合规 ────────────────────────────────────────────────────────
