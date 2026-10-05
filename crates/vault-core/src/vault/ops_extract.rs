@@ -254,7 +254,7 @@ impl Vault {
         use std::io::{Read, Seek, SeekFrom};
         use zeroize::Zeroize;
 
-        let (offset, aad_tag, layout, size) = {
+        let (offset, aad_tag, layout, size, length) = {
             let index = self.cached_index.as_ref().ok_or(VaultError::NotOpen)?;
             let meta = index
                 .files
@@ -265,6 +265,7 @@ impl Vault {
                 meta.aad_tag.clone(),
                 meta.layout.clone(),
                 meta.size,
+                meta.length,
             )
         };
         let (chunk_size, chunk_count) = match layout {
@@ -278,9 +279,6 @@ impl Vault {
                 ))
             }
         };
-        if chunk_size == 0 || chunk_count == 0 {
-            return Err(VaultError::Other("分块布局参数非法".into()));
-        }
         // 边界与窗口上限（双保险：协议层也已限制）
         const MAX_WINDOW: u64 = 64 * 1024 * 1024;
         if start >= size || end_excl <= start {
@@ -291,30 +289,12 @@ impl Vault {
             return Err(VaultError::Other("单次请求窗口过大".into()));
         }
 
-        // 末块明文长度（与 read_decrypt_file_data_layout 同一套 checked 校验）
-        let overhead = 28u64;
-        let full_ct = chunk_size
-            .checked_add(overhead)
-            .ok_or_else(|| VaultError::Other("分块布局参数非法".into()))?;
-        let full_ct_total = full_ct
-            .checked_mul(chunk_count - 1)
-            .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?;
-        let cipher_len = {
-            let index = self.cached_index.as_ref().ok_or(VaultError::NotOpen)?;
-            index.files.get(vpath).map(|m| m.length).unwrap_or(0)
-        };
-        let expected_last = match cipher_len.checked_sub(full_ct_total) {
-            Some(v) if v > overhead && v <= full_ct => v - overhead,
-            _ => {
-                return Err(VaultError::Other(
-                    "分块密文长度与索引布局不一致（密文可能被截断或篡改）".into(),
-                ))
-            }
-        };
+        // 3.0.1（F3）：统一布局解析（chunk_size 上限 + 末块校验 + 全 checked）
+        let plan = resolve_chunk_plan(length, chunk_size, chunk_count)?;
 
-        let first = start / chunk_size;
-        let last = (end - 1) / chunk_size;
-        if last >= chunk_count {
+        let first = start / plan.chunk_size;
+        let last = (end - 1) / plan.chunk_size;
+        if last >= plan.chunk_count {
             return Err(VaultError::Other("请求区间越界".into()));
         }
         let frozen = aad_tag.unwrap_or_else(|| vpath.to_string());
@@ -322,26 +302,41 @@ impl Vault {
         let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
 
         let mut out = Vec::with_capacity((end - start) as usize);
-        let mut pos = offset + first * full_ct;
+        // 3.0.1（F4）：偏移算术全 checked —— 旧实现 `offset + first * full_ct`
+        // 未检查，溢出在 release（overflow-checks=true）下 panic
+        let mut pos = offset
+            .checked_add(
+                first
+                    .checked_mul(plan.full_ct)
+                    .ok_or_else(|| VaultError::Other("媒体区间算术溢出".into()))?,
+            )
+            .ok_or_else(|| VaultError::Other("媒体区间算术溢出".into()))?;
         for i in first..=last {
-            let plain_n = if i + 1 == chunk_count {
-                expected_last
-            } else {
-                chunk_size
-            };
-            let ct_len = plain_n + overhead;
+            let ct_len = plan.ct_len(i);
             file.seek(SeekFrom::Start(pos))?;
             let mut enc = vec![0u8; ct_len as usize];
             file.read_exact(&mut enc)?;
-            let mut plain = decrypt_into(enc_key, enc, &chunk_aad(&frozen, i, chunk_count))
+            let mut plain = decrypt_into(enc_key, enc, &chunk_aad(&frozen, i, plan.chunk_count))
                 .ok_or(VaultError::DecryptFailed)?;
-            // 本块明文区间 [i*cs, i*cs+plain_n) 与请求区间 [start, end) 的交集
-            let chunk_plain_lo = i * chunk_size;
-            let lo = start.max(chunk_plain_lo) - chunk_plain_lo;
-            let hi = end.min(chunk_plain_lo + plain_n) - chunk_plain_lo;
+            // 本块明文区间 [i*cs, i*cs+plain_n) 与请求区间 [start, end) 的交集。
+            // 3.0.1（F4）：切片前显式 sanity —— 旧实现索引谎报 size 时
+            // `lo > hi` 直接 `panic: slice index starts at ... but ends at ...`
+            //（普通切片越界不受 overflow-checks 保护，每请求一次 DoS）
+            let chunk_plain_lo = i
+                .checked_mul(plan.chunk_size)
+                .ok_or_else(|| VaultError::Other("媒体区间算术溢出".into()))?;
+            let lo = start.saturating_sub(chunk_plain_lo);
+            let hi = end.saturating_sub(chunk_plain_lo).min(plan.plain_len(i));
+            if lo > hi || hi as usize > plain.len() {
+                return Err(VaultError::Other(
+                    "媒体区间与分块布局不一致（索引可能被篡改）".into(),
+                ));
+            }
             out.extend_from_slice(&plain[lo as usize..hi as usize]);
             plain.zeroize();
-            pos += ct_len;
+            pos = pos
+                .checked_add(ct_len)
+                .ok_or_else(|| VaultError::Other("媒体区间算术溢出".into()))?;
         }
         Ok(out)
     }
@@ -423,7 +418,15 @@ impl Vault {
                 })
                 .collect()
         };
-        let total_bytes: u64 = file_infos.iter().map(|f| f.5).sum();
+        // 3.0.1（F5）：累计改 checked —— 旧 `sum()` 在 overflow-checks 下遇
+        // u64 溢出必然 panic（两条 size = u64::MAX/2+1 的索引条目即可在提取
+        // 开始前炸掉进程）；索引交叉校验（Index::validate）落地后正常文件
+        // 不会到这里溢出，本检查属于纵深防御。
+        let total_bytes: u64 = file_infos
+            .iter()
+            .map(|f| f.5)
+            .try_fold(0u64, |acc, s| acc.checked_add(s))
+            .ok_or_else(|| VaultError::Other("文件总大小累计溢出（索引可能被篡改）".into()))?;
         let mut done_bytes: u64 = 0;
         let mut ok = 0usize;
         let mut fail = 0usize;
@@ -437,7 +440,7 @@ impl Vault {
                 (Some(outer), ChunkLayout::Chunked { .. }) if *size > 0 => {
                     let base = done_bytes;
                     let total = total_bytes;
-                    wrapped = move |done: u64, _total: u64| outer(base + done, total);
+                    wrapped = move |done: u64, _total: u64| outer(base.saturating_add(done), total);
                     Some(&wrapped)
                 }
                 _ => None,
@@ -447,7 +450,7 @@ impl Vault {
                 per_file,
             ) {
                 Ok(_) => {
-                    done_bytes += *size;
+                    done_bytes = done_bytes.saturating_add(*size);
                     ok += 1;
                 }
                 Err(e) => {
@@ -538,7 +541,12 @@ impl Vault {
         let mut ok = 0usize;
         let mut fail = 0usize;
         let mut errors: Vec<String> = Vec::new();
-        let total_bytes: u64 = targets.iter().map(|t| t.5).sum();
+        // 3.0.1（F5）：同 extract_all_files —— 累计改 checked，杜绝 panic
+        let total_bytes: u64 = targets
+            .iter()
+            .map(|t| t.5)
+            .try_fold(0u64, |acc, s| acc.checked_add(s))
+            .ok_or_else(|| VaultError::Other("文件总大小累计溢出（索引可能被篡改）".into()))?;
         let mut done_bytes: u64 = 0;
         let mut done_files = 0usize;
         for (vpath, rel_dir, file_name, offset, length, size, aad_tag, layout) in &targets {
@@ -548,7 +556,7 @@ impl Vault {
                 (Some(outer), ChunkLayout::Chunked { .. }) if *size > 0 => {
                     let base = done_bytes;
                     let total = total_bytes;
-                    wrapped = move |done: u64, _total: u64| outer(base + done, total);
+                    wrapped = move |done: u64, _total: u64| outer(base.saturating_add(done), total);
                     Some(&wrapped)
                 }
                 _ => None,
@@ -559,7 +567,7 @@ impl Vault {
                 per_file,
             ) {
                 Ok(_) => {
-                    done_bytes += *size;
+                    done_bytes = done_bytes.saturating_add(*size);
                     ok += 1;
                 }
                 Err(e) => {
@@ -579,9 +587,8 @@ impl Vault {
 }
 
 /// 3.0.0（v6）：分块流式解密到任意写入器 —— 逐块「读取密文 → 解密 → 写出」，
-/// 明文任何时刻至多一块（CHUNK_SIZE_V6）在内存。长度一致性校验与
-/// `read_decrypt_file_data_layout` 相同（checked 运算，末块长度必须落在
-/// (0, chunk_size]）。
+/// 明文任何时刻至多一块（CHUNK_SIZE_V6）在内存。长度一致性校验统一走
+/// `resolve_chunk_plan`（3.0.1 F3：含 chunk_size 上限）。
 #[allow(clippy::too_many_arguments)]
 fn stream_decrypt_to_writer<W: std::io::Write>(
     file: &mut std::fs::File,
@@ -599,24 +606,13 @@ fn stream_decrypt_to_writer<W: std::io::Write>(
     use crate::crypto::decrypt_into;
     use zeroize::Zeroize;
 
-    if chunk_size == 0 || chunk_count == 0 {
-        return Err(VaultError::Other("分块布局参数非法".into()));
-    }
-    let overhead = 28u64; // nonce(12) + GCM tag(16)
-    let full_ct = chunk_size
-        .checked_add(overhead)
-        .ok_or_else(|| VaultError::Other("分块布局参数非法".into()))?;
-    let full_ct_total = full_ct
-        .checked_mul(chunk_count - 1)
-        .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?;
-    let expected_last = match length.checked_sub(full_ct_total) {
-        Some(v) if v > overhead && v <= full_ct => v - overhead,
-        _ => {
-            return Err(VaultError::Other(
-                "分块密文长度与索引布局不一致（密文可能被截断或篡改）".into(),
-            ))
-        }
-    };
+    // 3.0.1（F3）：统一布局解析 —— chunk_size 上限 / 末块校验 / 全 checked。
+    // 旧实现唯一检查是「非零」，chunk_count=1 时 2^40 的块尺寸直达
+    // vec![0u8; N] → alloc-abort 整个进程。
+    let plan = resolve_chunk_plan(length, chunk_size, chunk_count)?;
+    offset
+        .checked_add(length)
+        .ok_or_else(|| VaultError::Other("分块密文范围溢出（索引可能被篡改）".into()))?;
 
     // 3.0.0（优化1）：读/解密流水线 —— 后台线程预读下一块密文
     //（密文非敏感，无需零化；sync_channel(1) 限制在途 ≤ 2 块）
@@ -625,13 +621,8 @@ fn stream_decrypt_to_writer<W: std::io::Write>(
     std::thread::scope(|s| {
         s.spawn(move || {
             let mut pos = offset;
-            for i in 0..chunk_count {
-                let plain_n = if i + 1 == chunk_count {
-                    expected_last
-                } else {
-                    chunk_size
-                };
-                let ct_len = plain_n + overhead;
+            for i in 0..plan.chunk_count {
+                let ct_len = plan.ct_len(i);
                 let mut enc = vec![0u8; ct_len as usize];
                 // &File 同样实现 Read/Seek —— 与会话句柄共享游标但受互斥锁保护，
                 // 读线程独占本请求期间的位置语义
@@ -643,14 +634,23 @@ fn stream_decrypt_to_writer<W: std::io::Write>(
                     let _ = tx.send(Err(e));
                     return;
                 }
-                pos += ct_len;
+                pos = match pos.checked_add(ct_len) {
+                    Some(p) => p,
+                    None => {
+                        let _ = tx.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "分块密文位置溢出",
+                        )));
+                        return;
+                    }
+                };
                 if tx.send(Ok((i as usize, enc))).is_err() {
                     return; // 主线程已退出
                 }
             }
         });
         let mut done: u64 = 0;
-        let total: u64 = length - overhead * chunk_count;
+        let total: u64 = plan.plaintext_total();
         for received in rx {
             let (i, enc) = match received {
                 Ok(v) => v,
@@ -659,11 +659,11 @@ fn stream_decrypt_to_writer<W: std::io::Write>(
             let mut plain = decrypt_into(
                 enc_key,
                 enc,
-                &crate::crypto::chunk_aad(frozen, i as u64, chunk_count),
+                &crate::crypto::chunk_aad(frozen, i as u64, plan.chunk_count),
             )
             .ok_or(VaultError::DecryptFailed)?;
             writer.write_all(&plain)?;
-            done += plain.len() as u64;
+            done = done.saturating_add(plain.len() as u64);
             plain.zeroize();
             if let Some(cb) = chunk_progress {
                 cb(done.min(total), total);

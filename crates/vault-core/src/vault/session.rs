@@ -466,7 +466,8 @@ impl Vault {
         // 2.8.0：先嗅探 magic + 版本字节，再按格式读取对应大小的头部
         // （v4 文件总长可能不足 2048 字节，不能直接按 v5 头部大小读取）
         // 3.0.0（M-2）：嗅探扩展到 41 字节 —— 顺手读出头部保留区的挑战盐
-        //（9..41）作为会话初始值；每次成功开柜后轮换（见下方成功路径）。
+        //（9..41）作为会话初始值。3.0.1（F19）：该盐在文件生命周期内恒定，
+        // 开柜不再轮换（轮换会使已启用二因子的保险柜砖死，见成功路径注释）。
         let mut sniff = [0u8; 41];
         file.read_exact(&mut sniff)?;
         if &sniff[..8] != MAGIC {
@@ -591,6 +592,13 @@ impl Vault {
             off += PARTITION_ENTRY_SIZE_V4;
         }
 
+        // 3.0.1（F1 修复）：对全部**真实分区**统一做索引范围校验。
+        // index_offset/index_length 不在任何认证范围内；过去只对认证命中的
+        // 分区做范围检查 —— 诱饵分区（受害者没有其密码，永不命中）的越界值
+        // 会随会话状态保留，直到「删除分区」时直接驱动破坏性 7-pass 擦除。
+        // 伪条目是随机字节，offset/length 无意义，不参与校验。
+        Self::validate_parsed_partition_ranges(&file, &parsed)?;
+
         // C9 修复 + 2.3.0 + 2.4.1：始终对**全部 8 个条目**执行完整 Argon2id 派生
         // （即使中途匹配），消除计时侧信道 —— 总派生工作量恒定，与真实分区数量无关。
         //
@@ -632,6 +640,8 @@ impl Vault {
             let p = &parsed[idx];
             // 2.6.1：用「绑定头部」的认证标签校验 —— 头部前缀 + 本条目别名字段 + salt
             // 都被纳入 HMAC，因此篡改头部必然使该分区匹配失败（不再依赖分区计数）。
+            // 3.0.1（F27）：v4 保留 legacy 兼容（≤2.6.0 的合法旧柜只有 AUTH_OK
+            // 标签）；迁移到 bound 标签有规范形门槛，见成功路径注释。
             let eoff = 106 + idx * PARTITION_ENTRY_SIZE_V4;
             let tag_ok = verify_auth_tag_bound(
                 &keys.auth_key,
@@ -711,15 +721,24 @@ impl Vault {
             // 2.6.1：旧格式（未绑定头部）认证标签 → 首次成功打开即就地迁移为绑定格式，
             // 之后头部完整性由 auth_tag 无条件保证。仅迁移当前分区（其他分区的
             // auth_key 未知，待其各自被打开时迁移），由随后的 update_header 落盘。
+            // 3.0.1（F27 修复）：迁移**仅当头部已是规范形**（9..73 全零，即
+            // header[..105] == auth_tag_header_prefix）时进行 —— legacy 标签
+            // （HMAC(auth_key, "AUTH_OK")）不绑定任何头部字段，若对非规范形
+            // 头部无条件重打 bound 标签，等于把被篡改的头部「洗白」为已认证
+            // 形态。非规范形（≤2.6.0 携带旧 lock_key 残留的合法旧柜）保持
+            // legacy 标签原样落盘；update_header 落盘规范形后，下次打开自然迁移。
             let moff = 106 + idx * PARTITION_ENTRY_SIZE_V4;
-            let migrated_tag = create_auth_tag_bound(
-                &auth_key,
-                &auth_tag_header_prefix(&salt, VERSION_V4),
-                &header[moff..moff + 16],
-                &header[moff + 16..moff + 48],
-            );
-            if self.partitions[active].auth_tag != migrated_tag {
-                self.partitions[active].auth_tag = migrated_tag;
+            let canonical_prefix = auth_tag_header_prefix(&salt, VERSION_V4);
+            if header[..105] == canonical_prefix {
+                let migrated_tag = create_auth_tag_bound(
+                    &auth_key,
+                    &canonical_prefix,
+                    &header[moff..moff + 16],
+                    &header[moff + 16..moff + 48],
+                );
+                if self.partitions[active].auth_tag != migrated_tag {
+                    self.partitions[active].auth_tag = migrated_tag;
+                }
             }
 
             self.enc_key = Some(LockedKey::new(enc_key));
@@ -741,9 +760,8 @@ impl Vault {
             self.audit_dirty = true; // "已解锁"审计尚未落盘
 
             // 成功打开：重置锁定区并重新签名头部（旧保险柜在此完成锁定区格式迁移）。
-            // 3.0.0（M-2）：每次成功开柜轮换硬件密钥挑战盐 —— 响应一次性。
-            //（v4 头部不写盐，此处轮换仅为会话语义一致）
-            OsRng.fill_bytes(&mut self.yk_challenge_salt);
+            // 3.0.1（F19 修复）：不再轮换挑战盐 —— v4 头部本就不写盐，这里
+            // 保持会话内嗅探值不变（与 v5/v6 成功路径同语义）。
             // 3.0.0（L-2）：后置步骤失败时显式放弃会话，不再外泄「Err + 半开会话」
             if let Err(e) = self.update_header() {
                 self.abandon_session();
@@ -868,6 +886,9 @@ impl Vault {
             off += PARTITION_ENTRY_SIZE_V5;
         }
 
+        // 3.0.1（F1 修复）：同 v4 —— 全部真实分区的索引范围统一校验（见上方说明）
+        Self::validate_parsed_partition_ranges(&file, &parsed)?;
+
         // 阶段 1：8 × Argon2id（KEK 派生），分块并行（与 v4 相同的调度优化）。
         // 2.8.1：KEK 用 Zeroizing 包裹 —— `?` 提前返回（派生失败）时已派生的
         // KEK 不再以明文形式残留在堆上（数组没有 Drop，旧实现靠不到）
@@ -949,7 +970,10 @@ impl Vault {
             if let Some(dk) = dk_opt {
                 // dk 是 Zeroizing：所有失败分支随 drop 自动清零，不再手工复制清零
                 if let Ok(keys) = expand_keys(&dk) {
-                    if verify_auth_tag_bound(
+                    // 3.0.1（F27）：信封路径仅接受 bound 标签 —— 所有 v5/v6
+                    // 写入方都发 bound 标签，legacy 分支按构造不可达；接受
+                    // legacy 等于给「篡改后重打标签洗白」留门
+                    if verify_auth_tag_bound_only(
                         &keys.auth_key,
                         &prefix,
                         alias_field,
@@ -1077,9 +1101,11 @@ impl Vault {
             self.audit_dirty = true;
 
             // 成功打开：重置锁定区并重新签名头部。
-            // 3.0.0（M-2）：每次成功开柜轮换硬件密钥挑战盐 —— 响应一次性
-            //（旧响应在本次开柜后立即失效，下次开柜需重新触摸钥匙）。
-            OsRng.fill_bytes(&mut self.yk_challenge_salt);
+            // 3.0.1（F19 修复，撤销 M-2）：挑战盐在文件生命周期内**恒定**。
+            // M-2 的「每次开柜轮换」使 data_key 仍包裹在旧盐响应之下 —— 第二次
+            // 成功开柜即把已启用二因子的保险柜永久砖死（新盐的响应无法解开
+            // 旧包裹，且重新包裹要求会话已打开）。盐只在 create 时随机生成
+            // 一次；「响应一次性」的收益由响应不出后端（命令层现场挑战）取代。
             // 3.0.0（L-2）：后置步骤失败时显式放弃会话
             if let Err(e) = self.update_header() {
                 self.abandon_session();
@@ -1109,6 +1135,32 @@ impl Vault {
 
         Err(VaultError::AuthFailed)
     }
+    /// 3.0.1（F1 修复）：头部解析后、任何密钥派生之前，对全部真实分区
+    /// （别名合理条目）统一做索引范围校验。index_offset/index_length 不受
+    /// 任何认证保护（auth_tag AAD / 包裹 AAD / 锁区 HMAC 均不覆盖，头部签名
+    /// 在多分区场景下也不能硬拒），能写文件的攻击者可直接篡改 —— 越界值
+    /// 必须在进入会话状态之前拒绝。合法保险柜的索引恒写入文件内部，
+    /// 该校验对正常文件永真；越界即「头部被篡改或损坏」，与锁区校验失败
+    /// 同级处理（直接拒绝，不计入口令错误锁定计数）。
+    fn validate_parsed_partition_ranges(
+        file: &File,
+        parsed: &[PartitionInfo],
+    ) -> Result<(), VaultError> {
+        let file_size = file.metadata()?.len();
+        for p in parsed.iter().filter(|p| is_plausible_alias(&p.alias)) {
+            let in_bounds = match p.index_offset.checked_add(p.index_length) {
+                Some(end) => end <= file_size,
+                None => false,
+            };
+            if !in_bounds {
+                return Err(VaultError::Other(
+                    "分区表校验失败：分区索引范围超出文件边界（头部可能被篡改或损坏）".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// 2.4.1 新增（从 open_and_authenticate 抽取）：对已通过 auth_tag（头部绑定）校验的
     /// 分区做索引边界检查 + 读取解密。密钥由调用方持有并负责清理。
     /// 头部完整性已由调用方在 auth_tag 校验阶段无条件保证。
@@ -1159,6 +1211,9 @@ impl Vault {
             }
         };
         let index: Index = serde_json::from_slice(&index_json)?;
+        // 3.0.1（F3/F4/F5 根治）：索引布局自洽性校验 —— 矛盾的 size/length/
+        // layout 在加载时拒绝，而非在提取/媒体/擦除的算术路径上爆雷
+        index.validate(file_size)?;
         secure_wipe_vec(enc_index);
         secure_wipe_vec(index_json);
         Ok(index)

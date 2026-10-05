@@ -9,6 +9,49 @@ use crate::VaultError;
 
 const AUDIT_MAX_EVENTS: usize = 10000;
 
+/// 3.0.1（F7 修复）：审计数组反序列化的硬上限 —— 取运行期上限的 10 倍。
+/// AUDIT_MAX_EVENTS 只在追加时生效（add 的 pop_front），from_entries 对输入
+/// 列表长度不做限制；索引密文上限 256 MiB ≠ 解密后 JSON 有结构上限，数百万
+/// 条恶意条目会在 serde 解析阶段分配数百万个含 String 的 AuditEntry，并在
+/// 会话期随 save_index 反复克隆/重序列化。取 10× 而非 AUDIT_MAX_EVENTS 本身：
+/// 若历史版本曾写出超限但合法的审计，开柜不受影响（内存上界仍受控），
+/// 超过硬上限的才判定为篡改/损坏并拒绝。
+const AUDIT_PARSE_HARD_CAP: usize = AUDIT_MAX_EVENTS * 10;
+
+/// 3.0.1（F7 修复）：审计数组的受限反序列化 —— 用 SeqAccess 逐条计数，
+/// 超过硬上限立即中止解析（内存上界恒为硬上限条数，而非等整个 JSON 解完）。
+pub(crate) fn deserialize_capped<'de, D>(deserializer: D) -> Result<Vec<AuditEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CappedVec;
+    impl<'de> serde::de::Visitor<'de> for CappedVec {
+        type Value = Vec<AuditEntry>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("审计条目数组")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(AUDIT_PARSE_HARD_CAP));
+            let mut n = 0usize;
+            while let Some(e) = seq.next_element::<AuditEntry>()? {
+                n += 1;
+                if n > AUDIT_PARSE_HARD_CAP {
+                    return Err(<A::Error as serde::de::Error>::custom(format!(
+                        "审计条目数超过上限 {}（索引可能被篡改或损坏）",
+                        AUDIT_PARSE_HARD_CAP
+                    )));
+                }
+                v.push(e);
+            }
+            Ok(v)
+        }
+    }
+    deserializer.deserialize_seq(CappedVec)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuditEntry {
     pub ts: f64, // epoch seconds as float64（兼容 Python time.time()）

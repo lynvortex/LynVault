@@ -1,6 +1,6 @@
 //! 维护操作 —— 修改密码 / v4→v5 升级 / 完整性体检 / 搜索 / 碎片整理 / 销毁。
 //! 3.0.0 拆分自 vault.rs，逻辑逐字节不变。
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -291,10 +291,8 @@ impl Vault {
 
         // 4. 完整备份（失败统一「先 DoD 擦除再删除」）
         let backup_result: std::io::Result<()> = (|| {
-            let mut backup_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup_path)?;
+            // 3.0.1（F10）：0600 落盘（见 create_scratch_file）
+            let mut backup_file = crate::vault::fs_util::create_scratch_file(&backup_path)?;
             let mut original = File::open(&vault_path)?;
             let copy = std::io::copy(&mut original, &mut backup_file);
             let sync = backup_file.sync_all();
@@ -336,11 +334,8 @@ impl Vault {
         let lock_state = self.lock_state.clone();
         let result = (|| -> Result<PartitionInfo, VaultError> {
             // 7a. 临时文件 + v5 占位头部
-            let mut tmp_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
+            // 3.0.1（F10）：0600 落盘（见 create_scratch_file）
+            let mut tmp_file = crate::vault::fs_util::create_scratch_file(&temp_path)?;
             tmp_file.write_all(&[0u8; HEADER_SIZE_V5])?;
             tmp_file.flush()?;
 
@@ -354,6 +349,19 @@ impl Vault {
             let mut src_file = File::open(&vault_path)?;
             let mut write_cursor = HEADER_SIZE_V5 as u64;
             for (i, (vpath, old_off, old_len)) in files_snapshot.iter().enumerate() {
+                // 3.0.1（F6）：分配上限 —— old_len 来自（已认证但可能损坏的）
+                // 旧索引，按真实文件长度与 MAX_INMEM_BUFFER 双重设限；v4 写入方
+                // 恒满足（导入即按 MAX_INMEM_BUFFER 收口），越界值 alloc-abort
+                // 整个进程的路径就此关闭。
+                let end = old_off
+                    .checked_add(*old_len)
+                    .ok_or_else(|| VaultError::Other("升级管线：文件密文范围溢出".into()))?;
+                if *old_len > MAX_INMEM_BUFFER as u64 || end > orig_len {
+                    return Err(VaultError::Other(format!(
+                        "升级管线：{} 的密文范围与保险柜文件不符（索引可能被篡改或损坏）",
+                        vpath
+                    )));
+                }
                 let aad_tag = index.files.get(vpath).and_then(|m| m.aad_tag.clone());
                 let aad = aad_bytes(aad_tag.as_deref(), vpath).to_vec();
                 src_file.seek(SeekFrom::Start(*old_off))?;
@@ -454,9 +462,39 @@ impl Vault {
 
         match result {
             Ok(new_part) => {
-                // 8. 备份已无用（替换已提交）：DoD 擦除（尽力而为）
-                if let Err(e) = dod_erase(&backup_path, None) {
-                    log::warn!("擦除升级备份失败（保险柜同目录可能残留 .bak 文件）: {}", e);
+                // 8. 备份已无用（替换已提交）：DoD 擦除。
+                // 3.0.1（F29 修复）：与失败路径同一纪律 —— .bak 是**旧口令仍能
+                // 打开的整柜副本**，改口令通常正因为旧口令可能已泄露，残留副本
+                // 使轮换失效。擦除失败重试后仍有 remove_file 兜底；彻底删不掉
+                // 时在审计中留下用户可见的警告（此前只写日志，界面无任何提示）。
+                let mut backup_residue = false;
+                if backup_path.exists() {
+                    let mut wiped = false;
+                    for _ in 0..3 {
+                        match dod_erase(&backup_path, None) {
+                            Ok(()) => {
+                                wiped = true;
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!("擦除升级备份失败（将重试，最终回退删除）: {}", e)
+                            }
+                        }
+                        if !backup_path.exists() {
+                            wiped = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    if !wiped {
+                        let _ = fs::remove_file(&backup_path);
+                    }
+                    backup_residue = backup_path.exists();
+                    if backup_residue {
+                        log::error!(
+                            "升级备份 .bak 删除失败：保险柜同目录残留旧口令可打开的完整副本，请手动删除"
+                        );
+                    }
                 }
                 // 9. 重开句柄 + 会话切换到 v5。
                 // 2.8.1（诚实报错）：替换已经提交 —— 此时磁盘必然已是 v5 新密码。
@@ -498,6 +536,14 @@ impl Vault {
                 self.audit = Some(audit_log);
                 self.cached_index = Some(index);
                 self.audit_dirty = false; // 新索引（含审计）已随管线落盘
+                                          // 3.0.1（F29）：.bak 残留警告入审计（audit_dirty 置位 → close 时
+                                          // 随索引落盘，用户在审计日志中可见）
+                if backup_residue {
+                    if let Some(ref mut audit) = self.audit {
+                        audit.add("警告：升级备份删除失败，保险柜同目录可能残留 .bak 文件（旧密码仍可打开全部内容），请手动检查并删除");
+                    }
+                    self.audit_dirty = true;
+                }
                 let mut old_enc = old_enc_key;
                 old_enc.zeroize();
                 let mut old_auth = old_auth_key;
@@ -728,10 +774,8 @@ impl Vault {
         // 2.7.1 修复：备份 io::copy 中途失败（磁盘不足最常见）时半份 .bak 永久
         // 残留 —— 失败分支统一「先 DoD 擦除再删除」。
         let backup_result: std::io::Result<()> = (|| {
-            let mut backup_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup_path)?;
+            // 3.0.1（F10）：0600 落盘（见 create_scratch_file）
+            let mut backup_file = crate::vault::fs_util::create_scratch_file(&backup_path)?;
             let mut original = File::open(&vault_path)?;
             let copy = std::io::copy(&mut original, &mut backup_file);
             let sync = backup_file.sync_all();
@@ -758,11 +802,8 @@ impl Vault {
             // 版本可能变化，占位不足会让头部覆写越界到数据区
             let hdr_size = header_size_of(self.format_version)?;
             let mut tmp_file = {
-                let mut tmp_file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&temp_path)?;
+                // 3.0.1（F10）：0600 落盘（见 create_scratch_file）
+                let mut tmp_file = crate::vault::fs_util::create_scratch_file(&temp_path)?;
                 if !single_partition {
                     // 多分区：整体复制原文件，保留所有分区数据
                     let src_file = File::open(&vault_path)?;

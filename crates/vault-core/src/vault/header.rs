@@ -232,7 +232,9 @@ pub(crate) fn write_header_envelope(
     }
     // 3.0.0（M-2）：硬件密钥挑战盐写入保留区 9..41（在签名覆盖范围内）。
     // 该盐不参与 auth_tag 前缀与包裹 AAD 的绑定（前缀按「保留区全 0」的规范形
-    // 重建，语义不变），仅用于派生挑战；轮换它即令旧响应失效。
+    // 重建，语义不变），仅用于派生挑战。
+    // 3.0.1（F19）：盐在 create 时随机生成一次、此后终生不变 —— 开柜路径
+    // **禁止**轮换本盐（历史上轮换过一次即砖死二因子保险柜，见 session.rs）。
     header[YK_SALT_OFFSET..YK_SALT_OFFSET + 32].copy_from_slice(yk_challenge_salt);
     header[73..105].copy_from_slice(salt);
     header[105] = MAX_PARTITIONS as u8;

@@ -57,7 +57,24 @@ pub(crate) fn dod_overwrite_range_progress(
     if length == 0 {
         return Ok(());
     }
+    // 3.0.1（F1 修复，硬边界）：区间必须完全落在文件内。调用方传入的
+    // offset/length 可能来自头部/索引（部分字段不受认证保护）或损坏数据；
+    // 越过 EOF 的 write_all 会把文件撑大（7 遍 × 越界长度且不截断），最坏
+    // 可耗尽磁盘并摧毁整柜。任何越界一律拒绝 —— 擦除失败对调用方是
+    // 「不影响正确性」的告警，而越界写入是数据毁灭。
+    let file_len = file.metadata()?.len();
+    let end = offset.checked_add(length).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "擦除区间溢出（offset+length）")
+    })?;
+    if end > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "擦除区间超出文件边界，已拒绝执行",
+        ));
+    }
     // 2.3.0 修复：32 位平台上 u64 → usize 会截断导致只擦除部分数据，显式拒绝
+    //（3.0.1：该检查在边界校验后已不可达（length ≤ file_len ≤ usize 档位），
+    // 保留作为纵深防御）
     if length > usize::MAX as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

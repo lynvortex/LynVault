@@ -63,6 +63,9 @@ pub struct FileMeta {
 pub struct Index {
     pub files: HashMap<String, FileMeta>, // vpath -> meta
     pub folders: HashMap<String, bool>,   // vpath -> true
+    /// 3.0.1（F7）：受限反序列化 —— 超过 AUDIT_PARSE_HARD_CAP 的审计数组
+    /// 直接拒绝解析（内存放大 DoS 收口；运行期上限由 add() 的 pop_front 维持）
+    #[serde(deserialize_with = "crate::audit::deserialize_capped")]
     pub audit: Vec<AuditEntry>,
     /// 3.0.0（胁迫密码）：本分区的胁迫触发标记。
     ///
@@ -82,6 +85,80 @@ impl Index {
             audit: Vec::new(),
             duress: false,
         }
+    }
+
+    /// 3.0.1（F3/F4/F5 根治）：索引加载后的布局自洽性校验 —— 每个条目的
+    /// size/length/offset/layout 必须满足写入方恒等式。索引整体由 AES-GCM
+    /// 保护，篡改需要分区口令；本校验的对手是「投毒文件 / 恶意模板」与
+    /// 「真实损坏」—— 让矛盾数据在加载时干净报错，而不是在提取 / 媒体 /
+    /// 擦除的算术路径上 panic、巨量分配或越界擦除。
+    ///
+    /// 恒等式（与 ops_import / IndexManager 写入侧逐字节一致，存量柜全部满足）：
+    /// - Legacy：`length == size + 28`（nonce12 + tag16，空文件亦然）
+    /// - Chunked：`chunk_size ∈ (0, CHUNK_SIZE_V6]`、`count > 0`、
+    ///   `length == size + 28*count`、末块明文 ∈ (0, chunk_size]
+    /// - `offset + length ≤ 保险柜文件大小`
+    pub fn validate(&self, file_size: u64) -> Result<(), VaultError> {
+        const OVERHEAD: u64 = 28; // nonce(12) + GCM tag(16)
+        let max_chunk = crate::vault::consts::CHUNK_SIZE_V6;
+        for (vpath, meta) in &self.files {
+            let end = meta
+                .offset
+                .checked_add(meta.length)
+                .ok_or_else(|| VaultError::Other(format!("{}: 文件密文范围溢出", vpath)))?;
+            if end > file_size {
+                return Err(VaultError::Other(format!(
+                    "{}: 文件密文范围超出保险柜文件（索引可能被篡改或损坏）",
+                    vpath
+                )));
+            }
+            match &meta.layout {
+                ChunkLayout::Legacy => {
+                    if meta.length < OVERHEAD || meta.size != meta.length - OVERHEAD {
+                        return Err(VaultError::Other(format!(
+                            "{}: 密文长度与明文大小不一致（索引可能被篡改或损坏）",
+                            vpath
+                        )));
+                    }
+                }
+                ChunkLayout::Chunked {
+                    chunk_size,
+                    chunk_count,
+                } => {
+                    if *chunk_size == 0 || *chunk_size > max_chunk || *chunk_count == 0 {
+                        return Err(VaultError::Other(format!(
+                            "{}: 分块布局参数非法（索引可能被篡改或损坏）",
+                            vpath
+                        )));
+                    }
+                    let full_ct = chunk_size
+                        .checked_add(OVERHEAD)
+                        .ok_or_else(|| VaultError::Other(format!("{}: 分块布局参数非法", vpath)))?;
+                    let full_ct_total = full_ct.checked_mul(chunk_count - 1).ok_or_else(|| {
+                        VaultError::Other(format!("{}: 分块布局参数非法（块数溢出）", vpath))
+                    })?;
+                    let expected_last = match meta.length.checked_sub(full_ct_total) {
+                        Some(v) if v > OVERHEAD && v <= full_ct => v - OVERHEAD,
+                        _ => {
+                            return Err(VaultError::Other(format!(
+                                "{}: 分块密文长度与布局不一致（索引可能被篡改或损坏）",
+                                vpath
+                            )));
+                        }
+                    };
+                    let expected_size = (chunk_count - 1)
+                        .saturating_mul(*chunk_size)
+                        .saturating_add(expected_last);
+                    if meta.size != expected_size {
+                        return Err(VaultError::Other(format!(
+                            "{}: 明文大小与分块布局不一致（索引可能被篡改或损坏）",
+                            vpath
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 验证虚拟路径是否安全。
@@ -529,15 +606,7 @@ fn move_file_in_index(
         index.files.insert(old_vpath.to_string(), meta);
         return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
     }
-    // 2.8.2：同时检查文件夹命名空间（与 move_folder 对称）—— 旧实现只查 files，
-    // 把文件移动成已有文件夹的名字会制造 file/folder 同键碰撞
-    if index.folders.contains_key(&new_vpath) {
-        index.files.insert(old_vpath.to_string(), meta);
-        return Err(VaultError::Other(format!(
-            "目标路径已存在同名文件夹，无法移动为文件: {}",
-            new_vpath
-        )));
-    }
+    // 3.0.1（F15）：删除与上一行重复的 folders 冲突检查（该分支按构造不可达）
     index.files.insert(new_vpath, meta);
     Ok(())
 }

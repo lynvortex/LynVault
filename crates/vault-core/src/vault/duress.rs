@@ -287,7 +287,17 @@ impl Vault {
         let mut suffix = [0u8; 16];
         OsRng.fill_bytes(&mut suffix);
         let copy_path = path.with_extension(format!("rehearsal.{}", hex::encode(suffix)));
-        if let Err(e) = std::fs::copy(&path, &copy_path) {
+        // 3.0.1（F10）：演练副本与本体同等敏感，独占创建 + Unix 0600 落盘
+        //（旧 std::fs::copy 按 umask 落盘，通常 0644）
+        let copy_result: std::io::Result<()> = (|| {
+            let mut dst = crate::vault::fs_util::create_scratch_file(&copy_path)?;
+            let mut src = std::fs::File::open(&path)?;
+            let r = std::io::copy(&mut src, &mut dst).and_then(|_| dst.sync_all());
+            drop(dst);
+            drop(src);
+            r
+        })();
+        if let Err(e) = copy_result {
             // 部分写入的副本同样暴露存在性 —— 先擦除再报错
             crate::vault::fs_util::wipe_scratch_file(&copy_path);
             return Err(VaultError::Other(format!("演练副本创建失败：{}", e)));
@@ -360,7 +370,12 @@ impl VerifyPartitionPassword for Vault {
         use subtle::ConstantTimeEq;
         match self.format_version {
             VERSION_V4 => {
-                let salt = self.salt;
+                // 3.0.1（F30 修复）：v4 会话密钥按**活跃分区条目自身的盐**派生
+                //（打开路径逐条目 derive_keys(password, key_file_data, &p.salt)）
+                // —— 旧实现用保险柜盐派生，比较永远不可能成立（fail-closed 的
+                // 功能性 bug，当前仅 yubikey 重包裹路径拒绝 v4 才未暴露）。
+                let active = self.active_partition.ok_or(VaultError::NotOpen)?;
+                let salt = self.partitions[active].salt;
                 let keys = derive_keys(password, key_file_data, &salt)?;
                 let session = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
                 let ok = bool::from(keys.enc_key.ct_eq(&**session));

@@ -13,9 +13,10 @@
 //! - ops_extract 提取与读取
 //! - ops_delete 安全删除与自动整理触发
 //! - maintenance 改密码 / 升级 / 体检 / 搜索 / 碎片整理 / 销毁
-mod consts;
+// 3.0.1：pub(crate) —— Index::validate 需要读取 CHUNK_SIZE_V6 上限
+pub(crate) mod consts;
 mod duress;
-mod fs_util;
+pub(crate) mod fs_util;
 mod header;
 mod locked_key;
 mod maintenance;
@@ -85,8 +86,9 @@ pub struct Vault {
     pub(crate) yubikey_wrapped: bool,
 
     /// 3.0.0（M-2）：硬件密钥挑战盐（头部保留区 9..41 的会话副本）。
-    /// 打开时从头部读入；**每次成功开柜轮换**（update_header 前重掷随机），
-    /// 响应因此一次性。v4 会话恒为全 0（不参与）。Default 全 0 = 存量兼容形态。
+    /// 3.0.1（F19 修复）：打开时从头部读入后**终生不变** —— 开柜轮换会使
+    /// data_key 的旧响应包裹永久不可解（二因子保险柜砖死）。盐只在 create
+    /// 时随机生成；v4 会话与 Default 全 0 = 存量兼容形态。
     pub(crate) yk_challenge_salt: [u8; 32],
 }
 

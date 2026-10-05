@@ -84,6 +84,21 @@ pub(crate) fn verify_no_reparse(file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 3.0.1（F10 修复）：以独占创建（create_new）打开保险柜的临时/备份/演练
+/// 副本 —— 与本体同等敏感（整柜密文副本，旧口令即可离线爆破），Unix 下按
+/// 0600 落盘；旧实现按 umask（通常 0644），同机其他用户可读走副本。
+/// Windows 的 ACL 语义不同，不受影响。
+pub(crate) fn create_scratch_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 /// 2.7.1 新增：以 create_new 语义独占创建保险柜文件（目标已存在时失败，
 /// 绝不清零已有内容）。打开标志与 [`open_vault_rw`] 完全一致。
 pub(crate) fn open_vault_create_new(path: &Path) -> std::io::Result<File> {
@@ -101,13 +116,22 @@ pub(crate) fn open_vault_create_new(path: &Path) -> std::io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
+        // 3.0.1（F10 修复）：保险柜按 0600 落盘 —— 旧实现只有 umask（通常
+        // 0644），同机其他用户可读走密文做离线口令爆破。Windows 的 ACL 语义
+        // 不同，不受影响。
+        opts.mode(0o600);
     }
     opts.open(path)
 }
 
 /// 2.6.1 新增：取得保险柜文件的独占锁，防止双实例并发写坏头部/索引。
-/// - Unix：`flock(LOCK_EX | LOCK_NB)`，非阻塞；锁随文件句柄关闭自动释放。
-/// - Windows：由 [`open_vault_rw`] 的共享模式保证，此处为空操作。
+/// - Unix：`flock(LOCK_EX | LOCK_NB)`，**建议性**锁，非阻塞；锁随文件句柄
+///   关闭自动释放。
+/// - Windows：无独立实现 —— [`open_vault_rw`] 以「请求读写 + 只共享读」
+///   打开，Windows 共享模式是**内核强制锁**：会话存续期间任何其他进程对
+///   同一文件的读写打开都得到 sharing violation。语义强于 Unix 的建议性
+///   flock。3.0.1（F17 复核）：审计提出的「Windows 跨进程互斥为空」不成立
+///   —— 共享模式本身即独占保证，无需边车锁文件。
 /// 返回 `Err` 表示文件已被其他实例独占占用。
 #[cfg(unix)]
 pub(crate) fn lock_vault_exclusive(file: &File) -> std::io::Result<()> {
@@ -121,6 +145,8 @@ pub(crate) fn lock_vault_exclusive(file: &File) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 pub(crate) fn lock_vault_exclusive(_file: &File) -> std::io::Result<()> {
+    // Windows：独占由 open_vault_rw 的共享模式（FILE_SHARE_READ）在内核层
+    // 强制 —— 见上方文档。此函数保留以维持打开流程的调用点对称。
     Ok(())
 }
 
@@ -138,11 +164,21 @@ pub(crate) fn load_index_from_file(
             length
         )));
     }
+    // 3.0.1（F1 纵深防御）：范围校验提前到 seek/分配之前
+    let file_len = file.metadata()?.len();
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| VaultError::Other("索引范围溢出".into()))?;
+    if end > file_len {
+        return Err(VaultError::Other("索引超出文件范围".into()));
+    }
     file.seek(SeekFrom::Start(offset))?;
     let mut enc = vec![0u8; length as usize];
     file.read_exact(&mut enc)?;
     let plain = decrypt_gcm(enc_key, &enc, b"index").ok_or(VaultError::DecryptFailed)?;
     let index: Index = serde_json::from_slice(&plain)?;
+    // 3.0.1（F3/F4/F5 根治）：布局自洽性校验（与打开路径同一防线）
+    index.validate(file_len)?;
     secure_wipe_vec(plain);
     Ok(index)
 }
@@ -395,6 +431,89 @@ pub(crate) fn read_decrypt_file_data(
     decrypt_into(enc_key, enc_data, aad).ok_or(VaultError::DecryptFailed)
 }
 
+/// 分块密文每块开销：nonce(12) + GCM tag(16)
+pub(crate) const CHUNK_OVERHEAD: u64 = 28;
+
+/// 3.0.1（F3/F4 统一收口）：分块布局解析结果 —— 逐块几何的唯一事实来源。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChunkPlan {
+    pub chunk_size: u64,
+    pub chunk_count: u64,
+    /// 满块密文长度 = chunk_size + CHUNK_OVERHEAD
+    pub full_ct: u64,
+    /// 末块明文长度 ∈ (0, chunk_size]
+    pub expected_last: u64,
+}
+
+impl ChunkPlan {
+    /// 第 i 块的明文长度（末块 = expected_last，其余 = chunk_size）
+    pub fn plain_len(&self, i: u64) -> u64 {
+        if i + 1 == self.chunk_count {
+            self.expected_last
+        } else {
+            self.chunk_size
+        }
+    }
+
+    /// 第 i 块的密文长度
+    pub fn ct_len(&self, i: u64) -> u64 {
+        self.plain_len(i) + CHUNK_OVERHEAD
+    }
+
+    /// 明文总长（= 索引 size 字段在写入时的值）。
+    /// saturating：resolve_chunk_plan 的校验已保证真实值不溢出（(count-1)*full_ct
+    /// ≤ length），此处 saturate 仅作为纵深防御，杜绝任何 panic 路径。
+    pub fn plaintext_total(&self) -> u64 {
+        (self.chunk_count - 1)
+            .saturating_mul(self.chunk_size)
+            .saturating_add(self.expected_last)
+    }
+}
+
+/// 3.0.1（F3 修复）：由密文总长 + 索引布局解析分块几何 —— 所有读取路径
+/// （整段 / 流式提取 / 媒体区间 / 体检）共用，不得自行演算。校验：
+/// - `chunk_size ∈ (0, CHUNK_SIZE_V6]`：唯一曾是「非零」检查 —— chunk_count=1
+///   时 `length` 全额通过，`vec![0u8; 2^40]` 直接 alloc-abort 整个进程；
+///   写入方恒用 CHUNK_SIZE_V6 分块，超限值必属篡改/损坏；
+/// - `chunk_count > 0`，全程 checked 运算（release 档 overflow-checks 开启，
+///   但显式报错优于 panic）；
+/// - 末块明文 ∈ (0, chunk_size]：密文长度与索引布局矛盾即拒绝（截断/篡改）。
+pub(crate) fn resolve_chunk_plan(
+    length: u64,
+    chunk_size: u64,
+    chunk_count: u64,
+) -> Result<ChunkPlan, VaultError> {
+    if chunk_size == 0 || chunk_count == 0 {
+        return Err(VaultError::Other("分块布局参数非法".into()));
+    }
+    if chunk_size > CHUNK_SIZE_V6 {
+        return Err(VaultError::Other(format!(
+            "分块大小非法（{} 字节，超过上限 {} 字节）",
+            chunk_size, CHUNK_SIZE_V6
+        )));
+    }
+    let full_ct = chunk_size
+        .checked_add(CHUNK_OVERHEAD)
+        .ok_or_else(|| VaultError::Other("分块布局参数非法".into()))?;
+    let full_ct_total = full_ct
+        .checked_mul(chunk_count - 1)
+        .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?;
+    let expected_last = match length.checked_sub(full_ct_total) {
+        Some(v) if v > CHUNK_OVERHEAD && v <= full_ct => v - CHUNK_OVERHEAD,
+        _ => {
+            return Err(VaultError::Other(
+                "分块密文长度与索引布局不一致（密文可能被截断或篡改）".into(),
+            ))
+        }
+    };
+    Ok(ChunkPlan {
+        chunk_size,
+        chunk_count,
+        full_ct,
+        expected_last,
+    })
+}
+
 /// 3.0.0（v6）：布局感知的整段读取解密 —— Chunked 布局按块流式解密后拼接，
 /// 对外行为（返回完整明文 Vec）与 Legacy 一致；调用方仍需自行施加
 /// MAX_INMEM_BUFFER 上限（本函数不重复校验，供预览/编辑等确需整段的路径用）。
@@ -419,58 +538,29 @@ pub(crate) fn read_decrypt_file_data_layout(
             chunk_size,
             chunk_count,
         } => {
-            let (chunk_size, chunk_count) = (*chunk_size, *chunk_count);
-            if chunk_size == 0 || chunk_count == 0 || offset.checked_add(length).is_none() {
-                return Err(VaultError::Other("分块布局参数非法".into()));
-            }
-            // 由密文总长反推末块明文长度：前 count-1 块每块 chunk_size + 28 字节密文，
-            // 末块 = 末块明文 + 28。反推结果必须在 (0, chunk_size] 内 —— 否则密文
-            // 长度与索引布局矛盾（截断/篡改），拒绝解密。
-            // 3.0.0 安全：chunk_count/chunk_size 来自不可信索引，全程 checked 运算
-            let overhead = 28u64; // nonce(12) + GCM tag(16)
-            let full_ct = chunk_size
-                .checked_add(overhead)
-                .ok_or_else(|| VaultError::Other("分块布局参数非法".into()))?;
-            let full_ct_total = full_ct
-                .checked_mul(chunk_count - 1)
-                .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?;
-            let expected_last = match length.checked_sub(full_ct_total) {
-                Some(v) if v > overhead && v <= full_ct => v - overhead,
-                _ => {
-                    return Err(VaultError::Other(
-                        "分块密文长度与索引布局不一致（密文可能被截断或篡改）".into(),
-                    ))
-                }
-            };
+            // 3.0.1（F3）：统一布局解析（含 chunk_size 上限与末块校验）
+            let plan = resolve_chunk_plan(length, *chunk_size, *chunk_count)?;
+            offset
+                .checked_add(length)
+                .ok_or_else(|| VaultError::Other("文件数据范围溢出".into()))?;
             let frozen = frozen.unwrap_or(vpath);
-            // L-8（审计修复）：与同函数上方 full_ct.checked_mul 同一防护风格
-            //（实际不可达：expected_last 校验已蕴含 length > overhead*chunk_count，
-            // 但同一函数内防护风格必须一致）
-            let plaintext_total = length
-                .checked_sub(
-                    overhead
-                        .checked_mul(chunk_count)
-                        .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?,
-                )
-                .ok_or_else(|| VaultError::Other("分块密文长度不足".into()))?;
+            // L-8（审计修复）：分配前按明文总长设容量（plan 已保证不溢出）
+            let plaintext_total = plan.plaintext_total();
             let mut out = Vec::with_capacity(plaintext_total as usize);
             let mut pos = offset;
-            for i in 0..chunk_count {
-                let plain_n = if i + 1 == chunk_count {
-                    expected_last
-                } else {
-                    chunk_size
-                };
-                let ct_len = plain_n + overhead;
+            for i in 0..plan.chunk_count {
+                let ct_len = plan.ct_len(i);
                 file.seek(SeekFrom::Start(pos))?;
                 let mut enc = vec![0u8; ct_len as usize];
                 file.read_exact(&mut enc)?;
-                let mut plain = decrypt_into(enc_key, enc, &chunk_aad(frozen, i, chunk_count))
+                let mut plain = decrypt_into(enc_key, enc, &chunk_aad(frozen, i, plan.chunk_count))
                     .ok_or(VaultError::DecryptFailed)?;
                 out.extend_from_slice(&plain);
                 // L5（审计修复）：与 read_media_range / stream_decrypt_to_writer 同一纪律
                 plain.zeroize();
-                pos += ct_len;
+                pos = pos.checked_add(ct_len).ok_or_else(|| {
+                    VaultError::Other("分块密文位置溢出（索引可能被篡改）".into())
+                })?;
             }
             Ok(out)
         }
@@ -499,41 +589,21 @@ pub(crate) fn verify_file_data_layout(
             chunk_size,
             chunk_count,
         } => {
-            let (chunk_size, chunk_count) = (*chunk_size, *chunk_count);
-            if chunk_size == 0 || chunk_count == 0 {
-                return Err(VaultError::Other("分块布局参数非法".into()));
-            }
-            let overhead = 28u64;
-            let full_ct = chunk_size
-                .checked_add(overhead)
-                .ok_or_else(|| VaultError::Other("分块布局参数非法".into()))?;
-            let full_ct_total = full_ct
-                .checked_mul(chunk_count - 1)
-                .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?;
-            let expected_last = match length.checked_sub(full_ct_total) {
-                Some(v) if v > overhead && v <= full_ct => v - overhead,
-                _ => {
-                    return Err(VaultError::Other(
-                        "分块密文长度与索引布局不一致（密文可能被截断或篡改）".into(),
-                    ))
-                }
-            };
+            // 3.0.1（F3）：统一布局解析
+            let plan = resolve_chunk_plan(length, *chunk_size, *chunk_count)?;
             let frozen = frozen.unwrap_or(vpath);
             let mut pos = offset;
-            for i in 0..chunk_count {
-                let plain_n = if i + 1 == chunk_count {
-                    expected_last
-                } else {
-                    chunk_size
-                };
-                let ct_len = plain_n + overhead;
+            for i in 0..plan.chunk_count {
+                let ct_len = plan.ct_len(i);
                 file.seek(SeekFrom::Start(pos))?;
                 let mut enc = vec![0u8; ct_len as usize];
                 file.read_exact(&mut enc)?;
-                let plain = decrypt_into(enc_key, enc, &chunk_aad(frozen, i, chunk_count))
+                let plain = decrypt_into(enc_key, enc, &chunk_aad(frozen, i, plan.chunk_count))
                     .ok_or(VaultError::DecryptFailed)?;
                 secure_wipe_vec(plain);
-                pos += ct_len;
+                pos = pos.checked_add(ct_len).ok_or_else(|| {
+                    VaultError::Other("分块密文位置溢出（索引可能被篡改）".into())
+                })?;
             }
             Ok(())
         }
@@ -660,6 +730,12 @@ pub(crate) fn open_import_source(src_path: &Path) -> std::io::Result<File> {
 pub(crate) fn path_within(child: &Path, base: &Path) -> bool {
     #[cfg(windows)]
     {
+        // 3.0.1（F8 修复）：base 组件耗尽后，子路径的剩余组件不得包含
+        // ParentDir / Prefix —— 旧实现只逐组件比较 base 的组件数，base 用尽
+        // 即返回 true，`path_within(C:\out\..\..\Windows\x, C:\out)` 误判为
+        // true（非 Windows 分支的 `child.starts_with(base)` 无此缺陷）。
+        // 当前调用点传入的路径均已 canonicalize 或经 sanitize_filename，
+        // 不可利用；本修复属纵深防御。
         let mut child_comps = child.components();
         for base_comp in base.components() {
             match child_comps.next() {
@@ -673,10 +749,41 @@ pub(crate) fn path_within(child: &Path, base: &Path) -> bool {
                 _ => return false,
             }
         }
+        for c in child_comps {
+            match c {
+                std::path::Component::Normal(_) => continue,
+                std::path::Component::CurDir => continue,
+                _ => return false,
+            }
+        }
         true
     }
     #[cfg(not(windows))]
     {
         child.starts_with(base)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod path_within_tests {
+    use super::*;
+
+    /// 3.0.1（F8 回归）：Windows 分支 base 耗尽后剩余组件含 ParentDir 必须拒绝
+    #[test]
+    fn rejects_parent_dir_remaining() {
+        use std::path::Path;
+        assert!(path_within(Path::new(r"C:\out\sub"), Path::new(r"C:\out")));
+        assert!(path_within(Path::new(r"C:\out"), Path::new(r"C:\out")));
+        assert!(path_within(
+            Path::new(r"C:\out\sub\x.txt"),
+            Path::new(r"C:\out")
+        ));
+        // 旧缺陷用例：非 Windows 分支的 starts_with 语义正确，Windows 分支曾误判
+        assert!(!path_within(
+            Path::new(r"C:\out\..\Windows\x"),
+            Path::new(r"C:\out")
+        ));
+        // 完全在 base 之外
+        assert!(!path_within(Path::new(r"C:\Windows"), Path::new(r"C:\out")));
     }
 }

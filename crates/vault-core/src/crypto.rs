@@ -393,6 +393,11 @@ pub fn create_auth_tag_bound(
 /// 恒定时间校验分区认证标签：同时比较「头部绑定」（新）与「AUTH_OK」（旧）两种
 /// 标签，任一匹配即通过。两种标签都完整计算、都用 `ct_eq` 比较（不短路），
 /// 保证每次认证的工作量恒定，与真实分区数量无关。
+///
+/// 3.0.1（F27）：**仅 v4 打开路径**允许本函数 —— legacy 标签不绑定任何头部
+/// 字段，接受它意味着「篡改被接受后被无条件重打 bound 标签洗白」。v5/v6
+/// 信封路径一律用 [`verify_auth_tag_bound_only`]（所有 v5/v6 写入方都发
+/// bound 标签，legacy 分支按构造不可达）。
 pub fn verify_auth_tag_bound(
     auth_key: &[u8],
     header_prefix: &[u8],
@@ -410,6 +415,23 @@ pub fn verify_auth_tag_bound(
     let ok_bound = bound.ct_eq(stored);
     let ok_legacy = legacy.ct_eq(stored);
     (ok_bound | ok_legacy).into()
+}
+
+/// 3.0.1（F27 修复）：恒定时间校验「头部绑定」认证标签（仅 bound 形态）。
+/// v5/v6 信封路径专用。
+pub fn verify_auth_tag_bound_only(
+    auth_key: &[u8],
+    header_prefix: &[u8],
+    entry_alias: &[u8],
+    entry_salt: &[u8],
+    tag: &[u8],
+) -> bool {
+    if tag.len() < 32 {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    let bound = create_auth_tag_bound(auth_key, header_prefix, entry_alias, entry_salt);
+    bound.ct_eq(&tag[..32]).into()
 }
 
 /// 计算头部签名（HMAC-SHA512 over first 887 bytes of header）

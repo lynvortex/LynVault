@@ -1781,19 +1781,34 @@ fn duress_clear_mark_disables_trigger() {
 
 // ═══════════════ 3.0.0：硬件密钥二因子（响应注入 —— 无需真钥匙）═══════════════
 
-/// 启用 → 无响应拒绝 → 带响应可开 → 改密码保留二因子 → 解除复原
+/// 3.0.1（F19 回归修复）：响应必须由**文件中的挑战盐**派生 —— 模拟真实
+/// 「钥匙对挑战算响应」的确定性函数（SHA-256 截断模拟 HMAC-SHA1；vault-core
+/// 只把响应当不透明 20 字节）。旧测试用固定字面量 RESP，使「开柜轮换盐」
+/// 类缺陷完全无法被端到端测试发现（3.0.0 F19 因此漏网）。
+fn hardware_response(path: &std::path::Path) -> [u8; 20] {
+    use sha2::{Digest, Sha256};
+    let salt = vault_core::read_vault_yk_salt(path).expect("读取挑战盐");
+    let challenge = vault_core::crypto::derive_yubikey_challenge(&salt);
+    let d = Sha256::digest(challenge);
+    let mut resp = [0u8; 20];
+    resp.copy_from_slice(&d[..20]);
+    resp
+}
+
+/// 启用 → 无响应拒绝 → 带响应可开 → **连续重开不砖化（F19 回归）** →
+/// 改密码保留二因子 → 解除复原
 #[test]
 fn yubikey_2fa_full_lifecycle() {
     let dir = tempdir("yk2fa");
     let path = dir.join("yk.lyt");
     const PWD2: &str = "hardware key vault pwd";
-    const RESP: [u8; 20] = [0x5A; 20];
 
     let mut v = Vault::default();
     v.create(&path, PWD2, None).unwrap();
     let src = write_src(&dir, "hw.txt", b"hardware protected");
     v.import_file(&src, "/hw.txt").unwrap();
-    v.enable_yubikey_2fa(PWD2, None, &RESP).unwrap();
+    let resp = hardware_response(&path);
+    v.enable_yubikey_2fa(PWD2, None, &resp).unwrap();
     assert!(v.is_yubikey_2fa_active().unwrap());
     v.close();
 
@@ -1812,25 +1827,38 @@ fn yubikey_2fa_full_lifecycle() {
     );
     // 正确响应：开柜成功，内容完好
     let mut v3 = Vault::default();
-    v3.open_and_authenticate(&path, PWD2, None, Some(&RESP))
+    v3.open_and_authenticate(&path, PWD2, None, Some(&resp))
         .unwrap();
     assert_eq!(v3.load_file_data("/hw.txt").unwrap(), b"hardware protected");
 
+    // F19 回归核心：盐恒定 —— 关柜再连续重开两次，每次都必须成功。
+    // （3.0.0 的开柜轮换在此处第二次重开即 AuthFailed 且永久不可恢复）
+    let resp2 = hardware_response(&path);
+    assert_eq!(resp2, resp, "挑战盐在开柜后不得变化（F19）");
+    v3.close();
+    let mut v3b = Vault::default();
+    v3b.open_and_authenticate(&path, PWD2, None, Some(&resp))
+        .expect("第二次开柜必须成功（F19 回归）");
+    v3b.close();
+    let mut v3c = Vault::default();
+    v3c.open_and_authenticate(&path, PWD2, None, Some(&resp))
+        .expect("第三次开柜必须成功（F19 回归）");
+
     // 改密码：不带响应明确报错；带响应成功且保留二因子
-    assert!(v3
+    assert!(v3c
         .change_password(PWD2, "new hardware pwd 999", None, None::<fn(usize)>, None)
         .is_err());
-    v3.change_password(
+    v3c.change_password(
         PWD2,
         "new hardware pwd 999",
         None,
         None::<fn(usize)>,
-        Some(&RESP),
+        Some(&resp),
     )
     .unwrap();
-    v3.close();
+    v3c.close();
     let mut v4 = Vault::default();
-    v4.open_and_authenticate(&path, "new hardware pwd 999", None, Some(&RESP))
+    v4.open_and_authenticate(&path, "new hardware pwd 999", None, Some(&resp))
         .unwrap();
     assert!(
         v4.is_yubikey_2fa_active().unwrap(),
@@ -1838,7 +1866,7 @@ fn yubikey_2fa_full_lifecycle() {
     );
 
     // 解除后无响应可开
-    v4.disable_yubikey_2fa("new hardware pwd 999", None, &RESP)
+    v4.disable_yubikey_2fa("new hardware pwd 999", None, &resp)
         .unwrap();
     v4.close();
     let mut v5 = Vault::default();
@@ -1854,7 +1882,6 @@ fn yubikey_2fa_coexists_with_plain_partitions() {
     let path = dir.join("co.lyt");
     const MAIN_PWD: &str = "plain main partition";
     const YK_PWD: &str = "yubikey second part";
-    const RESP: [u8; 20] = [0xA5; 20];
 
     let mut v = Vault::default();
     v.create(&path, MAIN_PWD, None).unwrap();
@@ -1864,9 +1891,10 @@ fn yubikey_2fa_coexists_with_plain_partitions() {
     drop(v);
 
     // 打开二因子分区并启用
+    let resp = hardware_response(&path);
     let mut v2 = Vault::default();
     v2.open_and_authenticate(&path, YK_PWD, None, None).unwrap();
-    v2.enable_yubikey_2fa(YK_PWD, None, &RESP).unwrap();
+    v2.enable_yubikey_2fa(YK_PWD, None, &resp).unwrap();
     v2.close();
 
     // 无响应：普通分区可开（双路径普通命中）、二因子分区拒绝
@@ -1880,11 +1908,11 @@ fn yubikey_2fa_coexists_with_plain_partitions() {
 
     // 带响应：二因子分区可开（混合命中）；普通分区也可开（混合未命中 → 普通命中）
     let mut v5 = Vault::default();
-    v5.open_and_authenticate(&path, YK_PWD, None, Some(&RESP))
+    v5.open_and_authenticate(&path, YK_PWD, None, Some(&resp))
         .unwrap();
     v5.close();
     let mut v6 = Vault::default();
-    v6.open_and_authenticate(&path, MAIN_PWD, None, Some(&RESP))
+    v6.open_and_authenticate(&path, MAIN_PWD, None, Some(&resp))
         .unwrap();
     assert_eq!(v6.load_file_data("/plain.txt").unwrap(), b"plain data");
     assert!(
@@ -1900,7 +1928,6 @@ fn yubikey_2fa_partition_duress_flow() {
     let path = dir.join("ykd.lyt");
     const MAIN_PWD: &str = "plain main partition";
     const YK_PWD: &str = "yubikey duress part";
-    const RESP: [u8; 20] = [0x71; 20];
 
     let mut v = Vault::default();
     v.create(&path, MAIN_PWD, None).unwrap();
@@ -1910,21 +1937,22 @@ fn yubikey_2fa_partition_duress_flow() {
     drop(v);
 
     // 启用二因子（Yk 会话）
+    let resp = hardware_response(&path);
     let mut v2 = Vault::default();
     v2.open_and_authenticate(&path, YK_PWD, None, None).unwrap();
-    v2.enable_yubikey_2fa(YK_PWD, None, &RESP).unwrap();
+    v2.enable_yubikey_2fa(YK_PWD, None, &resp).unwrap();
     v2.close();
     // 主分区会话跨分区标记二因子分区（验证走混合路径）
     let mut v2b = Vault::default();
     v2b.open_and_authenticate(&path, MAIN_PWD, None, None)
         .unwrap();
-    v2b.set_duress_mark_on("Yk", YK_PWD, None, Some(&RESP))
+    v2b.set_duress_mark_on("Yk", YK_PWD, None, Some(&resp))
         .unwrap();
     v2b.close();
 
     // 胁迫开柜（带响应）→ 主分区销毁
     let mut v3 = Vault::default();
-    v3.open_and_authenticate(&path, YK_PWD, None, Some(&RESP))
+    v3.open_and_authenticate(&path, YK_PWD, None, Some(&resp))
         .expect("带响应的胁迫开柜必须成功");
     v3.close();
     let mut v4 = Vault::default();
@@ -2250,4 +2278,152 @@ fn add_partition_rejects_duplicate_alias() {
         .unwrap();
     // 原分区不受影响（首个 Alpha 的密码仍可打开它——通过分区列表验证数量）
     assert_eq!(v.get_partitions().len(), 3);
+}
+
+// ═══════════════ 3.0.1：安全修复回归测试 ═══════════════
+
+/// F1 回归：擦除区间硬边界 —— 越界（含越过 EOF）一律拒绝，文件不得被撑大
+#[test]
+fn dod_overwrite_range_rejects_out_of_bounds() {
+    let dir = tempdir("f1wipe");
+    let path = dir.join("w.bin");
+    fs::write(&path, vec![0xAAu8; 1024]).unwrap();
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    // 区间完全在文件内：成功
+    vault_core::wipe::dod_overwrite_range(&mut f, 0, 512).unwrap();
+    // 越过 EOF：拒绝（旧实现会把文件撑大到越界长度再覆写 7 遍）
+    assert!(vault_core::wipe::dod_overwrite_range(&mut f, 0, 4096).is_err());
+    // offset+length 溢出：拒绝
+    assert!(vault_core::wipe::dod_overwrite_range(&mut f, u64::MAX - 1, 10).is_err());
+    drop(f);
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        1024,
+        "文件不得被越界擦除撑大"
+    );
+}
+
+/// F1 回归：未认证的头部 index_offset/length 驱动的破坏性擦除必须在打开时
+/// 被全分区范围校验拦截（攻击者无需密码：只改文件即可触发旧缺陷）
+#[test]
+fn tampered_index_range_is_rejected_at_open() {
+    let dir = tempdir("f1range");
+    let path = dir.join("r.lyt");
+    const PWD: &str = "range validation pwd!";
+    let mut v = Vault::default();
+    v.create(&path, PWD, None).unwrap();
+    let src = write_src(&dir, "a.txt", b"data");
+    v.import_file(&src, "/a.txt").unwrap();
+    v.close();
+
+    // 篡改第一个分区条目（别名 Main 合法）的 index_offset/length
+    // —— 条目内偏移：106 + 80（index_offset，8 字节 LE）与 106 + 88（length）
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    f.seek(SeekFrom::Start(106 + 80)).unwrap();
+    f.write_all(&0u64.to_le_bytes()).unwrap();
+    f.write_all(&(u64::MAX / 2).to_le_bytes()).unwrap();
+    drop(f);
+
+    let mut v2 = Vault::default();
+    let err = v2
+        .open_and_authenticate(&path, PWD, None, None)
+        .expect_err("越界分区表必须被拒绝");
+    assert!(
+        format!("{}", err).contains("分区表校验失败"),
+        "应被分区表范围校验拒绝，实际: {}",
+        err
+    );
+}
+
+/// F3/F4/F5 根治：Index::validate 拒绝与写入方几何矛盾的条目
+#[test]
+fn index_validate_rejects_inconsistent_layouts() {
+    use vault_core::index::ChunkLayout;
+    use vault_core::{FileMeta, Index};
+
+    let legacy = |size, offset, length| FileMeta {
+        name: "f".into(),
+        size,
+        offset,
+        length,
+        aad_tag: None,
+        layout: ChunkLayout::Legacy,
+    };
+    // Legacy：size == length - 28 合法；矛盾拒绝
+    let mut idx = Index::new();
+    idx.files.insert("/ok".into(), legacy(10, 100, 38));
+    assert!(idx.validate(10000).is_ok());
+    idx.files.insert("/bad".into(), legacy(999, 200, 38));
+    assert!(idx.validate(10000).is_err());
+    // 密文范围越过文件边界：拒绝
+    let mut oob = Index::new();
+    oob.files.insert("/oob".into(), legacy(10, 9000, 1 << 20));
+    assert!(oob.validate(10000).is_err());
+    // Chunked：chunk_size 超上限（F3 的 2^40 分配路径）拒绝
+    let mut big = Index::new();
+    big.files.insert(
+        "/big".into(),
+        FileMeta {
+            name: "big".into(),
+            size: 100,
+            offset: 0,
+            length: 128,
+            aad_tag: None,
+            layout: ChunkLayout::Chunked {
+                chunk_size: 1 << 40,
+                chunk_count: 1,
+            },
+        },
+    );
+    assert!(big.validate(u64::MAX).is_err());
+    // Chunked：size 与布局矛盾（F4 的谎报 size → 切片 panic 路径）拒绝
+    let mut mis = Index::new();
+    mis.files.insert(
+        "/mis".into(),
+        FileMeta {
+            name: "mis".into(),
+            size: 200,
+            offset: 0,
+            length: 100 + 28,
+            aad_tag: None,
+            layout: ChunkLayout::Chunked {
+                chunk_size: 100,
+                chunk_count: 1,
+            },
+        },
+    );
+    assert!(mis.validate(u64::MAX).is_err());
+}
+
+/// F7 回归：审计数组的反序列化上限 —— 硬上限内可解析（兼容历史超限），
+/// 超过硬上限拒绝（数百万条目的内存放大 DoS 收口）
+#[test]
+fn audit_array_deserialization_is_capped() {
+    use vault_core::Index;
+    let hmac = "00".repeat(32);
+    let entry = |i: usize| {
+        format!(
+            r#"{{"ts":1700000000.0,"event":"e{}","hmac":"{}"}}"#,
+            i, hmac
+        )
+    };
+    let build = |n: usize| {
+        format!(
+            r#"{{"files":{{}},"folders":{{}},"audit":[{}]}}"#,
+            (0..n).map(entry).collect::<Vec<_>>().join(",")
+        )
+    };
+    // 运行期上限（1 万）之上、硬上限（10 万）之内：仍可解析
+    assert!(serde_json::from_str::<Index>(&build(10_001)).is_ok());
+    // 超过硬上限：拒绝
+    assert!(serde_json::from_str::<Index>(&build(100_001)).is_err());
 }
