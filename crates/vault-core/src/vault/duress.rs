@@ -13,8 +13,17 @@
 //! - 设置 / 触发均**不写审计日志** —— 诱饵柜的操作记录必须看起来完全正常；
 //! - 触发覆写只重写头部一次（约 2 KiB），不产生可观察的批量 I/O。
 //!
-//! **红线（文档与 UI 均须如实告知）**：
+//! **红线（文档与 UI 均须如实告知，3.0.1 措辞修正）**：
+//! - 触发是**元数据级销毁**：其他分区的头部条目被随机化（索引定位与密钥
+//!   不可达），但密文本身**原地残留**、不会被擦除；多分区保险柜的碎片整理
+//!   不回收其他分区死密文（`estimate_dead_bytes` 对多分区恒 None）—— 持有
+//!   旧文件快照者可嫁接旧头部条目（仍需该分区口令才能解密，且「全文件
+//!   回滚窗口」为 README 已记录的已知限制）；
 //! - 触发即其他分区数据永久销毁，无任何找回手段；
+//! - 需要物理级清理时须**显式**调用 [`Vault::scrub_other_partitions_data`]：
+//!   随机化条目（同自动触发）+ 对其他分区密文残留做随机覆写。这是**可选的
+//!   高级操作**（非自动执行）—— 批量 I/O 会破坏上述「不可观测」承诺，
+//!   只适用于「主动交出设备前清理」场景，UI 须二次确认并如实说明；
 //! - 演练模式通过对保险柜**临时副本**执行完整触发流程来验证机制，
 //!   副本用后即 DoD 擦除，原件零接触。
 use std::fs::File;
@@ -29,7 +38,7 @@ use crate::error::VaultError;
 
 use super::consts::*;
 use super::fs_util::load_index_from_file;
-use super::header::{alias_field16, auth_tag_header_prefix, key_wrap_aad};
+use super::header::{alias_field16, auth_tag_header_prefix, header_size_of, key_wrap_aad};
 use super::Vault;
 use crate::wipe::secure_wipe_vec;
 
@@ -93,13 +102,25 @@ impl Vault {
             .iter()
             .position(|p| p.alias == target_alias)
             .ok_or(VaultError::PartitionNotFound)?;
-        if self.partitions.len() < 2 {
+        if self.partitions.len() < 2 && mark {
+            // 3.0.1（#26 修复）：「至少 2 个分区」约束只作用于**设置** ——
+            // 删除另一分区后仍应允许解除残留标记（旧实现一律拒绝，标记
+            // 变成无法解除的死状态）
             return Err(VaultError::Other(
                 "胁迫分区至少需要 2 个分区：请先创建用于隐藏真实数据的其他分区".into(),
             ));
         }
         // 允许标记当前分区（用户打开诱饵分区放好文件后原地标记是自然流程）；
         // 也允许标记其他分区（需目标口令解写其索引）。
+
+        // 0. v4 目标显式拒绝（3.0.1，#26 修复）—— v4 无包裹层，解包路径
+        //    必然失败，旧文案「目标分区密码不正确」具误导性
+        if mark && self.partitions[pos].wrapped_key.is_none() {
+            return Err(VaultError::Other(
+                "胁迫密码暂不支持 v4 旧格式分区（无密钥包裹层）；请先通过修改密码升级为信封格式"
+                    .into(),
+            ));
+        }
 
         // 1. 用目标口令解包目标分区的 data_key（双路径：混合优先）
         let target = self.partitions[pos].clone();
@@ -244,6 +265,115 @@ impl Vault {
         Ok(())
     }
 
+    /// 3.0.1（#3 修复）：胁迫触发的**物理清理**扩展 —— 显式调用（绝不自动
+    /// 执行，批量 I/O 会破坏「不可观测」承诺，见模块文档红线）。
+    ///
+    /// 步骤 1 与 [`Self::check_and_trigger_duress`] 一致：其他分区条目随机化
+    /// （元数据级销毁）；步骤 2 对**其余全部文件区域**（当前分区的索引、
+    /// 文件密文与头部之外）做单遍随机覆写 —— 其他分区的密文残留与死索引
+    /// 一并销毁，不再给「嫁接旧快照 + 口令爆破」留下密文。
+    ///
+    /// 单遍随机而非 DoD 7-pass：覆写对象是 AES-GCM 密文（不是明文），
+    /// 目标是让密文不可用而非取证级擦除；调用方（UI）须二次确认 ——
+    /// 其他分区数据立即永久不可恢复。不写审计（胁迫承诺）。
+    /// 返回覆写字节数。
+    pub fn scrub_other_partitions_data(
+        &mut self,
+        progress: Option<&dyn Fn(u64, u64)>,
+    ) -> Result<u64, VaultError> {
+        if !self.is_open() {
+            return Err(VaultError::NotOpen);
+        }
+        let active = self.active_partition.ok_or(VaultError::NotOpen)?;
+        if self.partitions.len() < 2 {
+            return Err(VaultError::Other(
+                "没有可清理的其他分区（单分区保险柜没有死密文）".into(),
+            ));
+        }
+        if self.partitions[active].wrapped_key.is_none() {
+            return Err(VaultError::Other(
+                "v4 旧格式会话暂不支持物理清理：请先通过修改密码升级为信封格式".into(),
+            ));
+        }
+
+        // 1. 条目随机化（与自动触发同一策略）
+        for (i, p) in self.partitions.iter_mut().enumerate() {
+            if i == active {
+                continue;
+            }
+            let mut rnd = [0u8; 64];
+            OsRng.fill_bytes(&mut rnd);
+            p.alias = String::from_utf8_lossy(&rnd).into_owned();
+            let mut salt = [0u8; 32];
+            OsRng.fill_bytes(&mut salt);
+            p.salt = salt;
+            let mut tag = [0u8; 32];
+            OsRng.fill_bytes(&mut tag);
+            p.auth_tag = tag;
+            p.index_offset = OsRng.next_u64();
+            p.index_length = OsRng.next_u64();
+            if let Some(w) = p.wrapped_key.as_mut() {
+                OsRng.fill_bytes(w);
+            }
+            p.audit_count = OsRng.next_u32();
+        }
+        self.update_header()?;
+        if let Some(file) = self.file.as_mut() {
+            let _ = file.sync_all();
+        }
+
+        // 2. 计算保留区间：头部 + 当前分区索引 + 当前分区全部文件密文。
+        //    其余区域（其他分区索引/密文、历史死区）= 覆写目标。
+        let path = self.path.clone().ok_or(VaultError::NotOpen)?;
+        let file_len = std::fs::metadata(&path).map_err(VaultError::from)?.len();
+        let hdr = header_size_of(self.format_version)? as u64;
+        let mut keep: Vec<(u64, u64)> = Vec::new();
+        {
+            let p = &self.partitions[active];
+            keep.push((p.index_offset, p.index_length));
+            let index = self.cached_index.as_ref().ok_or(VaultError::NotOpen)?;
+            for m in index.files.values() {
+                keep.push((m.offset, m.offset.saturating_add(m.length)));
+            }
+        }
+        keep.retain(|&(o, l)| l > 0 && o < file_len);
+        for k in keep.iter_mut() {
+            k.1 = k.1.min(file_len);
+        }
+        keep.sort();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for &(o, e) in &keep {
+            match merged.last_mut() {
+                Some(last) if o <= last.1 => {
+                    if e > last.1 {
+                        last.1 = e;
+                    }
+                }
+                _ => merged.push((o, e)),
+            }
+        }
+
+        // 3. 逐段覆写 [hdr, file_len) 中不在保留区间的部分
+        let mut scrubbed = 0u64;
+        {
+            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+            let mut cursor = hdr;
+            for &(s, e) in &merged {
+                let s = s.max(cursor);
+                if s > cursor {
+                    random_overwrite_range(file, cursor, s - cursor, progress)?;
+                    scrubbed += s - cursor;
+                }
+                cursor = cursor.max(e);
+            }
+            if cursor < file_len {
+                random_overwrite_range(file, cursor, file_len - cursor, progress)?;
+                scrubbed += file_len - cursor;
+            }
+        }
+        Ok(scrubbed)
+    }
+
     /// 演练：对保险柜文件的**临时副本**执行完整触发流程（真实开柜 + 真实覆写），
     /// 验证机制有效后把副本 DoD 擦除。原件零接触。
     /// 返回 (副本上被随机覆写的其他分区数)。
@@ -272,16 +402,20 @@ impl Vault {
                 .map(|m| m.len())
                 .unwrap_or(0)
                 .saturating_add(4 * 1024 * 1024);
-            if let Ok(free) = crate::vault::fs_util::disk_free_bytes(
+            match crate::vault::fs_util::disk_free_bytes(
                 path.parent().unwrap_or(std::path::Path::new(".")),
             ) {
-                if free < need {
-                    return Err(VaultError::Other(format!(
-                        "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），演练已取消",
-                        need / (1024 * 1024),
-                        free / (1024 * 1024),
-                    )));
+                Ok(free) => {
+                    if free < need {
+                        return Err(VaultError::Other(format!(
+                            "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），演练已取消",
+                            need / (1024 * 1024),
+                            free / (1024 * 1024),
+                        )));
+                    }
                 }
+                // 3.0.1（#48 一致性）：预查询失败留痕（不再静默跳过）
+                Err(e) => log::warn!("演练副本磁盘预检失败，跳过预检: {}", e),
             }
         }
         let mut suffix = [0u8; 16];
@@ -347,6 +481,33 @@ impl Vault {
         }
         Ok(others_before)
     }
+}
+
+/// 3.0.1（#3 修复）：单遍随机覆写（物理清理专用 —— 覆写对象是密文，
+/// 非 DoD 取证级语义，见 scrub_other_partitions_data 文档）。
+fn random_overwrite_range(
+    file: &mut File,
+    offset: u64,
+    length: u64,
+    progress: Option<&dyn Fn(u64, u64)>,
+) -> std::io::Result<()> {
+    use rand::RngCore;
+    const CHUNK: usize = 1024 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    let mut written = 0u64;
+    while written < length {
+        let n = ((length - written) as usize).min(CHUNK);
+        OsRng.fill_bytes(&mut buf[..n]);
+        file.seek(SeekFrom::Start(offset + written))?;
+        file.write_all(&buf[..n])?;
+        written += n as u64;
+        if let Some(cb) = progress {
+            cb(written, length);
+        }
+    }
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// 验证「当前分区密码」—— v4 与信封（v5/v6）两条路径。

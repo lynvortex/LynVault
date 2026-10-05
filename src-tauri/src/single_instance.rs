@@ -66,6 +66,11 @@ impl Drop for ConnSlotGuard {
     }
 }
 
+/// 3.0.1（#9 修复，F24 残留收口）：连接读超时 —— 64 条空闲 pending 连接
+/// × 5s 仍可占满线程池使合法转发被 drop（→ 降级启动）。回环握手 RTT 为
+/// 微秒级，1s 超时对正常转发毫无影响，同时把洪泛占窗压到 1s。
+const CONN_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// si.json 配置（2.8.2 / L2）：随机端口 + 随机令牌，随安装持久化
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SiConfig {
@@ -351,6 +356,8 @@ pub fn server_loop(handle: AppHandle) {
         return;
     };
     let expected_token = cfg.token;
+    // 3.0.1（#16）：accept 失败退避起点
+    let mut accept_backoff = Duration::from_millis(10);
 
     // 3.0.1（F24）：两个独立计数器 —— pending（accept 起算，限线程数，宽松）
     // 与 active（令牌握手通过后才占用，限真实处理并发）。旧实现共用一个
@@ -358,27 +365,46 @@ pub fn server_loop(handle: AppHandle) {
     let pending = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let Ok(stream) = stream else {
+            // 3.0.1（#16 修复）：accept 持续失败不再空转 —— 记日志 + 退避后重试
+            accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
+            log::warn!(
+                "单实例 accept 失败（{}ms 后重试）",
+                accept_backoff.as_millis()
+            );
+            std::thread::sleep(accept_backoff);
+            continue;
+        };
+        accept_backoff = Duration::from_millis(10);
         if pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_CONNS {
             pending.fetch_sub(1, Ordering::SeqCst);
             drop(stream);
             continue;
         }
         let handle = handle.clone();
-        let pending = pending.clone();
+        let pending_in_thread = pending.clone();
         let active = active.clone();
         let expected_token = expected_token.clone();
-        std::thread::spawn(move || {
-            // 2.8.2：处理线程 panic 不得泄漏计数（否则累计后单实例转发
-            // 永久失效）
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_connection(&handle, stream, &expected_token, active);
-            }));
-            if result.is_err() {
-                log::warn!("单实例连接处理线程 panic（已恢复）");
+        // 3.0.1（#16 修复）：thread::spawn 失败（线程数耗尽）旧实现 panic 掉
+        // 整个 accept 循环 —— 单实例转发从此永久失效。改 Builder::spawn +
+        // 失败记日志（放弃该连接），accept 循环存活。
+        match std::thread::Builder::new()
+            .name("si-conn".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_connection(&handle, stream, &expected_token, active);
+                }));
+                if result.is_err() {
+                    log::warn!("单实例连接处理线程 panic（已恢复）");
+                }
+                pending_in_thread.fetch_sub(1, Ordering::SeqCst);
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("单实例处理线程创建失败（放弃该连接）: {}", e);
+                pending.fetch_sub(1, Ordering::SeqCst);
             }
-            pending.fetch_sub(1, Ordering::SeqCst);
-        });
+        }
     }
 }
 
@@ -392,8 +418,8 @@ fn handle_connection(
     expected_token: &str,
     active: Arc<AtomicUsize>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(CONN_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONN_IO_TIMEOUT));
     let mut reader = BufReader::new(stream);
 
     // 1. 握手：必须为 "PROTO_HELLO <token>" 且令牌逐字节一致

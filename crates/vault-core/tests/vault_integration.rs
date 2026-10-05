@@ -2307,6 +2307,47 @@ fn dod_overwrite_range_rejects_out_of_bounds() {
     );
 }
 
+/// 3.0.1 回归（F1 假阳性收口）：伪条目是纯随机字节，有概率恰好形成
+/// 1-2 字符的「合理别名」+ 随机 index_offset —— 全量范围硬校验曾把这样的
+/// 正常保险柜永久拒绝打开（假阳性砖化）。构造该形态：把伪条目的别名字段
+/// 写成 "K "（合理）+ 越界偏移，重开必须成功（该条目被按伪条目排除），
+/// 且认证命中的真实分区不受影响。
+#[test]
+fn pseudo_entry_with_plausible_alias_and_random_range_does_not_block_open() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempdir("pseudorange");
+    let path = dir.join("pseudo.lyt");
+    const PWD: &str = "pseudo range test pwd!";
+    let mut v = Vault::default();
+    v.create(&path, PWD, None).unwrap();
+    v.close();
+
+    // 篡改**伪条目 1**（条目 0 = Main 真实分区）：别名字段 → "K" + 零填充，
+    // index_offset/length → 接近 u64::MAX 的随机值（条目内偏移 106+192+80/88）
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let base: u64 = 106 + 192;
+    f.seek(SeekFrom::Start(base)).unwrap();
+    let mut alias = [0u8; 16];
+    alias[0] = b'K';
+    f.write_all(&alias).unwrap();
+    f.seek(SeekFrom::Start(base + 80)).unwrap();
+    f.write_all(&(u64::MAX / 2).to_le_bytes()).unwrap();
+    f.write_all(&(u64::MAX / 2).to_le_bytes()).unwrap();
+    drop(f);
+
+    // 修复前：全量范围硬校验报「分区表校验失败」→ 永久打不开；
+    // 修复后：越界伪条目被排除出会话，正常打开
+    let mut v2 = Vault::default();
+    v2.open_and_authenticate(&path, PWD, None, None)
+        .expect("偶然合理的伪条目不得阻断开柜");
+    assert_eq!(v2.get_partitions().len(), 1, "越界伪条目不得进入分区表");
+    v2.close();
+}
+
 /// F1 回归：未认证的头部 index_offset/length 驱动的破坏性擦除必须在打开时
 /// 被全分区范围校验拦截（攻击者无需密码：只改文件即可触发旧缺陷）
 #[test]

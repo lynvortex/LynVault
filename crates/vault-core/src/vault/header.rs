@@ -1,8 +1,11 @@
 //! 头部格式层 —— 头部读写（v4/v5/v6）、解析、签名、认证标签绑定、别名字段。
 //! 3.0.0 拆分自 vault.rs，逻辑逐字节不变。
+//! 3.0.1（P0 #1 修复）：所有对**最终保险柜文件**的原地头部写入改经「日志边车」
+//! （见 [`write_header_bytes_journaled`]）—— 单缓冲原地覆写在中途掉电/撕裂后
+//! 签名与认证必失败且无冗余可恢复，是「无攻击者也砖化整柜」的唯一剩余项。
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -12,6 +15,7 @@ use crate::error::VaultError;
 use crate::lock::LockState;
 
 use super::consts::*;
+use super::fs_util::sync_parent_dir;
 use super::PartitionInfo;
 
 /// 2.8.0：头部锁定区信息（开锁前的失败尝试提示用）
@@ -112,7 +116,9 @@ pub fn read_vault_yk_salt(path: &Path) -> Result<[u8; 32], VaultError> {
     Ok(yk_salt)
 }
 
-/// 写入完整头部（含签名）—— 按格式版本分发。
+/// 写入完整头部（含签名）—— 按格式版本分发（**直接写入**，仅适用于全新文件：
+/// create 路径与碎片整理 / 升级管线的临时文件。对已存在保险柜的原地头部更新
+/// 一律走 [`write_header_journaled`]，见其文档）。
 pub(crate) fn write_header_to_file(
     file: &mut File,
     version: u8,
@@ -124,29 +130,227 @@ pub(crate) fn write_header_to_file(
 ) -> Result<(), VaultError> {
     match version {
         // v4 保留区保持全 0（二因子不适用于 v4，挑战盐无意义）
-        VERSION_V4 => write_header_v4(file, lock_state, salt, partitions, sign_key),
-        // v6 与 v5 头部同布局，仅版本字节不同（认证标签 / 包裹 AAD 按版本绑定）
-        VERSION_V5 | VERSION_V6 => write_header_envelope(
+        VERSION_V4 => write_header_bytes(
             file,
+            &build_header_v4(lock_state, salt, partitions, sign_key),
+        ),
+        // v6 与 v5 头部同布局，仅版本字节不同（认证标签 / 包裹 AAD 按版本绑定）
+        VERSION_V5 | VERSION_V6 => write_header_bytes(
+            file,
+            &build_header_envelope(
+                version,
+                lock_state,
+                salt,
+                partitions,
+                sign_key,
+                yk_challenge_salt,
+            )?,
+        ),
+        v => Err(VaultError::Other(format!("未知的保险柜格式版本: {}", v))),
+    }
+}
+
+/// 3.0.1（P0 #1 修复）：对**已存在的保险柜文件**做头部更新 —— 经日志边车
+/// 防撕裂。旧实现 2 KiB 单缓冲在 offset 0 原地覆写，中途掉电/崩溃撕裂后
+/// 签名与认证必失败且无冗余可恢复（改密 / save_index / 增删分区均触发，
+/// 是「无攻击者也砖化整柜」的唯一路径）。
+///
+/// 三步协议（与索引 C3 修复同一思想，下沉到头部层）：
+/// 1. 完整新头部快照写入边车日志（`.lyt.hdr.journal`，create_new + fsync +
+///    目录 fsync）；
+/// 2. 头部原地覆写 + fsync；
+/// 3. 删除日志 + 目录 fsync。
+///
+/// 任意一步中断，下次打开由 [`recover_header_from_journal`] 收敛：
+/// 日志完好 → 恢复或完成写入；日志撕裂 → 删除（头部要么已写完，要么日志
+/// 本就无有效内容）。
+#[allow(clippy::too_many_arguments)] // 与 write_header_to_file 保持同形签名
+pub(crate) fn write_header_journaled(
+    file: &mut File,
+    vault_path: &Path,
+    version: u8,
+    lock_state: &LockState,
+    salt: &[u8; 32],
+    partitions: &[PartitionInfo],
+    sign_key: &[u8; 32],
+    yk_challenge_salt: &[u8; 32],
+) -> Result<(), VaultError> {
+    let header: Vec<u8> = match version {
+        VERSION_V4 => build_header_v4(lock_state, salt, partitions, sign_key).to_vec(),
+        VERSION_V5 | VERSION_V6 => build_header_envelope(
             version,
             lock_state,
             salt,
             partitions,
             sign_key,
             yk_challenge_salt,
-        ),
-        v => Err(VaultError::Other(format!("未知的保险柜格式版本: {}", v))),
-    }
+        )?
+        .to_vec(),
+        v => return Err(VaultError::Other(format!("未知的保险柜格式版本: {}", v))),
+    };
+    write_header_bytes_journaled(file, vault_path, &header)
 }
 
-/// v4 头部（1024 字节）—— 与 2.x 历史格式逐字节一致。
-pub(crate) fn write_header_v4(
+/// 头部边车日志路径（`<保险柜>.hdr.journal`）。
+pub(crate) fn journal_path(vault_path: &Path) -> PathBuf {
+    let mut s = vault_path.as_os_str().to_os_string();
+    s.push(".hdr.journal");
+    PathBuf::from(s)
+}
+
+/// 日志边车原子写入：create_new（不跟随链接）+ fsync + 目录 fsync。
+/// 目标已存在（上一轮崩溃遗留的未恢复日志）→ 移除后重试一次 —— 新快照
+/// 即将取代它，且打开路径已先于任何会话写入执行过恢复。
+fn write_journal_atomic(jp: &Path, header: &[u8]) -> Result<(), VaultError> {
+    let write_once = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(jp)?;
+        f.write_all(header)?;
+        f.sync_all()?;
+        Ok(())
+    };
+    match write_once() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(jp);
+            write_once()?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    sync_parent_dir(jp);
+    Ok(())
+}
+
+/// 头部字节经日志边车落盘（[`write_header_journaled`] 的字节层收口，
+/// 亦供锁定区部分更新复用）。
+pub(crate) fn write_header_bytes_journaled(
     file: &mut File,
+    vault_path: &Path,
+    header: &[u8],
+) -> Result<(), VaultError> {
+    debug_assert!(header.len() == HEADER_SIZE_V4 || header.len() == HEADER_SIZE_V5);
+    let jp = journal_path(vault_path);
+    write_journal_atomic(&jp, header)?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(header)?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if write_result.is_ok() {
+        let _ = std::fs::remove_file(&jp);
+        sync_parent_dir(vault_path);
+    }
+    // 写入失败时保留日志（下次打开恢复）；向上传播写入错误 —— 调用方的
+    // 崩溃一致性约定（先写头部、成功后才提交内存）不因此改变
+    write_result.map_err(VaultError::from)
+}
+
+/// 3.0.1（P0 #1 修复）：打开路径调用 —— 收敛上一次头部写入崩溃遗留的日志。
+/// 须已持有独占句柄（open_vault_rw + lock_vault_exclusive 之后、任何读判定
+/// 之前）。静默容错：任何失败都不阻塞打开（最坏保持现状，日志留给下次）。
+pub(crate) fn recover_header_from_journal(file: &mut File, vault_path: &Path) {
+    let jp = journal_path(vault_path);
+    let Ok(data) = std::fs::read(&jp) else {
+        return; // 无日志 = 常态
+    };
+    let size = data.len();
+    // 日志必须是完整头部快照：长度与版本字节互相印证（防半截日志被当成
+    // 有效头部恢复）
+    let valid = (size == HEADER_SIZE_V4 || size == HEADER_SIZE_V5)
+        && &data[..8] == MAGIC
+        && matches!(data[8], VERSION_V4 | VERSION_V5 | VERSION_V6)
+        && ((size == HEADER_SIZE_V4) == (data[8] == VERSION_V4));
+    if !valid {
+        // 撕裂的日志无恢复价值：头部要么已更新完成（原地写成功于日志之后），
+        // 要么本就等不到有效快照 —— 删除避免永久滞留
+        let _ = std::fs::remove_file(&jp);
+        sync_parent_dir(vault_path);
+        return;
+    }
+    // 文件本体短于头部：头部层无法修复（外部截断），清日志并放行
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len < size as u64 {
+        let _ = std::fs::remove_file(&jp);
+        return;
+    }
+    // 与当前头部逐字节比对：一致 = 原地写已完成（仅日志删除失败遗留）→ 清理
+    let mut current = vec![0u8; size];
+    let same = file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut current))
+        .is_ok()
+        && current == data;
+    if same {
+        let _ = std::fs::remove_file(&jp);
+        sync_parent_dir(vault_path);
+        return;
+    }
+    // 不一致 = 原地写未完成 → 用完整快照恢复头部
+    let restored = file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&data))
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+        .is_ok();
+    if restored {
+        let _ = std::fs::remove_file(&jp);
+    }
+    // 恢复失败保留日志，下次打开重试
+    sync_parent_dir(vault_path);
+}
+
+/// 3.0.1（P0 #1 修复）：锁定区部分更新（开柜失败计数 +1）同样经日志防撕裂
+/// —— 41 字节小写撕裂同样破坏锁定区 HMAC，下次打开报「头部可能被篡改」。
+/// 读全头部 → 内存补丁 → 全量日志协议。
+pub(crate) fn write_lock_region_journaled(
+    file: &mut File,
+    vault_path: &Path,
+    lock_offset: usize,
+    lock_buf: &[u8; 41],
+) -> Result<(), VaultError> {
+    let header_size = if lock_offset == LOCK_OFFSET_V4 {
+        HEADER_SIZE_V4
+    } else {
+        HEADER_SIZE_V5
+    };
+    let mut header = vec![0u8; header_size];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    header[lock_offset..lock_offset + 41].copy_from_slice(lock_buf);
+    write_header_bytes_journaled(file, vault_path, &header)
+}
+
+/// 把构建好的头部字节直接写入文件 offset 0（全新文件专用，见
+/// [`write_header_to_file`] 文档）。
+fn write_header_bytes(file: &mut File, header: &[u8]) -> Result<(), VaultError> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(header)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// v4 头部构建（1024 字节）—— 与 2.x 历史格式逐字节一致。
+pub(crate) fn build_header_v4(
     lock_state: &LockState,
     salt: &[u8; 32],
     partitions: &[PartitionInfo],
     sign_key: &[u8; 32],
-) -> Result<(), VaultError> {
+) -> [u8; HEADER_SIZE_V4] {
     let mut header = [0u8; HEADER_SIZE_V4];
 
     header[..8].copy_from_slice(MAGIC);
@@ -195,30 +399,24 @@ pub(crate) fn write_header_v4(
 
     let sig = compute_header_signature(&header[..SIGNED_LENGTH], sign_key);
     header[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE].copy_from_slice(&sig);
-
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&header)?;
-    file.flush()?;
-    file.sync_all()?;
-    Ok(())
+    header
 }
 
-/// v5/v6 信封头部（2048 字节，2.8.0 起）：与 v4 的差异 ——
+/// v5/v6 信封头部构建（2048 字节，2.8.0 起）：与 v4 的差异 ——
 /// - 分区条目 96 → 192 字节：新增 60 字节 `wrapped_key`（nonce12 + ct32 + tag16）；
 /// - 条目保留字段同样填充随机数（真实条目先整体随机再覆写结构化字段，
 ///   不给「保留区为 0」这类可区分标记留位置）；
 /// - 锁定区移至 1642（106 + 8×192），签名覆盖 header[..1984] 并写在 1984..2048。
 ///
 /// 3.0.0（v6）：头部布局与 v5 完全一致，版本字节参数化（5 或 6）。
-pub(crate) fn write_header_envelope(
-    file: &mut File,
+pub(crate) fn build_header_envelope(
     version: u8,
     lock_state: &LockState,
     salt: &[u8; 32],
     partitions: &[PartitionInfo],
     sign_key: &[u8; 32],
     yk_challenge_salt: &[u8; 32],
-) -> Result<(), VaultError> {
+) -> Result<[u8; HEADER_SIZE_V5], VaultError> {
     debug_assert!(matches!(version, VERSION_V5 | VERSION_V6));
     let mut header = [0u8; HEADER_SIZE_V5];
 
@@ -277,12 +475,7 @@ pub(crate) fn write_header_envelope(
         compute_header_signature(&canonical, sign_key)
     };
     header[SIGNATURE_OFFSET_V5..SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE].copy_from_slice(&sig);
-
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&header)?;
-    file.flush()?;
-    file.sync_all()?;
-    Ok(())
+    Ok(header)
 }
 
 /// 按格式版本返回头部大小（碎片整理 / 升级管线的占位头部尺寸必须与之一致，

@@ -28,6 +28,24 @@ const HMAC_LEN: usize = 20;
 /// 挑战上限（YubiKey HMAC-SHA1 最大 64 字节）
 const MAX_CHALLENGE: usize = 64;
 
+/// 3.0.1（#17 修复）：SELECT OTP 应用后的 YubiKey 专属属性校验 ——
+/// 旧实现只按读卡器名含 "yubikey" 匹配，同名恶意读卡器在场即可注入自选
+/// 响应。SELECT 响应的负载形态是 YubiKey OTP 应用的固有属性：
+/// 10 字节，首 3 字节为固件版本（主版本 1-6，实测设备 3.x-5.x）。
+/// 至少要求「负载 ≥ 10 字节 + 版本字节合理 + 非全零」—— 抬高伪装门槛
+///（随机应答的恶意读卡器几乎必然失配）；残余限制：无法从协议层根除
+/// 深度伪装，开柜方向本就 fail-closed（错误响应解包必失败）。
+fn validate_select_response(payload: &[u8]) -> Result<(), String> {
+    if payload.len() < 10 {
+        return Err("SELECT 响应形态异常（非 YubiKey OTP 应用？）".into());
+    }
+    let major = payload[0];
+    if !(1..=6).contains(&major) || payload[..3] == [0, 0, 0] {
+        return Err("SELECT 响应版本字段异常（疑似伪造读卡器）".into());
+    }
+    Ok(())
+}
+
 /// 建立上下文并返回第一个「名称含 YubiKey」的读卡器 + 已连接卡片
 fn connect_first_yubikey() -> Result<(Context, Card), String> {
     let ctx = Context::establish(pcsc::Scope::User)
@@ -71,7 +89,8 @@ fn transmit_checked(card: &Card, apdu: &[u8]) -> Result<Vec<u8>, String> {
 pub fn probe() -> Result<bool, String> {
     let probe_result = (|| -> Result<bool, String> {
         let (_ctx, card) = connect_first_yubikey()?;
-        transmit_checked(&card, &APDU_SELECT)?;
+        let payload = transmit_checked(&card, &APDU_SELECT)?;
+        validate_select_response(&payload)?;
         Ok(true)
     })();
     match probe_result {
@@ -86,7 +105,8 @@ pub fn probe() -> Result<bool, String> {
 /// 对 `&[u8; 64]` 永假的长度检查。
 pub fn challenge_response(challenge: &[u8; 64]) -> Result<[u8; HMAC_LEN], String> {
     let (_ctx, card) = connect_first_yubikey()?;
-    transmit_checked(&card, &APDU_SELECT)?;
+    let sel = transmit_checked(&card, &APDU_SELECT)?;
+    validate_select_response(&sel)?;
 
     let mut apdu = Vec::with_capacity(5 + MAX_CHALLENGE);
     apdu.extend_from_slice(&[

@@ -78,8 +78,11 @@ pub fn derive_legacy_lock_key(
 
     let mut master = [0u8; 32];
     if let Err(e) = argon2.hash_password_into(&combined, &lock_salt, &mut master) {
+        // 3.0.1（#21 修复）：Argon2 失败时输出缓冲可能已部分写入（中间态），
+        // 一并清零
         combined.zeroize();
         lock_salt.zeroize();
+        master.zeroize();
         return Err(VaultError::Other(format!(
             "Argon2id 派生 legacy lock_key 失败: {}",
             e
@@ -147,7 +150,10 @@ fn argon2_master(
     // combined（含主密码字节）再返回，不允许 `?` 提前返回跳过零化
     let mut master = [0u8; 32];
     if let Err(e) = argon2.hash_password_into(&combined, salt, &mut master) {
+        // 3.0.1（#21 修复）：Argon2 失败时输出缓冲可能已部分写入（中间态），
+        // 一并清零
         combined.zeroize();
+        master.zeroize();
         return Err(VaultError::Other(format!("Argon2id 派生失败: {}", e)));
     }
     combined.zeroize();

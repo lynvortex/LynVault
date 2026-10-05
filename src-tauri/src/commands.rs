@@ -31,12 +31,19 @@ static DIALOG_TOKENS: Mutex<Vec<(String, Vec<String>, Instant)>> = Mutex::new(Ve
 /// 3.0.1（F16）：对话框令牌有效期 —— 正常流程（选完即导入/提取）远短于此
 const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(600);
 
-/// 3.0.0（优化2）：媒体流式预览令牌表 —— (token, vpath)。
+/// 3.0.0（优化2）：媒体流式预览令牌表 —— (token, vpath, 签发时刻)。
 /// 非一次性（播放/拖动进度条会对同一 URL 发多次 Range 请求），随会话
 /// 生命周期：开柜时签发、关柜/锁定/销毁即全部作废。被攻陷的 WebView
 /// 最多流式读取「已由用户点开预览的那个文件」—— 与 load_file_content
 /// 的既有信任模型一致，且受扩展名白名单与分块布局双重约束。
-static MEDIA_TOKENS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// 3.0.1（#14 修复）：条目带签发时刻（15 分钟闲置过期）+ 按 vpath 去重
+///（重签发不挤出其他在播令牌）。
+static MEDIA_TOKENS: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
+
+/// 3.0.1（#14 修复）：媒体令牌闲置过期 —— 超过此时长的令牌失效（播放中
+/// 的令牌会随播放器请求不断刷新？否 —— 本实现按「签发时刻」判过期，
+/// 15 分钟足够覆盖一次连续预览会话；到期后由前端重新 mint）
+const MEDIA_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// 清空媒体令牌（会话结束点调用）
 pub fn clear_media_tokens() {
@@ -56,7 +63,12 @@ struct MediaSlot;
 
 impl MediaSlot {
     fn try_acquire() -> Option<MediaSlot> {
-        let mut guard = MEDIA_INFLIGHT.lock().ok()?;
+        // 3.0.1（#13 修复）：锁中毒恢复（与命令层 into_inner() 纪律一致）——
+        // 一次 panic 后预览静默死亡到重启的路径就此关闭
+        let mut guard = match MEDIA_INFLIGHT.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         if *guard >= MEDIA_MAX_INFLIGHT {
             return None;
         }
@@ -189,17 +201,23 @@ fn verify_dialog_paths(token: &str, paths: &[String]) -> Result<(), String> {
 
 /// 核验令牌但**不消费**（两段式流程的预检用 —— check_extract_all_dest
 /// 预检不焚令牌，最终提取才焚）
+/// 3.0.1（#18 修复）：补齐与 verify_dialog_paths 同一 TTL 检查 —— 3.0.1 只
+/// 给消费式核验加了过期判定，peek 漏了，过期令牌仍可通过预检形成
+/// 「过期令牌 + 任意路径」的窗口
 fn peek_dialog_paths(token: &str) -> Result<Vec<String>, String> {
     let guard = match DIALOG_TOKENS.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     // I2（审计整理）：与 verify_dialog_paths 同一恒定时间纪律
-    guard
+    let (_, paths, issued) = guard
         .iter()
         .find(|(t, _, _)| ct_eq_str(t, token))
-        .map(|(_, paths, _)| paths.clone())
-        .ok_or_else(|| "对话框令牌无效或已使用".to_string())
+        .ok_or_else(|| "对话框令牌无效或已使用".to_string())?;
+    if issued.elapsed() >= DIALOG_TOKEN_TTL {
+        return Err("对话框令牌无效或已使用".to_string());
+    }
+    Ok(paths.clone())
 }
 
 /// 2.4.1 新增：通过启动参数 / 文件关联传入的保险柜路径。
@@ -358,9 +376,16 @@ pub async fn create_vault(
                     .create(Path::new(&path), &password, key_data.as_deref())
                     .map_err(|e| e.to_string())?;
                 let mut guard = lock_vault(state)?;
+                // 3.0.1（#11 修复）：顶替已打开会话前先正常关闭旧会话并作废
+                // 媒体令牌 —— 与 open_vault 的 L-10/F16 不变量对齐（旧实现直接
+                // 覆盖：缓冲审计丢失、媒体令牌串会话）
+                if let Some(ref mut old) = *guard {
+                    old.close();
+                }
                 *guard = Some(vault);
                 // 2.8.0：保险柜已打开 → 启动剪贴板保护（开柜期间即时清空）
                 crate::clipboard_guard::start();
+                clear_media_tokens();
                 Ok(())
             })();
             if let Some(kd) = key_data {
@@ -408,27 +433,49 @@ pub async fn open_vault(
             state.check_auth_cooldown()?;
             // 3.0.0（M-1）：UNC / 设备路径守卫
             ensure_local_path(&path)?;
+            // 3.0.1（#7 修复，对齐 get_lock_info 的 F9）：扩展名门 —— 非法
+            // 扩展名直接拒绝，与「口令错误」不可区分
+            let lower = path.to_ascii_lowercase();
+            if !lower.ends_with(".lyt") && !lower.ends_with(".vault") {
+                return Err("密码或密钥文件不正确，或保险柜文件不可用".into());
+            }
             let key_data = load_key_file(&key_file_path)?;
             // 3.0.1（F2）：前端只声明意图（useYubikey），响应由后端现场挑战
             // 硬件计算 —— 旧实现接受 WebView 提供的任意 20 字节（静态重放面）
-            let yk = match use_yubikey {
-                Some(true) => {
-                    let salt = vault_core::read_vault_yk_salt(Path::new(&path))
-                        .map_err(|e| e.to_string())?;
-                    Some(compute_yk_response(&salt)?)
-                }
-                _ => None,
-            };
             let opened: Result<usize, String> = (|| {
+                // 3.0.1（#7 修复）：非口令类错误统一泛化 —— 旧实现可区分
+                // 「不存在 / 坏 magic / 过短 / 版本不支持」，是被攻陷 WebView
+                // 的免认证本地文件枚举 oracle。口令类结果（密码错误 / 锁定）
+                // 保持可区分；具体失败原因只进后端日志。
+                let yk = match use_yubikey {
+                    Some(true) => vault_core::read_vault_yk_salt(Path::new(&path))
+                        .ok()
+                        .and_then(|salt| compute_yk_response(&salt).ok()),
+                    _ => None,
+                };
                 let mut vault = Vault::default();
-                let idx = vault
-                    .open_and_authenticate(
-                        Path::new(&path),
-                        &password,
-                        key_data.as_deref(),
-                        yk.as_ref(),
-                    )
-                    .map_err(|e| e.to_string())?;
+                let idx = match vault.open_and_authenticate(
+                    Path::new(&path),
+                    &password,
+                    key_data.as_deref(),
+                    yk.as_ref(),
+                ) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        let generic = match e {
+                            vault_core::VaultError::AuthFailed => {
+                                "密码或密钥文件不正确".to_string()
+                            }
+                            vault_core::VaultError::Locked => {
+                                "保险柜已锁定（连续失败次数过多），请稍后再试".to_string()
+                            }
+                            vault_core::VaultError::AlreadyOpen => "保险柜已打开".to_string(),
+                            _ => "密码或密钥文件不正确，或保险柜文件不可用".to_string(),
+                        };
+                        log::warn!("open_vault 失败（细节仅入日志）: {}", e);
+                        return Err(generic);
+                    }
+                };
                 let mut guard = lock_vault(state)?;
                 // 3.0.0（L-10 审计修复）：顶替已打开会话前先正常关闭旧会话 ——
                 // 旧实现直接覆盖，旧 Vault 走 Drop 只清密钥不落盘，
@@ -1054,20 +1101,22 @@ pub async fn add_partition(
     key_file_path: Option<String>,
 ) -> Result<(), String> {
     run_blocking(&app, "add_partition", move |state| {
-        // 分区别名校验：只允许安全字符，防止 XSS。
-        // 2.6.1：收紧为 ASCII-only，禁止 Unicode 同形字符造成「视觉同名」的
-        // 分区别名混淆（与 vault-core::is_valid_alias 保持一致）。
-        if !alias
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ')
-        {
-            return Err("分区别名只能包含 ASCII 字母、数字、下划线、短横线和空格".into());
-        }
-        if alias.trim().is_empty() || alias.len() > 16 {
-            return Err("分区别名长度需在 1-16 字符之间".into());
-        }
-        // 2.3.0 修复：密码 / 密钥文件在所有路径上零化（旧实现 `?` 提前返回会跳过）
+        // 3.0.1（#12 修复）：别名校验移入内层闭包 —— 旧实现两条早退路径在
+        // password.as_mut_str().zeroize() 之前 return，口令以明文残留
         let result: Result<(), String> = (|| {
+            // 分区别名校验：只允许安全字符，防止 XSS。
+            // 2.6.1：收紧为 ASCII-only，禁止 Unicode 同形字符造成「视觉同名」的
+            // 分区别名混淆（与 vault-core::is_valid_alias 保持一致）。
+            if !alias
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ')
+            {
+                return Err("分区别名只能包含 ASCII 字母、数字、下划线、短横线和空格".into());
+            }
+            if alias.trim().is_empty() || alias.len() > 16 {
+                return Err("分区别名长度需在 1-16 字符之间".into());
+            }
+            // 2.3.0 修复：密码 / 密钥文件在所有路径上零化（旧实现 `?` 提前返回会跳过）
             let key_data = load_key_file(&key_file_path)?;
             let added: Result<(), String> = (|| {
                 let mut guard = lock_vault(state)?;
@@ -1219,41 +1268,46 @@ pub async fn preview_office_file(
     mut password: Option<String>,
 ) -> Result<String, String> {
     run_blocking(&app, "preview_office_file", move |state| {
-        // 2.8.2：带口令的尝试走认证冷却（3 秒）—— 旧实现文档口令可全速暴力
-        // 尝试，与开柜口令的限速不对称。无口令（OFFICE_ENCRYPTED 哨兵探测）
-        // 不消耗冷却。
-        if password.is_some() {
-            state.check_auth_cooldown()?;
-        }
-        let mut guard = lock_vault(state)?;
-        let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        // 2.5.1 修复（OOM）：旧实现直接 load_file_data（内部上限 256 MiB），
-        // 而 load_file_content 的预览路径有 64 MiB 上限 —— 同为「预览」，
-        // Office 路径却允许整读 256 MiB 再做解压解析，恶意/超大文件可瞬间
-        // 占用数百 MB 内存。现与预览路径统一 64 MiB 上限。
-        let size = {
-            let index = vault.load_index().map_err(|e| e.to_string())?;
-            index
-                .files
-                .get(&vpath)
-                .map(|m| m.size)
-                .ok_or("文件不存在")?
-        };
-        if size > MAX_PREVIEW_SIZE {
-            return Err(format!(
-                "文件过大（{} 字节），预览上限 64 MB，请使用「提取」导出后查看",
-                size
-            ));
-        }
-        let data = vault.load_file_data(&vpath).map_err(|e| e.to_string())?;
-        let filename = vpath.rsplit('/').next().unwrap_or(&vpath);
-        // 2.7.0：password 为 Some 时解密 Agile Encryption 加密文档（纯内存）；
-        // 为 None 且文档已加密时返回 OFFICE_ENCRYPTED 哨兵，由前端弹出口令输入
-        let text = vault_core::office::extract_office_text(&data, filename, password.as_deref());
+        // 3.0.1（#12 修复）：全部逻辑移入内层闭包，口令与明文缓冲在**唯一
+        // 出口**收口零化 —— 旧实现 5 条 `?`/return 早退路径跳过 zeroize。
+        let text: Result<String, String> = (|| {
+            // 2.8.2：带口令的尝试走认证冷却（3 秒）—— 旧实现文档口令可全速暴力
+            // 尝试，与开柜口令的限速不对称。无口令（OFFICE_ENCRYPTED 哨兵探测）
+            // 不消耗冷却。
+            if password.is_some() {
+                state.check_auth_cooldown()?;
+            }
+            let mut guard = lock_vault(state)?;
+            let vault = guard.as_mut().ok_or("保险柜未打开")?;
+            // 2.5.1 修复（OOM）：旧实现直接 load_file_data（内部上限 256 MiB），
+            // 而 load_file_content 的预览路径有 64 MiB 上限 —— 同为「预览」，
+            // Office 路径却允许整读 256 MiB 再做解压解析，恶意/超大文件可瞬间
+            // 占用数百 MB 内存。现与预览路径统一 64 MiB 上限。
+            let size = {
+                let index = vault.load_index().map_err(|e| e.to_string())?;
+                index
+                    .files
+                    .get(&vpath)
+                    .map(|m| m.size)
+                    .ok_or("文件不存在")?
+            };
+            if size > MAX_PREVIEW_SIZE {
+                return Err(format!(
+                    "文件过大（{} 字节），预览上限 64 MB，请使用「提取」导出后查看",
+                    size
+                ));
+            }
+            let data = vault.load_file_data(&vpath).map_err(|e| e.to_string())?;
+            let filename = vpath.rsplit('/').next().unwrap_or(&vpath).to_string();
+            // 2.7.0：password 为 Some 时解密 Agile Encryption 加密文档（纯内存）；
+            // 为 None 且文档已加密时返回 OFFICE_ENCRYPTED 哨兵，由前端弹出口令输入
+            let r = vault_core::office::extract_office_text(&data, &filename, password.as_deref());
+            vault_core::wipe::secure_wipe_vec(data);
+            r
+        })();
         if let Some(ref mut p) = password {
             p.as_mut_str().zeroize();
         }
-        vault_core::wipe::secure_wipe_vec(data);
         text
     })
     .await
@@ -1572,6 +1626,56 @@ pub async fn duress_rehearsal(
     .await
 }
 
+/// 3.0.1（#3 修复）：胁迫**物理清理** —— 随机化其他分区头部条目（同自动触发
+/// 语义）并对其密文残留做随机覆写，弥补自动触发「元数据级销毁、密文原地
+/// 残留」的缺口（duress 模块文档红线已如实声明）。
+/// **破坏性**：其他分区数据立即永久不可恢复；需当前分区口令验证 ——
+/// 被攻陷的 WebView 不能单次 invoke 触发全量破坏。进度经 scrub-progress 事件。
+#[tauri::command]
+pub async fn duress_scrub_partitions(
+    app: AppHandle,
+    mut confirm_password: String,
+    key_file_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let app_progress = app.clone();
+    run_blocking(&app, "duress_scrub_partitions", move |state| {
+        let result: Result<serde_json::Value, String> = (|| {
+            state.check_auth_cooldown()?;
+            let key_data = load_key_file(&key_file_path)?;
+            let scrubbed: Result<serde_json::Value, String> = (|| {
+                let mut guard = lock_vault(state)?;
+                let vault = guard.as_mut().ok_or("保险柜未打开")?;
+                // 口令验证（二因子分区现场挑战硬件）
+                let yk = session_yk_response(vault)?;
+                vault
+                    .verify_current_password(&confirm_password, key_data.as_deref(), yk.as_ref())
+                    .map_err(|_| "当前分区密码不正确，未执行清理".to_string())?;
+                let app3 = app_progress.clone();
+                let last = std::cell::Cell::new(Instant::now() - Duration::from_millis(200));
+                let n = vault
+                    .scrub_other_partitions_data(Some(&move |done: u64, total: u64| {
+                        if last.get().elapsed() >= Duration::from_millis(100) {
+                            last.set(Instant::now());
+                            let _ = app3.emit(
+                                "scrub-progress",
+                                serde_json::json!({ "done": done, "total": total }),
+                            );
+                        }
+                    }))
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "scrubbed": n }))
+            })();
+            if let Some(kd) = key_data {
+                vault_core::wipe::secure_wipe_vec(kd);
+            }
+            scrubbed
+        })();
+        confirm_password.as_mut_str().zeroize();
+        result
+    })
+    .await
+}
+
 // 3.0.1（F2 修复）：删除 `parse_yk_response` —— IPC 不再传递响应字节，
 // 响应由后端 `compute_yk_response` / `session_yk_response` 现场挑战硬件获得。
 
@@ -1592,16 +1696,24 @@ pub async fn mint_media_token(app: AppHandle, vpath: String) -> Result<String, S
                 "该文件为旧版整段布局，不支持流式预览 —— 请提取后查看".into()
             });
         }
-        // 签发（上限 64 个，超出丢弃最早的）
+        // 签发（按 vpath 去重：重签发替换同 vpath 旧令牌，不挤出其他在播
+        // 令牌；先清理过期条目；上限 64 超出才淘汰最旧）。
+        // 3.0.1（#14 修复）：锁失败显式报错（旧实现静默签发未注册令牌 ——
+        // 前端拿到一个必然 404 的死令牌）
         use rand::RngCore;
         let mut tb = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut tb);
         let token: String = tb.iter().map(|b| format!("{:02x}", b)).collect();
-        if let Ok(mut guard) = MEDIA_TOKENS.lock() {
+        {
+            let mut guard = match MEDIA_TOKENS.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.retain(|(_, vp, issued)| vp != &vpath && issued.elapsed() < MEDIA_TOKEN_TTL);
             if guard.len() >= 64 {
                 guard.remove(0);
             }
-            guard.push((token.clone(), vpath));
+            guard.push((token.clone(), vpath, Instant::now()));
         }
         let _ = mime; // MIME 在协议层按扩展名再取（路径在此不含用户可控部分）
         Ok(token)
@@ -1609,11 +1721,29 @@ pub async fn mint_media_token(app: AppHandle, vpath: String) -> Result<String, S
     .await
 }
 
+/// 3.0.1（#14 修复）：校验 URL 中的 b64url(vpath) 段与登记的 vpath 一致
+///（URL 安全 base64：`-`→`+`、`_`→`/`，补齐 padding 后按标准字母表解码，
+/// 与前端 _b64url 的编码方式互逆）。
+fn media_b64_matches(encoded: &str, vpath: &str) -> bool {
+    use base64::Engine;
+    let std_alpha = encoded.replace('-', "+").replace('_', "/");
+    let padded = match std_alpha.len() % 4 {
+        2 => format!("{}==", std_alpha),
+        3 => format!("{}=", std_alpha),
+        0 => std_alpha,
+        _ => return false, // 长度 %4 == 1 恒非法
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(padded.as_bytes())
+        .map(|b| b == vpath.as_bytes())
+        .unwrap_or(false)
+}
+
 /// 3.0.0（优化2）：媒体流式请求处理 —— 自定义协议 `lynvault-media://` 的
 /// Rust 侧。URL 路径 = `/<token>/<b64url(vpath)>`（两者均为 URL 安全字符集，
 /// 无需百分号编解码）；Range 请求映射到分块解密，明文内存占用 = 请求窗口。
-/// 安全：令牌随会话签发/作废；扩展名白名单；分块布局校验；响应 no-store
-///（禁止 WebView 磁盘缓存，维持「明文不落盘」承诺）。
+/// 安全：令牌随会话签发/作废（3.0.1 起带闲置过期）；扩展名白名单；分块布局
+/// 校验；响应 no-store（禁止 WebView 磁盘缓存，维持「明文不落盘」承诺）。
 pub fn media_stream_response(
     app: &AppHandle,
     request: &tauri::http::Request<Vec<u8>>,
@@ -1646,21 +1776,33 @@ fn media_stream_inner(
     if request.method() != "GET" {
         return not_found();
     }
-    // 解析路径：<token>/<b64url(vpath)> —— vpath 以令牌登记为准（不信任 URL）
+    // 解析路径：<token>/<b64url(vpath)> —— vpath 以令牌登记为准（不信任 URL）。
+    // 3.0.1（#14 修复）：b64 段不再是死参数 —— 必须与登记 vpath 一致。
     let path = request.uri().path().trim_start_matches('/');
-    let Some((token, _b64)) = path.split_once('/') else {
+    let Some((token, b64_segment)) = path.split_once('/') else {
         return not_found();
     };
     let vpath = {
-        let guard = match MEDIA_TOKENS.lock() {
+        let mut guard = match MEDIA_TOKENS.lock() {
             Ok(g) => g,
-            Err(_) => return not_found(),
+            Err(p) => p.into_inner(),
         };
-        match guard.iter().find(|(t, _)| ct_eq_str(t, token)) {
-            Some((_, v)) => v.clone(),
+        // 3.0.1（#14 修复）：过期令牌移除并 404（闲置过期）
+        match guard.iter().position(|(t, _, _)| ct_eq_str(t, token)) {
+            Some(pos) => {
+                if guard[pos].2.elapsed() >= MEDIA_TOKEN_TTL {
+                    guard.remove(pos);
+                    return not_found();
+                }
+                guard[pos].1.clone()
+            }
             None => return not_found(),
         }
     };
+    // 3.0.1（#14 修复）：URL 中的 b64url(vpath) 段与登记 vpath 严格比对
+    if !media_b64_matches(b64_segment, &vpath) {
+        return not_found();
+    }
     let ext = vpath.rsplit('.').next().unwrap_or("");
     let Some(mime) = media_mime(ext) else {
         return not_found();
@@ -1672,9 +1814,10 @@ fn media_stream_inner(
     };
 
     let state = app.state::<AppState>();
+    // 3.0.1（#13 修复）：锁中毒恢复 —— 与命令层 into_inner() 纪律一致
     let mut guard = match state.vault.lock() {
         Ok(g) => g,
-        Err(_) => return not_found(),
+        Err(p) => p.into_inner(),
     };
     let vault = match guard.as_mut() {
         Some(v) => v,
@@ -2059,13 +2202,48 @@ pub async fn disable_persistence(app: AppHandle) -> Result<String, String> {
 }
 
 /// 2.8.0：保存设置（要求已启用持久化）。防截屏开关即时生效。
+/// 3.0.1（#8 修复）：保险柜打开期间降低安全等级（关防截屏 / 禁用自动锁）
+/// 必须提供当前分区口令并通过验证 —— 被攻陷的 WebView 一次 invoke 即可解除
+/// SetWindowDisplayAffinity 并禁用自动锁柜的路径就此关闭（F22 的提示条只在
+/// 启动时出现，不构成防护）。
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), String> {
+pub async fn save_settings(
+    app: AppHandle,
+    settings: serde_json::Value,
+    confirm_password: Option<String>,
+) -> Result<(), String> {
     let app2 = app.clone();
-    run_blocking(&app, "save_settings", move |_state| {
+    run_blocking(&app, "save_settings", move |state| {
         let s: crate::settings::Settings =
             serde_json::from_value(settings).map_err(|e| format!("设置格式无效: {}", e))?;
         let s = s.sanitized();
+        // 3.0.1（#8 修复）：降级判定与口令确认（仅当保险柜打开时）
+        let degradation = {
+            let guard = lock_vault(state)?;
+            match guard.as_ref() {
+                Some(vault) => {
+                    let current = crate::settings::load_active()
+                        .map(|(_, s)| s)
+                        .unwrap_or_default();
+                    let lowered_screenshot = current.anti_screenshot && !s.anti_screenshot;
+                    let disabled_autolock = current.autolock_minutes > 0 && s.autolock_minutes == 0;
+                    vault.is_open() && (lowered_screenshot || disabled_autolock)
+                }
+                None => false,
+            }
+        };
+        if degradation {
+            let pwd = confirm_password
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .ok_or("降低安全设置（关闭防截屏 / 禁用自动锁）需要输入当前分区密码确认")?;
+            let mut guard = lock_vault(state)?;
+            let vault = guard.as_mut().ok_or("保险柜未打开")?;
+            let yk = session_yk_response(vault)?;
+            vault
+                .verify_current_password(pwd, None, yk.as_ref())
+                .map_err(|_| "当前分区密码不正确，安全设置未更改".to_string())?;
+        }
         let path = crate::settings::active_config_path()
             .ok_or("未启用持久化，请先在设置中启用后再修改")?;
         crate::settings::save_at(&path, &s)?;
@@ -2222,9 +2400,15 @@ pub async fn check_extract_all_dest(
         let vault_path = vault.get_path().ok_or("保险柜未打开或路径不可用")?;
         let safe_stem = export_stem(vault_path);
 
-        // 2.8.2（H2）：预检不焚令牌（peek）；2.8.2（M7）：保护目录拒绝
+        // 2.8.2（H2）：预检不焚令牌（peek）；2.8.2（M7）：保护目录拒绝。
+        // 3.0.1（#10 修复）：peek 返回值必须与传入路径严格比对 —— 旧实现丢弃
+        // 返回值，「过期令牌 + 任意路径」可探测目标子文件夹存在性（存在性
+        // oracle）；最终提取命令本就要求逐条一致，此处对齐。
         let token = token.ok_or("缺少对话框令牌（请通过「提取全部」对话框选择目标）")?;
-        peek_dialog_paths(&token)?;
+        let registered = peek_dialog_paths(&token)?;
+        if registered.len() != 1 || registered[0] != dest_parent_folder {
+            return Err("传入路径与对话框登记不一致（请求可能被伪造）".to_string());
+        }
         reject_protected_dest(Path::new(&dest_parent_folder))?;
 
         let dest_parent = Path::new(&dest_parent_folder);

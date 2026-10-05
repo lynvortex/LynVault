@@ -165,15 +165,17 @@ pub fn save_to(location: ConfigLocation, settings: &Settings) -> Result<PathBuf,
 
 /// 3.0.0（L-9）：临时文件加固打开 —— 不跟随符号链接 + 句柄级校验
 /// 「非重解析点 + 硬链接数为 1」，校验失败放弃写入（防链接注入受害者文件）。
+/// 3.0.1（#15）：独占创建（create_new）+ 加固打开 —— 随机临时名下创建即
+/// 唯一，不截断既有内容；「不跟随符号链接 + 非重解析点 + 硬链接数为 1」
+/// 校验与 open_tmp_secure 相同。
 #[cfg(windows)]
-fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
+fn open_tmp_secure_new(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(tmp)?;
     // 句柄级确认（与 main.rs 日志写入同一套检查）
@@ -201,14 +203,14 @@ fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(windows))]
-fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
+fn open_tmp_secure_new(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // O_NOFOLLOW：拒绝指向已有符号链接的目标
+    // O_NOFOLLOW：拒绝指向已有符号链接的目标；create_new 独占创建
     let f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
         .open(tmp)?;
     // 3.0.1（F23 修复）：与 Windows 分支对称 —— O_NOFOLLOW 挡符号链接但
     // 挡不住在固定可预测名（settings.json.tmp）上预置的**硬链接**；
@@ -229,18 +231,29 @@ fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
 /// 2.8.2：原子写入（临时文件 + rename）—— 旧实现 fs::write 非原子且无 fsync，
 /// 写入中途掉电/被杀会留下截断的 settings.json，load_active 解析失败静默回
 /// 默认值，用户设置无提示丢失。
+/// 3.0.1（#15 修复）：临时名随机化 + create_new —— 旧实现固定
+/// `settings.json.tmp` 且不截断：并发保存（或上次崩溃残留）时旧内容更长会
+/// 混入新 JSON 尾部，损坏的 settings.json 静默重置全部设置；随机名同时消除
+/// 并发写者互踩。
 pub fn save_at(path: &std::path::Path, settings: &Settings) -> Result<(), String> {
     use std::io::Write;
     let sanitized = settings.clone().sanitized();
     let json =
         serde_json::to_string_pretty(&sanitized).map_err(|e| format!("序列化配置失败: {}", e))?;
-    let tmp = path.with_extension("json.tmp");
-    {
+    let tmp = {
+        use rand::RngCore;
+        let mut suffix = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let hex: String = suffix.iter().map(|b| format!("{:02x}", b)).collect();
+        path.with_extension(format!("json.tmp.{}", hex))
+    };
+    let write_result = (|| -> Result<(), String> {
         // 3.0.0（L-9 审计修复）：临时文件改为「不跟随符号链接」打开 + 句柄级校验
         // 「非重解析点 + 硬链接数为 1」—— 与日志文件（main.rs M5）同一威胁模型：
         // 预置符号链接/硬链接把配置写入（或 rename 覆盖）指向受害者文件。
-        // 固定名 + File::create（跟随链接）正是 M5 修过的原语。
-        let mut f = open_tmp_secure(&tmp).map_err(|e| {
+        // 3.0.1（#15）：create_new（随机名碰撞概率可忽略；残留/竞态直接失败重试
+        // 由调用方感知，绝不截断他人内容）
+        let mut f = open_tmp_secure_new(&tmp).map_err(|e| {
             format!(
                 "配置目录不可写（{}）。便携模式请把程序放到可写位置，或改用用户目录",
                 e
@@ -249,15 +262,21 @@ pub fn save_at(path: &std::path::Path, settings: &Settings) -> Result<(), String
         f.write_all(json.as_bytes())
             .map_err(|e| format!("配置写入失败: {}", e))?;
         f.sync_all().map_err(|e| format!("配置落盘失败: {}", e))?;
-    }
-    // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖已存在目标
-    std::fs::rename(&tmp, path).map_err(|e| {
+        drop(f);
+        // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖已存在目标
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!(
+                "配置写入失败（{}）。便携模式请把程序放到可写位置，或改用用户目录",
+                e
+            )
+        })
+    })();
+    // 收口：任何失败路径清理临时文件（成功时 rename 已移走）
+    if write_result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        format!(
-            "配置写入失败（{}）。便携模式请把程序放到可写位置，或改用用户目录",
-            e
-        )
-    })
+    }
+    write_result
 }
 
 /// 删除当前生效的配置文件（关闭持久化）。返回被删除的路径。

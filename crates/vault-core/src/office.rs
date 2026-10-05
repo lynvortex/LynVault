@@ -634,19 +634,26 @@ fn decrypt_standard_package(
     let key = derive_standard_key_from_password(password, &p.salt, p.key_bits);
 
     // 口令校验（AES-ECB）。
-    // 2.8.1：verifier 比对改为恒定时间（与 Agile 路径的 ct_eq 纪律一致），
-    // 并给 verifier_hash 解密失败的早退路径补上 key 清零（旧实现 key 以明文 drop）
-    let mut verifier = aes_ecb_decrypt(&key, &p.encrypted_verifier).ok_or_else(|| {
-        let mut k = key.clone();
-        k.zeroize();
-        "文档已损坏".to_string()
-    })?;
+    // 2.8.1：verifier 比对改为恒定时间（与 Agile 路径的 ct_eq 纪律一致）。
+    // 3.0.1（#22 修复）：错误路径改为 move + zeroize —— 旧实现注释声称补了
+    // 清零，实际清零的是 clone，原 key 两条早退路径以明文 drop。
+    let mut verifier = match aes_ecb_decrypt(&key, &p.encrypted_verifier) {
+        Some(v) => v,
+        None => {
+            let mut key = key;
+            key.zeroize();
+            return Err("文档已损坏".to_string());
+        }
+    };
+    let verifier_hash = match aes_ecb_decrypt(&key, &p.encrypted_verifier_hash) {
+        Some(v) => v,
+        None => {
+            let mut key = key;
+            key.zeroize();
+            return Err("文档已损坏".to_string());
+        }
+    };
     let expected = hash_bytes(HashAlg::Sha1, &verifier);
-    let verifier_hash = aes_ecb_decrypt(&key, &p.encrypted_verifier_hash).ok_or_else(|| {
-        let mut k = key.clone();
-        k.zeroize();
-        "文档已损坏".to_string()
-    })?;
     use subtle::ConstantTimeEq;
     let ok = verifier_hash.len() >= expected.len()
         && bool::from(verifier_hash.as_slice()[..expected.len()].ct_eq(&expected[..]));
@@ -773,12 +780,15 @@ pub fn extract_office_text(
 
 // ───────────────── 格式检测 ─────────────────
 
-/// 检测是否为 OLE 复合文档
+/// 检测是否为 OLE 复合文档。
+/// 3.0.1（#57 修复）：比对完整 8 字节 magic（旧实现只比前 4 字节 —— 非真实
+/// OLE 文件会被误导向 OLE 分支走一次干净失败；完整比对属检测收紧）。
 fn is_ole_compound(data: &[u8]) -> bool {
-    if data.len() < 4 {
+    const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    if data.len() < 8 {
         return false;
     }
-    data[..4] == [0xD0, 0xCF, 0x11, 0xE0]
+    data[..8] == OLE_MAGIC
 }
 
 // ───────────────── DOC 提取（旧版 Word OLE） ─────────────────
@@ -1164,6 +1174,9 @@ fn prescan_worksheet_xml(xml: &[u8]) -> Result<(), String> {
 /// xlsx 预扫描入口：交给 calamine 之前拒绝一切资源耗尽向量。
 fn prescan_xlsx(data: &[u8]) -> Result<(), String> {
     let cursor = Cursor::new(data);
+    // 已知限制（3.0.1 #56 文档化）：ZipArchive::new 会先为**全部**中央目录
+    // 条目分配元数据，条目数检查只能在其后 —— 64 MiB 预览上限下瞬态分配
+    // 约为文件体积的 2-4×（每条目 ~100 字节量级），不可前移，依赖上游。
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("ZIP 解析失败: {}", e))?;
     if archive.len() > MAX_XLSX_ZIP_ENTRIES {
         return Err(format!(
@@ -1172,20 +1185,28 @@ fn prescan_xlsx(data: &[u8]) -> Result<(), String> {
             MAX_XLSX_ZIP_ENTRIES
         ));
     }
-    let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    let mut names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    // 3.0.1（#52 修复）：名称去重 —— zip 的 by_name 恒取**最后一个**同名条目，
+    // 重复名称会让被遮蔽条目从未被计量（第一遍实测不完整）；按唯一名称集合
+    // 计量与 calamine 的解析目标（按名读取）一致。
+    names.sort();
+    names.dedup();
 
-    // 第一遍：逐条目**实测**解压尺寸（中央目录声明可撒谎，必须真解压计量）
+    // 第一遍：逐条目**实测**解压尺寸（中央目录声明可撒谎，必须真解压计量）。
+    // 3.0.1（#52 修复）：按索引逐一打开 —— 覆盖**物理上每个**条目
+    //（含被同名遮蔽者），总实测与文件真实解压开销一致。
     let mut total_uncompressed: u64 = 0;
-    for name in &names {
+    for i in 0..archive.len() {
         let mut f = archive
-            .by_name(name)
-            .map_err(|e| format!("ZIP 条目读取失败（{}）: {}", name, e))?;
+            .by_index(i)
+            .map_err(|e| format!("ZIP 条目 #{} 读取失败: {}", i, e))?;
+        let entry_name = f.name().to_string();
         let mut entry_total: u64 = 0;
         let mut buf = [0u8; 65536];
         loop {
             let n = f
                 .read(&mut buf)
-                .map_err(|e| format!("ZIP 条目解压失败（{}）: {}", name, e))?;
+                .map_err(|e| format!("ZIP 条目解压失败（{}）: {}", entry_name, e))?;
             if n == 0 {
                 break;
             }
@@ -1193,7 +1214,7 @@ fn prescan_xlsx(data: &[u8]) -> Result<(), String> {
             if entry_total > MAX_XLSX_ENTRY_UNCOMPRESSED {
                 return Err(format!(
                     "ZIP 条目 '{}' 解压尺寸超过上限（64 MiB）—— 可能为压缩炸弹",
-                    name
+                    entry_name
                 ));
             }
         }
@@ -1288,10 +1309,13 @@ fn prescan_biff_records(workbook: &[u8]) -> Result<(), String> {
                 bbox.merge(er + 1, ec + 1);
                 bbox.merge(sr + 1, sc + 1);
             }
-            // 单元格记录：FORMULA / LABELSST / NUMBER / LABEL / BOOLERR / RK / RSTRING / BLANK
+            // 单元格记录：FORMULA / LABELSST / NUMBER / LABEL / BOOLERR / RK / RSTRING / BLANK。
+            // 3.0.1（#54 修复）：删除 `r >= 65536` 死检查（rd16 返回 u16，恒假，
+            // 只会误导审计者以为这里有防护）；列检查保留（c 也来自 u16，但
+            // >= 256 的拒绝是真实语义）。
             0x0006 | 0x00FD | 0x0201 | 0x0203 | 0x0204 | 0x0205 | 0x027E | 0x00D6 if len >= 4 => {
                 let (r, c) = (rd16(p, 0), rd16(p, 2));
-                if r >= 65536 || c >= 256 {
+                if c >= 256 {
                     return Err(format!("单元格坐标超出 BIFF 极限（row={}, col={}）", r, c));
                 }
                 bbox.track(r + 1, c + 1)?;
@@ -1304,7 +1328,8 @@ fn prescan_biff_records(workbook: &[u8]) -> Result<(), String> {
                 if cl < cf {
                     return Err("MULRK/MULBLANK 列区间 end < start".to_string());
                 }
-                if r >= 65536 || cl >= 256 {
+                // 3.0.1（#54 修复）：`r >= 65536` 死检查删除（rd16 恒假）
+                if cl >= 256 {
                     return Err(format!("单元格坐标超出 BIFF 极限（row={}, col={}）", r, cl));
                 }
                 for c in cf..=cl {
@@ -1378,7 +1403,18 @@ where
     }
 
     for sheet_name in sheet_names {
-        output.push(format!("── {} ──", sheet_name));
+        // 3.0.1（#53 修复）：表名头行计入文本总量 —— 表名来自攻击者可控的
+        // workbook.xml（× MAX_SHEETS 个表），不计量的实际内存上界曾达承诺的
+        // 2-4 倍
+        let header = format!("── {} ──", sheet_name);
+        total += header.len() + 1;
+        if total > MAX_OFFICE_TEXT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "表格内容超过预览上限（64 MiB）",
+            ));
+        }
+        output.push(header);
 
         match workbook.worksheet_range(&sheet_name) {
             Ok(range) => {
@@ -1411,7 +1447,16 @@ where
                 }
             }
             Err(e) => {
-                output.push(format!("[读取错误: {}]", e));
+                // 3.0.1（#53 修复）：错误标记同样计入总量
+                let marker = format!("[读取错误: {}]", e);
+                total += marker.len() + 1;
+                if total > MAX_OFFICE_TEXT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "表格内容超过预览上限（64 MiB）",
+                    ));
+                }
+                output.push(marker);
             }
         }
         output.push(String::new());
@@ -1436,6 +1481,8 @@ fn extract_xls_ole_text(data: &[u8]) -> io::Result<String> {
 
 fn extract_docx_text(data: &[u8]) -> io::Result<String> {
     let cursor = Cursor::new(data);
+    // 已知限制（3.0.1 #56 文档化）：同 prescan_xlsx —— ZipArchive::new 为全部
+    // 中央目录条目分配元数据，条目数检查只能在其后（瞬态 ~2-4× 文件体积）。
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     // 2.5.1 修复：中央目录条目数上限（zip crate 为每个条目分配元数据）
@@ -1468,6 +1515,9 @@ fn parse_docx_xml(xml: &str) -> io::Result<String> {
     let mut paragraphs: Vec<String> = Vec::new();
     let mut current_para = String::new();
     let mut in_para = false;
+    // 3.0.1（#55 修复）：畸形 XML 不再静默截断接受 —— 解析失败时在预览尾部
+    // 显式标注「内容不完整」（用户不再误以为文档只有这么多内容）
+    let mut parse_broken = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1515,12 +1565,18 @@ fn parse_docx_xml(xml: &str) -> io::Result<String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(_) => {
+                parse_broken = true;
+                break;
+            }
             _ => {}
         }
         buf.clear();
     }
 
+    if parse_broken {
+        paragraphs.push("〔预览不完整：文档 XML 在此处解析失败，后续内容未展示〕".to_string());
+    }
     Ok(paragraphs.join("\n"))
 }
 

@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
-# 组装 lyn-vault_3.0.0_amd64.deb（在 WSL Ubuntu-22.04 内运行）
+# 组装 lyn-vault_<版本>_amd64.deb（在 WSL Ubuntu-22.04 内运行）
 # 结构参照 2.8.2 官方 bundler 产物；差异：webkit2gtk-4.1（Tauri 2）+ 新增 pcsclite 依赖
+#
+# 3.0.1（#39 修复）：
+# - 版本号从 src-tauri/tauri.conf.json 读取（旧实现硬编码 "3.0.0"，今天运行
+#   会产出标 3.0.0 的 deb）；
+# - SRC 取脚本自身所在目录（旧实现指向旧检出 "LynVault 3.0.0"，产出自
+#   过期源码）；
+# - STAGE 改 mktemp -d（旧固定 /tmp/deb-stage 在多用户环境可被预置符号
+#   链接/抢占），退出时自动清理；
+# - BIN 可用环境变量 LYNVAULT_BIN 覆盖。
 set -euo pipefail
 
-VERSION="3.0.0"
-SRC="/mnt/c/Users/Administrator/Desktop/Projects/LynVault/LynVault 3.0.0"
-BIN="/root/lynv-target/release/LynVault"
-STAGE="/tmp/deb-stage"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="${LYNVAULT_BIN:-/root/lynv-target/release/LynVault}"
 
-rm -rf "$STAGE"
+VERSION="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$SRC/src-tauri/tauri.conf.json" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+if [ -z "$VERSION" ]; then
+    echo "错误：无法从 tauri.conf.json 解析版本号" >&2
+    exit 1
+fi
+
+STAGE="$(mktemp -d)"
+cleanup() { rm -rf "$STAGE"; }
+trap cleanup EXIT
+
 mkdir -p "$STAGE/DEBIAN" \
     "$STAGE/usr/bin" \
     "$STAGE/usr/share/applications" \

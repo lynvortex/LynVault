@@ -17,8 +17,9 @@ mod yubikey;
 
 use std::fs::OpenOptions;
 
-/// 2.8.0：窗口标题版本号单一来源（与其他三处版本号统一）
-const APP_VERSION: &str = "3.0.0";
+/// 2.8.0：窗口标题版本号 —— 3.0.1（#43 修复）：从 Cargo.toml 派生（单一
+/// 来源），旧硬编码 "3.0.0" 在 3.0.1 发布时被遗漏，与其他三处版本号脱钩。
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 2.8.0：防截屏开关（对主窗口应用 SetWindowDisplayAffinity）。
 /// - 开启：WDA_EXCLUDEFROMCAPTURE（Win10 2004+，截屏/录屏/远程共享中窗口直接消失）；
@@ -566,6 +567,7 @@ fn main() {
             commands::clear_duress_mark,
             commands::get_duress_status,
             commands::duress_rehearsal,
+            commands::duress_scrub_partitions,
             // 3.0.0 新增：硬件密钥二因子（可选，YubiKey HMAC-SHA1 挑战-响应）
             // 3.0.1（F2）：yubikey_challenge 已删除 —— 响应不再出后端
             commands::enable_yubikey_2fa,

@@ -73,8 +73,9 @@ const VAULT_OPEN_FILTERS = [
 
 const state = {
     vaultOpen: false,
-    // 3.0.0：当前保险柜文件路径（硬件密钥挑战需要 —— 挑战由公开盐派生）
-    vaultPath: null,
+    // 3.0.1（#36 修复）：删除 state.vaultPath —— 自 3.0.0（F2）起硬件密钥
+    // 响应由后端现场挑战（挑战盐从保险柜文件读出），前端路径字段只写不读，
+    // 注释「挑战需要」已失实
     currentFolder: '/',
     selectedItems: [],
     searchMode: false, // 2.8.0：当前列表为搜索结果（清空搜索或导航后恢复目录视图）
@@ -849,7 +850,10 @@ function setBusy(on) {
     if (_busyCount < 0) _busyCount = 0;
     const ids = ['btn-close', 'btn-add-part', 'btn-del-part', 'btn-import-file',
         'btn-import-folder', 'btn-newfolder', 'btn-extract-all', 'btn-defrag', 'btn-destroy',
-        'btn-duress', 'btn-yk'];
+        'btn-duress', 'btn-yk',
+        // 3.0.1（#37 修复）：长操作期间这三个键同样冻结（后端串行化兜底之外
+        // 的 UI 一致性）
+        'btn-change-pwd', 'btn-audit', 'btn-verify'];
     ids.forEach(id => { const el = $(id); if (el) el.disabled = on || !state.vaultOpen; });
 }
 
@@ -1536,16 +1540,18 @@ function bindEvents() {
         repoLink.onclick = async (e) => {
             const url = repoLink.href;
             // 3.0.0（Tauri 2）：shell → opener 插件（capabilities 白名单限定 GitHub 仓库 URL）
+            // 3.0.1（#35 修复）：await 成功后才 preventDefault —— 旧实现先拦截
+            // 再 await，opener 失败时「保留默认行为」永不成立
             try {
                 if (window.__TAURI__ && window.__TAURI__.opener && window.__TAURI__.opener.openUrl) {
-                    e.preventDefault();
                     await window.__TAURI__.opener.openUrl(url);
-                } else {
                     e.preventDefault();
+                } else {
                     await invoke('plugin:opener|open_url', { url });
+                    e.preventDefault();
                 }
             } catch (err) {
-                console.warn('打开外部链接失败（保留默认行为）:', err);
+                console.warn('打开外部链接失败（回退浏览器默认行为）:', err);
             }
         };
     }
@@ -1906,6 +1912,28 @@ async function openSettings() {
                     window_height: h,
                     anti_screenshot: $('cfg-anti').checked,
                 };
+                // 3.0.1（#8 前端）：保险柜打开期间降低安全等级（关防截屏 /
+                // 禁用自动锁）需当前分区口令确认 —— 与后端强制验证配对
+                const lowersSecurity = (!!appSettings && appSettings.anti_screenshot && !newSettings.anti_screenshot) ||
+                    (!!appSettings && Number(appSettings.autolock_minutes) > 0 && newSettings.autolock_minutes === 0);
+                if (lowersSecurity && state.vaultOpen) {
+                    showInput('降低安全设置', '输入当前分区密码确认：', '', async (pwd) => {
+                        try {
+                            await invoke('save_settings', { settings: newSettings, confirmPassword: pwd || '' });
+                            settingsEnabled = true;
+                            appSettings = newSettings;
+                            applyTheme(newSettings.theme);
+                            applyWindowSize(newSettings.window_width, newSettings.window_height);
+                            resetIdleTimer();
+                            setStatus('设置已保存');
+                            return true;
+                        } catch (e2) {
+                            showInlineInputError(String(e2));
+                            return false;
+                        }
+                    }, true, null);
+                    return false; // 当前对话框让位给口令确认流程
+                }
                 try {
                     await invoke('save_settings', { settings: newSettings });
                     settingsEnabled = true;
@@ -2173,8 +2201,12 @@ async function manageDuress() {
     const active = status.active || '';
     const html =
         '<p>分区列表：<b>' + (parts.length ? parts.map(escapeHtml).join('、') : '无') + '</b></p>' +
-        '<p style="color:var(--danger,#e05555)">被标记为「胁迫分区」的密码在被胁迫交出后：其他所有分区的数据将被<b>永久销毁</b>，' +
-        '胁迫分区正常呈现（诱饵），操作记录不留痕迹。标记对外完全不可见。</p>' +
+        '<p style="color:var(--danger,#e05555)">被标记为「胁迫分区」的密码在被胁迫交出后：其他所有分区的头部条目将被<b>永久随机化</b>' +
+        '（数据从此不可达、不可找回），胁迫分区正常呈现（诱饵），操作记录不留痕迹，标记对外完全不可见。</p>' +
+        // 3.0.1（#3 修复）：如实声明「元数据级销毁」语义 —— 密文本体默认原地残留
+        '<p style="color:#8a6d1a"><b>如实说明：</b>触发属<b>元数据级销毁</b> —— 其他分区的密文本体默认<b>原地残留</b>' +
+        '（持有旧文件快照者可尝试嫁接，但仍需对应分区口令才能解密）。需要物理级清理请使用' +
+        '「物理清理死密文」（会放弃隐蔽性、产生批量 I/O，仅适合主动交出设备前使用）。</p>' +
         '<p><b>注意：</b>请选择/新建一个专门用作诱饵的分区 —— 若误标存放真实数据的分区，正常开柜即触发销毁。</p>';
     const buttons = [];
     if (parts.length >= 1) {
@@ -2183,6 +2215,8 @@ async function manageDuress() {
             buttons.push({ text: '标记已有分区', cls: 'btn-ok', action: () => flowMarkExisting(parts, active) });
             buttons.push({ text: '解除标记', cls: 'btn-cancel', action: () => flowClearDuress(parts) });
             buttons.push({ text: '演练触发', cls: 'btn-cancel', action: () => flowRehearseDuress(parts) });
+            // 3.0.1（#3 修复）：可选的物理级清理（显式调用，非自动执行）
+            buttons.push({ text: '物理清理死密文', cls: 'btn-cancel', action: () => flowScrubDuress() });
         }
     }
     buttons.push({ text: '关闭', cls: 'btn-cancel' });
@@ -2193,6 +2227,28 @@ async function _inputPassword(title, label) {
     return new Promise(resolve => {
         showInput(title, label, '', resolve, true, () => resolve(null));
     });
+}
+
+// 3.0.1（#3 修复）：胁迫物理清理 —— 随机化其他分区条目 + 覆写其密文残留。
+// 双重确认 + 当前分区口令验证（后端强制）。显式调用、绝不自动执行。
+async function flowScrubDuress() {
+    const ok1 = await uiAsk(
+        '即将随机化其他分区的头部条目，并对其密文残留做覆写清理。\n' +
+        '其他分区的数据将立即永久销毁（不可找回），且覆写期间产生批量 I/O（放弃隐蔽性）。\n确定继续？',
+        { title: '胁迫物理清理', type: 'error' }
+    );
+    if (!ok1) return;
+    const ok2 = await uiAsk('最终确认：我已理解此操作不可恢复。', { title: '最终确认', type: 'error' });
+    if (!ok2) return;
+    const pwd = await _inputPassword('胁迫物理清理', '输入当前分区密码验证：');
+    if (!pwd) return;
+    setStatus('正在清理其他分区死密文…');
+    try {
+        const r = data_of(await invoke('duress_scrub_partitions', { confirmPassword: pwd, keyFilePath: null }));
+        setStatus('物理清理完成（覆写 ' + formatSize(r.scrubbed || 0) + ' 死密文）');
+    } catch (e) {
+        showError(String(e));
+    }
 }
 
 async function _confirmDuressTwice() {
@@ -2395,7 +2451,6 @@ async function flowRehearseDuress(parts) {
 async function invokeOpenVault(filePath, pwd) {
     try {
         const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
-        state.vaultPath = filePath;
         return r;
     } catch (e) {
         // 未检测到 YubiKey 时直接按原错误走（密码错误内联提示）
@@ -2412,7 +2467,6 @@ async function invokeOpenVault(filePath, pwd) {
         if (!useKey) throw e;
         // 3.0.1（F2）：只声明意图（useYubikey），响应由后端现场挑战硬件
         const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null, useYubikey: true });
-        state.vaultPath = filePath;
         return r;
     }
 }
@@ -2657,6 +2711,11 @@ window.addEventListener('DOMContentLoaded', async () => {
             await window.__TAURI__.event.listen('extract-progress', (evt) => {
                 const p = evt.payload || {};
                 if (p.filesTotal) setStatus(`正在提取 ${p.filesDone || 0} / ${p.filesTotal}…`);
+            });
+            // 3.0.1（#3 修复）：胁迫物理清理进度
+            await window.__TAURI__.event.listen('scrub-progress', (evt) => {
+                const p = evt.payload || {};
+                if (p.total) setStatus(`正在清理死密文 ${Math.floor((p.done / p.total) * 100)}%`);
             });
             await window.__TAURI__.event.listen('integrity-progress', (evt) => {
                 const p = evt.payload || {};

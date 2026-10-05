@@ -245,14 +245,17 @@ impl Vault {
             ));
         }
         let old_part = self.partitions[0].clone();
-        let old_enc_key = **self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
-        let old_auth_key = **self.auth_key.as_ref().ok_or(VaultError::NotOpen)?;
+        // 3.0.1（#20 修复）：旧会话密钥以 Zeroizing 携带 —— 升级中途任何失败
+        // 路径（验证失败 / 备份失败 / 管线失败）出作用域即清零，不再只在
+        // 成功分支手工清零
+        let old_enc_key = Zeroizing::new(**self.enc_key.as_ref().ok_or(VaultError::NotOpen)?);
+        let old_auth_key = Zeroizing::new(**self.auth_key.as_ref().ok_or(VaultError::NotOpen)?);
 
         // 1. 验证当前密码（v4：直接派生三把密钥并与会话密钥恒定时间比较）
         {
             let keys = derive_keys(current_password, key_file_data, &old_part.salt)?;
             use subtle::ConstantTimeEq;
-            let enc_ok = bool::from(keys.enc_key.ct_eq(&old_enc_key));
+            let enc_ok = bool::from(keys.enc_key.ct_eq(&*old_enc_key));
             let mut k = keys;
             k.zeroize();
             if !enc_ok {
@@ -265,14 +268,18 @@ impl Vault {
 
         // 2. 磁盘预检（备份完整副本 + 临时文件，同一磁盘：约 2× + 4 MiB）
         let need = orig_len.saturating_mul(2).saturating_add(4 * 1024 * 1024);
-        if let Ok(free) = disk_free_bytes(vault_path.parent().unwrap_or(Path::new("."))) {
-            if free < need {
-                return Err(VaultError::Other(format!(
-                    "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），已取消操作，未产生任何中间文件",
-                    need / (1024 * 1024),
-                    free / (1024 * 1024),
-                )));
+        match disk_free_bytes(vault_path.parent().unwrap_or(Path::new("."))) {
+            Ok(free) => {
+                if free < need {
+                    return Err(VaultError::Other(format!(
+                        "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），已取消操作，未产生任何中间文件",
+                        need / (1024 * 1024),
+                        free / (1024 * 1024),
+                    )));
+                }
             }
+            // 3.0.1（#48 修复）：预查询失败至少留痕（旧实现静默跳过）
+            Err(e) => log::warn!("磁盘可用空间预检失败，跳过预检（继续执行）: {}", e),
         }
 
         // 3. 随机临时/备份文件名（防符号链接攻击，与碎片整理同一策略）
@@ -322,7 +329,7 @@ impl Vault {
                 old_part.index_length,
             )?
         };
-        let mut audit_log = AuditLog::from_entries(index.audit.clone(), old_auth_key);
+        let mut audit_log = AuditLog::from_entries(index.audit.clone(), *old_auth_key);
         // 换钥前先用旧密钥硬校验整条链（篡改即中止，不静默截断），再重建
         audit_log.rekey(&old_auth_key, new_keys.auth_key)?;
         audit_log.add("修改密码并升级为 v6 信封加密（流式分块）");
@@ -504,7 +511,7 @@ impl Vault {
                 let mut reopened: Option<File> = None;
                 let mut last_err: Option<VaultError> = None;
                 for _ in 0..3 {
-                    match open_vault_rw(&vault_path, false) {
+                    match open_vault_rw(&vault_path) {
                         Ok(f) => match lock_vault_exclusive(&f) {
                             Ok(()) => {
                                 reopened = Some(f);
@@ -519,12 +526,20 @@ impl Vault {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(150));
                 }
-                let file = reopened.ok_or_else(|| {
-                    VaultError::Other(format!(
-                        "密码修改已生效（旧密码已失效），但恢复会话失败（{}）。请用新密码重新打开保险柜",
-                        last_err.map(|e| e.to_string()).unwrap_or_default()
-                    ))
-                })?;
+                let file = match reopened {
+                    Some(f) => f,
+                    None => {
+                        // 3.0.1（#51 修复）：重开失败时磁盘已是 v6 新布局，内存却
+                        // 残留 v4 会话字段（旧密钥/旧分区表）—— 做 abandon_session
+                        // 等价的**纯内存**复位（不落盘任何内容），避免半死会话
+                        let msg = format!(
+                            "密码修改已生效（旧密码已失效），但恢复会话失败（{}）。请用新密码重新打开保险柜",
+                            last_err.map(|e| e.to_string()).unwrap_or_default()
+                        );
+                        self.abandon_session();
+                        return Err(VaultError::Other(msg));
+                    }
+                };
                 self.file = Some(file);
                 self.format_version = VERSION_V6;
                 self.data_key = Some(LockedKey::new(*data_key)); // Zeroizing 解包 → 装箱驻留
@@ -544,10 +559,7 @@ impl Vault {
                     }
                     self.audit_dirty = true;
                 }
-                let mut old_enc = old_enc_key;
-                old_enc.zeroize();
-                let mut old_auth = old_auth_key;
-                old_auth.zeroize();
+                // 3.0.1（#20）：旧密钥为 Zeroizing，drop 即清零（原手工清零删除）
                 Ok(())
             }
             Err(e) => {
@@ -564,7 +576,7 @@ impl Vault {
                         let _ = fs::remove_file(&backup_path);
                     }
                 }
-                let file = open_vault_rw(&vault_path, false).ok().and_then(|f| {
+                let file = open_vault_rw(&vault_path).ok().and_then(|f| {
                     lock_vault_exclusive(&f).ok()?;
                     Some(f)
                 });
@@ -742,14 +754,18 @@ impl Vault {
         // 同一磁盘上，按「约 2× 文件大小 + 4 MiB」预留；不足时明确拒绝且不产生
         // 任何中间文件（旧实现写到一半才失败，留下半份残留副本）。
         let need = orig_len.saturating_mul(2).saturating_add(4 * 1024 * 1024);
-        if let Ok(free) = disk_free_bytes(vault_path.parent().unwrap_or(Path::new("."))) {
-            if free < need {
-                return Err(VaultError::Other(format!(
-                    "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），已取消整理，未产生任何中间文件",
-                    need / (1024 * 1024),
-                    free / (1024 * 1024),
-                )));
+        match disk_free_bytes(vault_path.parent().unwrap_or(Path::new("."))) {
+            Ok(free) => {
+                if free < need {
+                    return Err(VaultError::Other(format!(
+                        "磁盘可用空间不足（需约 {} MB，仅剩 {} MB），已取消整理，未产生任何中间文件",
+                        need / (1024 * 1024),
+                        free / (1024 * 1024),
+                    )));
+                }
             }
+            // 3.0.1（#48 修复）：预查询失败至少留痕（旧实现静默跳过）
+            Err(e) => log::warn!("磁盘可用空间预检失败，跳过预检（继续执行）: {}", e),
         }
 
         // 随机临时文件名，防止符号链接攻击
@@ -890,6 +906,10 @@ impl Vault {
             let active = self.active_partition.ok_or(VaultError::NotOpen)?;
             self.partitions[active].index_offset = new_idx_offset;
             self.partitions[active].index_length = new_idx_length;
+            // 3.0.1（#5 修复）：步骤 4 已把会话内新增审计注入本次落盘的索引，
+            // 头部锚点必须与**本次落盘条目数**一致 —— 旧实现头部仍写旧计数，
+            // 下次开柜「锚点不符」假篡改警告。
+            self.partitions[active].audit_count = index.audit.len() as u32;
 
             // 步骤 6：写入头部（含所有分区的新偏移）
             let lock_state = &self.lock_state;
@@ -948,7 +968,7 @@ impl Vault {
                 let mut reopened: Option<File> = None;
                 let mut last_err: Option<String> = None;
                 for _ in 0..3 {
-                    match open_vault_rw(&vault_path, false) {
+                    match open_vault_rw(&vault_path) {
                         Ok(f) => match lock_vault_exclusive(&f) {
                             Ok(()) => {
                                 reopened = Some(f);
@@ -1050,7 +1070,7 @@ impl Vault {
                         self.partitions[active] = old_part;
                     }
                     self.file = None;
-                    let file = open_vault_rw(&vault_path, false).ok().and_then(|f| {
+                    let file = open_vault_rw(&vault_path).ok().and_then(|f| {
                         lock_vault_exclusive(&f).ok()?;
                         Some(f)
                     });
@@ -1114,7 +1134,38 @@ impl Vault {
         self.audit = None;
         self.audit_dirty = false;
 
-        // 基于已持有的句柄完成 DoD 7-pass 擦除 + 删除（全程不按路径重开）
-        Ok(crate::wipe::dod_erase_handle(file, &path, None)?)
+        // 基于已持有的句柄完成 DoD 7-pass 擦除 + 删除（全程不按路径重开）。
+        // 3.0.1（#6 修复）：擦除中途失败（瞬时占用 / I/O 错误）时旧实现直接
+        // 上抛 —— 会话已清空，重试只会 NotOpen，用户只能重启。改为内部短退避
+        // 重试：首次用会话句柄；失败后文件仍在则改走按路径擦除（dod_erase
+        // 自带 O_NOFOLLOW / REPARSE 防护），至多 3 次。文件已消失 = 删除达成。
+        let erase_err: Option<std::io::Error> =
+            match crate::wipe::dod_erase_handle(file, &path, None) {
+                Ok(()) => None,
+                Err(e) => {
+                    let mut err = Some(e);
+                    for _ in 0..2 {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        if !path.exists() {
+                            err = None;
+                            break;
+                        }
+                        match crate::wipe::dod_erase(&path, None) {
+                            Ok(()) => {
+                                err = None;
+                                break;
+                            }
+                            Err(e2) => err = Some(e2),
+                        }
+                    }
+                    err
+                }
+            };
+        // 3.0.1（P0 #1 修复）：头部日志边车随本体一并清理
+        let _ = std::fs::remove_file(super::header::journal_path(&path));
+        match erase_err {
+            None => Ok(()),
+            Some(e) => Err(VaultError::from(e)),
+        }
     }
 }

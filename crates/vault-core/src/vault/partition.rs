@@ -106,6 +106,7 @@ impl Vault {
         // 2.8.2（崩溃一致性）：先写头部、成功后才提交内存 —— 旧实现先
         // partitions.push 再 update_header，头部写入失败时内存与磁盘分叉，
         // 后续任意一次 save_index/update_header 都会把「失败的添加」持久化。
+        // 3.0.1（P0 #1 修复）：头部写入改经日志边车防撕裂。
         let new_entry = PartitionInfo {
             alias: alias.into(),
             salt: part_salt,
@@ -116,20 +117,9 @@ impl Vault {
             audit_count: 0,
         };
         {
-            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
-            let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
             let mut new_partitions = self.partitions.clone();
             new_partitions.push(new_entry.clone());
-            let yk_salt = self.yk_challenge_salt;
-            write_header_to_file(
-                file,
-                self.format_version,
-                &self.lock_state,
-                &self.salt,
-                &new_partitions,
-                sign_key,
-                &yk_salt,
-            )?;
+            self.write_header_with(&new_partitions)?;
             self.partitions = new_partitions;
         }
 
@@ -167,20 +157,9 @@ impl Vault {
             Some(active) if pos < active => Some(active - 1),
             other => other,
         };
-        {
-            let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
-            let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
-            let yk_salt = self.yk_challenge_salt;
-            write_header_to_file(
-                file,
-                self.format_version,
-                &self.lock_state,
-                &self.salt,
-                &new_partitions,
-                sign_key,
-                &yk_salt,
-            )?;
-        }
+        // 2.8.2（崩溃一致性）：先写头部、成功后才提交内存。
+        // 3.0.1（P0 #1 修复）：头部写入改经日志边车防撕裂。
+        self.write_header_with(&new_partitions)?;
         self.partitions = new_partitions;
         self.active_partition = new_active;
         self.log_event(&format!("删除分区 '{}'", alias));

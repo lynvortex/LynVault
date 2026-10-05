@@ -38,12 +38,12 @@ pub fn is_vault_file(path: &Path) -> bool {
 /// `FILE_FLAG_OPEN_REPARSE_POINT` / `O_NOFOLLOW` 打开，并用句柄元数据确认。
 /// 销毁路径（`Vault::destroy`）全程复用会话句柄，防护因此不再有「按路径重开」
 /// 的削弱窗口。
-pub(crate) fn open_vault_rw(path: &Path, create: bool) -> std::io::Result<File> {
+// 3.0.1（#46 修复）：删除 `create` 参数与 `create(true).truncate(true)` 死分支
+// —— 无任何调用方，且 truncate 语义是「打开即清空整柜」的脚枪；创建保险柜
+// 一律走 open_vault_create_new（目标存在时失败，绝不清零）。
+pub(crate) fn open_vault_rw(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
-    if create {
-        opts.create(true).truncate(true);
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -51,6 +51,13 @@ pub(crate) fn open_vault_rw(path: &Path, create: bool) -> std::io::Result<File> 
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         opts.share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        // 3.0.1（#47 修复）：显式访问掩码 = GENERIC 读写之外补 DELETE 权 ——
+        // 销毁路径的 delete-on-close（POSIX 语义，wipe::mark_delete_on_close）
+        // 要求本句柄持有 DELETE；旧实现句柄无 DELETE 权，该分支必然失败回退
+        // 按路径删除（文档高估了交付语义）。共享模式不变，其他进程的打开
+        // 行为不受影响。
+        use windows::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+        opts.access_mode(FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0);
     }
     #[cfg(unix)]
     {
@@ -540,9 +547,17 @@ pub(crate) fn read_decrypt_file_data_layout(
         } => {
             // 3.0.1（F3）：统一布局解析（含 chunk_size 上限与末块校验）
             let plan = resolve_chunk_plan(length, *chunk_size, *chunk_count)?;
-            offset
+            // 3.0.1（#27 修复）：checked_add 结果与文件长度比对（旧实现求值后
+            // 丢弃，等于没查）
+            let file_len = file.metadata()?.len();
+            let end = offset
                 .checked_add(length)
                 .ok_or_else(|| VaultError::Other("文件数据范围溢出".into()))?;
+            if end > file_len {
+                return Err(VaultError::Other(
+                    "文件密文范围超出保险柜文件（索引可能被篡改或损坏）".into(),
+                ));
+            }
             let frozen = frozen.unwrap_or(vpath);
             // L-8（审计修复）：分配前按明文总长设容量（plan 已保证不溢出）
             let plaintext_total = plan.plaintext_total();

@@ -1,11 +1,17 @@
-# LynVault Fuzz（3.0.1 F25 重构）
+# LynVault Fuzz（3.0.1 F25 重构；3.0.1 #38/#40 更正）
 #
 # - 每周定时 + 手动：每靶 60 秒冒烟，发现崩溃上传 artifact
 # - PR 冒烟：index_layout（3.0.1 新增算术靶）30 秒，防算术回归入库
 # - 3.0.1 修复：从仓库根用 --fuzz-dir 运行，crash artifact 落在
 #   fuzz/artifacts/<target>/，与 upload path 严格匹配（旧实现 working-directory
 #   + 相对 path 的组合使崩溃输入从未被上传，if-no-files-found: ignore 掩盖了
-#   这一点）；工具链固定 + --locked 保证可复现
+#   这一点）
+# - 3.0.1（#38 修复，更正 3.0.1 的过度声明）：旧头注宣称「工具链固定 +
+#   --locked」但两者实际均不存在 —— nightly 浮动、依赖解析未锁定。现落实：
+#   nightly 钉死到具体日期（升级时手动 bump）、CARGO_NET_LOCKED=true 强制
+#   按 Cargo.lock 解析。
+# - 3.0.1（#40 修复）：workflow 收紧 permissions；第三方 action 钉在具体
+#   commit SHA（浮动 tag 是供应链面 —— tag 可被推送方重写）。
 name: fuzz
 
 on:
@@ -18,6 +24,14 @@ on:
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
 
+env:
+  # 3.0.1（#38 修复）：按提交的 Cargo.lock 解析依赖，杜绝隐性浮动
+  CARGO_NET_LOCKED: "true"
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     if: github.event_name != 'pull_request'
@@ -27,12 +41,19 @@ jobs:
       matrix:
         target: [office_parse, header_probe, index_json, index_layout]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # 3.0.1（#38 修复）：nightly 钉死到日期（dtolnay action 钉 SHA +
+      # toolchain input 指定日期版）。升级 nightly 时 bump 此日期。
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly-2026-09-15
+      # taiki-e/install-action v2.9.4
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: |
             fuzz
@@ -43,7 +64,8 @@ jobs:
             -- -max_total_time=60 -rss_limit_mb=2560
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        # actions/upload-artifact v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts
@@ -54,12 +76,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly-2026-09-15
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: |
             fuzz
@@ -69,7 +93,7 @@ jobs:
             -- -max_total_time=30 -rss_limit_mb=2560
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fuzz-crash-index_layout
           path: fuzz/artifacts

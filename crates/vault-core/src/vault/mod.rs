@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use crate::audit::AuditLog;
+use crate::error::VaultError;
 use crate::index::Index;
 use crate::lock::LockState;
 use consts::WRAPPED_KEY_SIZE;
@@ -115,12 +116,15 @@ impl Vault {
     /// 现在只有 audit_dirty=true 时 close() 才补一次 save_index。
     /// 2.8.2（L13）：审计消息可能含攻击者可控的 vpath —— 入库前把控制字符
     /// 替换为 '?' 并截断到 200 字符，防止伪造审计条目结构 / 超长条目膨胀索引。
+    /// 3.0.1（#24 修复）：补齐 RTL 方向控制字符（U+202A..E / U+2066..9，与
+    /// sanitize_filename 的 I8 字符集一致）—— 旧实现放行它们，审计条目可被
+    /// 视觉伪装（U+202E 反转后续文本方向）。
     pub(crate) fn log_event(&mut self, msg: &str) {
         let sanitized: String = msg
             .chars()
             .map(|c| {
                 let cu = c as u32;
-                if cu < 0x20 || cu == 0x7f {
+                if cu < 0x20 || cu == 0x7f || matches!(cu, 0x202A..=0x202E | 0x2066..=0x2069) {
                     '?'
                 } else {
                     c
@@ -138,6 +142,19 @@ impl Vault {
 
     pub fn get_audit_entries(&self) -> Vec<crate::audit::AuditEntry> {
         self.audit.as_ref().map(|a| a.to_vec()).unwrap_or_default()
+    }
+
+    /// 3.0.1（#8 修复）：验证当前分区口令 —— 供命令层「降级安全开关需口令
+    /// 确认」（save_settings 关防截屏 / 禁用自动锁时）复用；v4/v5/v6 统一
+    /// 语义见 duress 模块的 VerifyPartitionPassword 实现（恒定时间比较）。
+    pub fn verify_current_password(
+        &mut self,
+        password: &str,
+        key_file_data: Option<&[u8]>,
+        yk_response: Option<&[u8; 20]>,
+    ) -> Result<(), VaultError> {
+        use duress::VerifyPartitionPassword;
+        self.verify_current_partition_password(password, key_file_data, yk_response)
     }
 
     /// 追加一条审计日志。如果审计日志未初始化则什么都不做。

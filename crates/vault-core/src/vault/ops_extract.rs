@@ -171,18 +171,26 @@ impl Vault {
 
         if matches!(layout, ChunkLayout::Legacy) {
             // ── Legacy：整段解密 → 写入（与历史行为逐字节一致）──
+            // 3.0.1（#23 修复）：明文在**所有**退出路径上零化 —— 旧实现
+            // write_all/sync_all 的 `?` 早退跳过 wipe
             let data = {
                 let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
                 let enc_key = self.enc_key.as_ref().ok_or(VaultError::NotOpen)?;
                 read_decrypt_file_data(file, enc_key, offset, length, aad)?
             };
-            let mut f = open_dest(&dest_path, overwrite).map_err(|_| {
-                VaultError::Other("目标文件已存在或路径异常（重解析点/符号链接？）".into())
-            })?;
-            f.write_all(&data)?;
-            f.sync_all()?;
+            let mut f = match open_dest(&dest_path, overwrite) {
+                Ok(f) => f,
+                Err(_) => {
+                    secure_wipe_vec(data);
+                    return Err(VaultError::Other(
+                        "目标文件已存在或路径异常（重解析点/符号链接？）".into(),
+                    ));
+                }
+            };
+            let io_result = f.write_all(&data).and_then(|_| f.sync_all());
             drop(f);
             secure_wipe_vec(data);
+            io_result?;
             Ok(())
         } else {
             // ── Chunked（v6）：分块流式提取 —— 明文任何时刻至多 4 MiB 在内存 ──
@@ -328,6 +336,9 @@ impl Vault {
             let lo = start.saturating_sub(chunk_plain_lo);
             let hi = end.saturating_sub(chunk_plain_lo).min(plan.plain_len(i));
             if lo > hi || hi as usize > plain.len() {
+                // 3.0.1（#23 修复）：sanity 拒绝路径同样零化（旧实现先于
+                // zeroize 返回，明文残留）
+                plain.zeroize();
                 return Err(VaultError::Other(
                     "媒体区间与分块布局不一致（索引可能被篡改）".into(),
                 ));
@@ -610,9 +621,16 @@ fn stream_decrypt_to_writer<W: std::io::Write>(
     // 旧实现唯一检查是「非零」，chunk_count=1 时 2^40 的块尺寸直达
     // vec![0u8; N] → alloc-abort 整个进程。
     let plan = resolve_chunk_plan(length, chunk_size, chunk_count)?;
-    offset
+    // 3.0.1（#27 修复）：与文件长度比对（旧实现求值后丢弃，等于没查）
+    let file_len = file.metadata()?.len();
+    let end = offset
         .checked_add(length)
         .ok_or_else(|| VaultError::Other("分块密文范围溢出（索引可能被篡改）".into()))?;
+    if end > file_len {
+        return Err(VaultError::Other(
+            "文件密文范围超出保险柜文件（索引可能被篡改或损坏）".into(),
+        ));
+    }
 
     // 3.0.0（优化1）：读/解密流水线 —— 后台线程预读下一块密文
     //（密文非敏感，无需零化；sync_channel(1) 限制在途 ≤ 2 块）
@@ -662,7 +680,11 @@ fn stream_decrypt_to_writer<W: std::io::Write>(
                 &crate::crypto::chunk_aad(frozen, i as u64, plan.chunk_count),
             )
             .ok_or(VaultError::DecryptFailed)?;
-            writer.write_all(&plain)?;
+            // 3.0.1（#23 修复）：写失败路径先零化再返回（旧实现 `?` 早退跳过）
+            if let Err(e) = writer.write_all(&plain) {
+                plain.zeroize();
+                return Err(e.into());
+            }
             done = done.saturating_add(plain.len() as u64);
             plain.zeroize();
             if let Some(cb) = chunk_progress {

@@ -1,6 +1,6 @@
 # LynVault CI 门禁
 #
-# 每次 push / PR 自动执行四道检查，任何一道失败即整次提交不合格：
+# 每次 push / PR 自动执行五道检查，任何一道失败即整次提交不合格：
 #   1. rustfmt   — 格式不规范（cargo fmt --check）
 #   2. clippy    — 隐患写法（-D warnings，警告即失败）
 #   3. test      — 全量测试（vault-core 在 Linux+Windows 双平台；
@@ -8,8 +8,12 @@
 #                  src-tauri 在 Linux 恢复编译与测试 —— 旧说明按 Tauri 1.x
 #                  的 4.0 包写，属过期门禁，src-tauri 曾在 Linux 完全无测试）
 #   4. deny      — 依赖漏洞（RustSEC）与许可证合规
+#   5. smoke     — 前端运行时冒烟（node ui/smoke-check.js；3.0.1 #34：
+#                  冒烟被 README 宣传为门禁但 CI 从未执行，属门禁虚设）
 #
 # 工具链版本与 rust-toolchain.toml 保持一致，升级时两处同步修改。
+# 3.0.1（#40 修复）：workflow 收紧 permissions；第三方 action 钉在具体
+# commit SHA（浮动 tag 是供应链面 —— tag 可被推送方重写）。
 
 name: CI
 
@@ -25,13 +29,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain（钉 SHA；toolchain 由 input 指定）
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: "1.96.0"
           components: rustfmt
@@ -41,12 +50,13 @@ jobs:
     name: Clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -61,8 +71,8 @@ jobs:
             cargo-args: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: "1.96.0"
       - name: Install Linux system deps (Tauri 2 / webkit2gtk-4.1)
@@ -70,18 +80,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo test --locked ${{ matrix.cargo-args }}
+
+  smoke:
+    name: UI smoke-check (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # ubuntu-latest 预装 node，无需 setup-node
+      - run: node ui/smoke-check.js
 
   deny:
     name: Cargo-deny (advisories + bans + licenses)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: "1.96.0"
-      - uses: taiki-e/install-action@v2
+      # taiki-e/install-action v2.9.4
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481
         with:
           tool: cargo-deny
       # --offline 不适用（需拉取 advisory DB）；--locked 保证按提交的 lockfile 检查

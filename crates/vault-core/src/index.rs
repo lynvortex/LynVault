@@ -170,12 +170,22 @@ impl Index {
     /// - 禁止空字节 / 控制字符
     /// - 不允许连续 '/'，不允许以 '/' 结尾（根 '/' 除外）
     /// - 每段不允许为空
+    ///
+    /// 3.0.1（#29）：长度上限 —— 总长 4 KiB、单段 255 字节（对齐常见文件
+    /// 系统），攻击性文件名低成本撑大加密索引的路径收口（索引每次落盘
+    /// 都要整体重写）。
+    pub const MAX_VPATH_LEN: usize = 4096;
+    pub const MAX_VPATH_SEG_LEN: usize = 255;
+
     pub fn validate_vpath(vpath: &str) -> bool {
         if !vpath.starts_with('/') {
             return false;
         }
         if vpath == "/" {
             return true;
+        }
+        if vpath.len() > Self::MAX_VPATH_LEN {
+            return false;
         }
         if vpath.contains('\\') || vpath.contains('\0') {
             return false;
@@ -190,6 +200,9 @@ impl Index {
                 // 连续 '/' 产生空段
                 return false;
             }
+            if seg.len() > Self::MAX_VPATH_SEG_LEN {
+                return false;
+            }
             if seg == "." || seg == ".." {
                 return false;
             }
@@ -199,6 +212,37 @@ impl Index {
             }
         }
         true
+    }
+
+    /// 3.0.1（#28 修复）：文件键拒绝根目录 —— validate_vpath 对根的豁免
+    /// 被文件创建路径继承时会产生 files["/"] 幽灵条目（根不是文件，两套
+    /// 删除/列表实现对它的行为不一致）。
+    pub fn is_file_vpath_allowed(vpath: &str) -> bool {
+        vpath != "/"
+    }
+
+    /// 3.0.1（#30 修复）：同父目录大小写不敏感查重 —— `/Doc.txt` 与
+    /// `/doc.txt` 在大小写敏感索引中共存后，Windows 提取时落盘同名，
+    /// overwrite=true 时后者静默清空前者。保险柜文件可能跨机器迁移
+    ///（Linux 创建 → Windows 提取），检查在**所有平台**生效。
+    /// 比较：全 Unicode 小写折叠（近似 NTFS 语义；个别特殊折叠规则的
+    /// 差异属残余风险）。
+    pub fn case_insensitive_sibling_exists(
+        files: &HashMap<String, FileMeta>,
+        new_vpath: &str,
+    ) -> bool {
+        let (parent, name) = match new_vpath.rsplit_once('/') {
+            Some((p, n)) => (p, n),
+            None => return false,
+        };
+        let name_lower = name.to_lowercase();
+        files.keys().any(|k| {
+            let (kp, kn) = match k.rsplit_once('/') {
+                Some((p, n)) => (p, n),
+                None => return false,
+            };
+            kp == parent && kn.to_lowercase() == name_lower
+        })
     }
 
     /// 归一化虚拟路径：去掉多余的 '/'、结尾 '/'、'.' 段。
@@ -264,11 +308,22 @@ impl<'a> IndexManager<'a> {
         let vpath = Index::normalize_vpath(vpath)
             .filter(|p| Index::validate_vpath(p))
             .ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
+        // 3.0.1（#28）：文件键拒绝根目录
+        if !Index::is_file_vpath_allowed(&vpath) {
+            return Err(VaultError::Other("文件路径不能是根目录".into()));
+        }
         let mut index = self.vault.load_index()?;
         // C5 修复：重名直接覆盖会丢失旧文件元数据（其密文残留无法清理）。
         // 改为冲突时报错，让调用方决定是覆盖、重命名还是取消。
         // 2.8.1：同时检查文件夹命名空间 —— file/folder 同名碰撞会让
         // rename/delete/move 语义含混（两套删除实现对同一 vpath 行为不同）。
+        // 3.0.1（#30）：同父目录大小写不敏感查重（Windows 提取同名冲突）
+        if Index::case_insensitive_sibling_exists(&index.files, &vpath) {
+            return Err(VaultError::Other(format!(
+                "同目录已存在仅大小写不同的文件名（Windows 提取时会冲突）: {}",
+                vpath
+            )));
+        }
         if index.files.contains_key(&vpath) {
             return Err(VaultError::Other(format!("目标路径已存在: {}", vpath)));
         }
@@ -439,6 +494,16 @@ impl<'a> IndexManager<'a> {
             index.files.insert(old_vpath.to_string(), meta);
             return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
         }
+        // 3.0.1（#30）：改名后的同父目录大小写不敏感查重（自身除外）
+        let mut others = index.files.clone();
+        others.remove(old_vpath);
+        if Index::case_insensitive_sibling_exists(&others, &new_vpath) {
+            index.files.insert(old_vpath.to_string(), meta);
+            return Err(VaultError::Other(format!(
+                "同目录已存在仅大小写不同的文件名（Windows 提取时会冲突）: {}",
+                new_vpath
+            )));
+        }
         index.files.insert(
             new_vpath.clone(),
             FileMeta {
@@ -526,23 +591,27 @@ impl<'a> IndexManager<'a> {
         let mut fail = 0usize;
         let mut errors: Vec<String> = Vec::new();
         for vp in vpaths {
-            let vp_norm = vp.trim_end_matches('/');
-            if vp_norm.is_empty() || vp_norm == "/" {
-                fail += 1;
-                errors.push(format!("{}: 非法路径", vp));
-                continue;
-            }
-            let is_dir = index.folders.contains_key(vp_norm);
-            let is_file = index.files.contains_key(vp_norm);
+            // 3.0.1（#27 修复）：入口统一归一化（旧实现只去尾斜杠，"/a//b" 之类
+            // 输入静默失配 —— 与删除/提取路径的归一化纪律一致）
+            let vp_norm = match Index::clean_vpath(vp) {
+                Some(p) if p != "/" => p,
+                _ => {
+                    fail += 1;
+                    errors.push(format!("{}: 非法路径", vp));
+                    continue;
+                }
+            };
+            let is_dir = index.folders.contains_key(vp_norm.as_str());
+            let is_file = index.files.contains_key(vp_norm.as_str());
             if !is_dir && !is_file {
                 fail += 1;
                 errors.push(format!("{}: 不存在", vp));
                 continue;
             }
             let r = if is_dir {
-                move_folder_in_index(&mut index, vp_norm, dest_dir)
+                move_folder_in_index(&mut index, &vp_norm, dest_dir)
             } else {
-                move_file_in_index(&mut index, vp_norm, dest_dir)
+                move_file_in_index(&mut index, &vp_norm, dest_dir)
             };
             match r {
                 Ok(()) => ok += 1,
@@ -605,6 +674,16 @@ fn move_file_in_index(
     if index.folders.contains_key(&new_vpath) || index.files.contains_key(&new_vpath) {
         index.files.insert(old_vpath.to_string(), meta);
         return Err(VaultError::Other(format!("目标路径已存在: {}", new_vpath)));
+    }
+    // 3.0.1（#30）：移动后的同父目录大小写不敏感查重（源条目除外）
+    let mut others = index.files.clone();
+    others.remove(old_vpath);
+    if Index::case_insensitive_sibling_exists(&others, &new_vpath) {
+        index.files.insert(old_vpath.to_string(), meta);
+        return Err(VaultError::Other(format!(
+            "同目录已存在仅大小写不同的文件名（Windows 提取时会冲突）: {}",
+            new_vpath
+        )));
     }
     // 3.0.1（F15）：删除与上一行重复的 folders 冲突检查（该分支按构造不可达）
     index.files.insert(new_vpath, meta);
@@ -708,6 +787,17 @@ fn rewrite_folder_keys(
         }
     }
 
+    // 3.0.1（P0 #2 修复）：**跨命名空间**冲突检查 —— 下方的键数量锚只看各
+    // map 自身，检不出「改写后的文件键撞上既有文件夹键（或反之）」：合法操作
+    // 链（import_file 只自动建直接父目录 → files["/b/f"] 可脱离 folders["/b"]
+    // 存在；随后 rename_folder("/a", "b") 全部检查通过）会产出
+    // files["/b/f"] + folders["/b/f"] 同键碰撞 —— rename/delete/move 语义随之
+    // 含混（两套删除实现对同一 vpath 行为不同）。
+    if new_files.keys().any(|k| new_folders.contains_key(k)) {
+        return Err(VaultError::Other(
+            "目标路径与现有文件/文件夹冲突（跨命名空间同键），已中止操作".into(),
+        ));
+    }
     if new_files.len() != files.len() || new_folders.len() != folders.len() {
         return Err(VaultError::Other(
             "目标路径与现有文件/文件夹冲突（子项重名），已中止操作".into(),
@@ -857,5 +947,46 @@ mod tests {
         assert!(idx.files.contains_key("/a/c.txt"), "源子树保持原状");
         // 无碰撞的改名照常通过
         assert!(super::rewrite_folder_keys(&idx.files, &idx.folders, "/a", "/c").is_ok());
+    }
+
+    // 3.0.1（P0 #2 回归）：跨命名空间碰撞 —— 键数量锚检不出，必须显式检查。
+    // 场景：files["/b/f"] 脱离 folders["/b"] 存在（import_file 只自动建直接
+    // 父目录的历史遗留），rename_folder("/a", "b") 把子文件夹 /a/f 改写为
+    // /b/f —— 两个 map 键数都不变，但 files["/b/f"] + folders["/b/f"] 同键。
+    #[test]
+    fn test_rename_folder_cross_namespace_collision_is_rejected() {
+        let mut idx = Index::new();
+        idx.files.insert(
+            "/b/f".into(),
+            FileMeta {
+                name: "f".into(),
+                size: 1,
+                offset: 0,
+                length: 10,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
+        idx.folders.insert("/a".into(), true);
+        idx.folders.insert("/a/f".into(), true);
+        // /a → /b：/a/f → /b/f 撞上既有文件 /b/f —— 必须拒绝
+        let r = super::rewrite_folder_keys(&idx.files, &idx.folders, "/a", "/b");
+        assert!(r.is_err(), "跨命名空间同键碰撞必须被拒绝");
+        // 反向：改写后的文件键撞上既有文件夹键同样拒绝
+        let mut idx2 = Index::new();
+        idx2.folders.insert("/b/x".into(), true);
+        idx2.folders.insert("/a".into(), true);
+        idx2.files.insert(
+            "/a/x".into(),
+            FileMeta {
+                name: "x".into(),
+                size: 1,
+                offset: 0,
+                length: 10,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
+        assert!(super::rewrite_folder_keys(&idx2.files, &idx2.folders, "/a", "/b").is_err());
     }
 }

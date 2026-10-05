@@ -36,6 +36,8 @@ LynVault-*-linux-amd64
 *.vault.tmp.*
 *.lyt.bak.*
 *.vault.bak.*
+*.hdr.journal
+*.rehearsal.*
 
 # 调试探针 / 临时目录（勿提交）
 .probe/

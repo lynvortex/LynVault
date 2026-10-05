@@ -30,6 +30,25 @@ fn lock_pages(ptr: *const u8, len: usize) -> bool {
     unsafe { VirtualLock(ptr as *const core::ffi::c_void, len) }.is_ok()
 }
 
+/// 3.0.1（#25 修复）：锁页失败最常见的可恢复原因是工作集配额不足 ——
+/// 先尝试扩展进程工作集再重试一次（旧实现直接静默降级）。
+#[cfg(windows)]
+fn try_grow_working_set() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Memory::{
+        SetProcessWorkingSetSizeEx, SETPROCESSWORKINGSETSIZEEX_FLAGS,
+    };
+    // HANDLE(-1) = GetCurrentProcess() 伪句柄（避免引入 Threading 特性依赖）
+    const CURRENT_PROCESS: HANDLE = HANDLE(-1);
+    const MIN_WS: usize = 64 * 1024 * 1024;
+    const MAX_WS: usize = 256 * 1024 * 1024;
+    // flags = 0：软限制（最小工作集请求，无硬性绑定语义）
+    const FLAGS: SETPROCESSWORKINGSETSIZEEX_FLAGS = SETPROCESSWORKINGSETSIZEEX_FLAGS(0);
+    unsafe {
+        let _ = SetProcessWorkingSetSizeEx(CURRENT_PROCESS, MIN_WS, MAX_WS, FLAGS);
+    }
+}
+
 #[cfg(windows)]
 fn unlock_pages(ptr: *const u8, len: usize) {
     use windows::Win32::System::Memory::VirtualUnlock;
@@ -51,6 +70,22 @@ impl LockedKey {
     pub(crate) fn new(key: [u8; 32]) -> Self {
         let key = Box::new(key);
         let locked = lock_pages(key.as_ptr(), 32);
+        // 3.0.1（#25 修复）：工作集配额不足是可恢复失败 —— 扩展后重试一次
+        //（cfg 作用域 shadowing，避免非 Windows 目标上 unused_mut）
+        #[cfg(windows)]
+        let locked = if !locked {
+            try_grow_working_set();
+            lock_pages(key.as_ptr(), 32)
+        } else {
+            locked
+        };
+        if !locked {
+            // 3.0.1（#25 修复）：降级设计可接受但必须留痕 —— 旧实现完全无痕，
+            // 「密钥可被换出到 pagefile」的降级无从诊断
+            log::warn!(
+                "会话密钥锁页失败（VirtualLock/mlock）—— 降级为「装箱驻留 + Drop 清零」，密钥页可被系统换出"
+            );
+        }
         Self { key, locked }
     }
 }

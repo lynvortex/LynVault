@@ -12,9 +12,17 @@ function makeEl(id) {
     const el = {
         id, textContent: '', value: '', style: {},
         children: [],
-        classList: { add() {}, remove() {}, contains: () => false, toggle() {} },
         dataset: {},
         addEventListener() {}, removeEventListener() {},
+    };
+    // 3.0.1（#33 修复）：classList 追踪真实类集合 —— 启动弹窗的「已显示」
+    // 判定依赖 contains('hidden') 为假（此前桩恒返回 false，断言是空操作）
+    el.__classes = new Set();
+    el.classList = {
+        add: (...cs) => cs.forEach(c => el.__classes.add(c)),
+        remove: (...cs) => cs.forEach(c => el.__classes.delete(c)),
+        contains: (c) => el.__classes.has(c),
+        toggle: (c) => { el.__classes.has(c) ? el.__classes.delete(c) : el.__classes.add(c); },
     };
     el.appendChild = (c) => {
         el.children.push(c); c.parent = el;
@@ -44,6 +52,12 @@ function makeEl(id) {
                         if (rest.includes(':not(:disabled)') && ch.disabled) ok = false;
                     } else if (part.startsWith('#')) {
                         if (ch.id !== part.slice(1)) ok = false;
+                    } else if (part.startsWith('.')) {
+                        // 3.0.1（#32 修复）：纯 class 选择器（buildFileRow 的
+                        // querySelector('.fi-icon') 依赖）—— 多类链 '.a.b' 逐段匹配
+                        const want = part.split('.').filter(Boolean);
+                        const have = String(ch.className || '').split(/\s+/);
+                        if (!want.every(w => have.includes(w))) ok = false;
                     } else { ok = false; }
                     if (ok) next.push(ch);
                 }
@@ -72,7 +86,11 @@ function makeEl(id) {
         set(v) {
             el.__html = v;
             el.children = [];
-            // 轻量解析 <input id="..." type="..."> 与 <button> —— 供查询器与回车测试
+            // 轻量解析 <input id="..." type="...">、<span class="..."> 与
+            // <button> —— 供查询器与回车测试。
+            // 3.0.1（#32 修复）：补 span 解析 —— buildFileRow 的行内结构是
+            // <span class="fi-icon/fi-name/fi-size">，不解析则 querySelector
+            // 返回 null，渲染链冒烟覆盖不到真实结构
             const re = /<input[^>]*id="([\w-]+)"[^>]*>/g;
             let m;
             globalThis.__parsed = (globalThis.__parsed || 0);
@@ -86,6 +104,15 @@ function makeEl(id) {
                 el.children.push(inp);
                 inp.parent = el;
                 elements[m[1]] = inp; // 注册进缓存（$ 可寻址）
+            }
+            const spanRe = /<span[^>]*class="([\w-]+)"[^>]*>/g;
+            while ((m = spanRe.exec(v)) !== null) {
+                const sp = makeEl('span-' + m[1]);
+                sp.tagName = 'SPAN';
+                sp.tag = 'span';
+                sp.className = m[1];
+                el.children.push(sp);
+                sp.parent = el;
             }
         },
     });
@@ -138,13 +165,25 @@ const $ = (sel) => {
 
 const tauriInvoke = async (cmd, args) => {
     if (cmd === 'get_settings') return { enabled: false, settings: null };
-    if (cmd === 'scan_vault_files') return [];           // 启动扫描
+    // 3.0.1（#33 修复）：返回一条假条目驱动 renderStartupList 渲染链，
+    // 「启动弹窗已显示」断言从永真式改为可观测信号
+    if (cmd === 'scan_vault_files') return [
+        { path: 'C:\\fake\\demo.lyt', name: 'demo.lyt', mtime: 1700000000, size: 4096 },
+    ];
     if (cmd === 'get_lock_info') return null;
     if (cmd === 'frontend_ready') return null;
     if (cmd === 'get_launch_vault_arg') return null;
     if (cmd === 'check_vault_file') return false;
     if (cmd === 'get_file_icon') return '';
-    if (cmd === 'list_folder') return { folders: [], files: [] };
+    // 3.0.1（#32 修复）：后端 list_folder 返回结构化**数组** —— 旧 mock 是
+    // 对象，(data||[]).map 抛错走 catch 分支，buildFileRow 0 覆盖且冒烟 PASS。
+    // 返回两行真实形状数据驱动完整渲染链（buildFileRow → mountRows）。
+    if (cmd === 'list_folder') {
+        return [
+            { name: '文件夹甲', vpath: '/文件夹甲', type: 'folder' },
+            { name: 'sample.txt', vpath: '/sample.txt', type: 'file', size: 2048 },
+        ];
+    }
     if (cmd === 'get_duress_status') return { marked: false, partitions: ['Main', 'Decoy'], active: 'Main' };
     if (cmd === 'yubikey_status') return { enabled: false, present: true };
     if (cmd === 'add_partition') return {};
@@ -152,6 +191,7 @@ const tauriInvoke = async (cmd, args) => {
     if (cmd === 'clear_duress_mark') return {};
     if (cmd === 'enable_yubikey_2fa') return {};
     if (cmd === 'duress_rehearsal') return { wiped: 1 };
+    if (cmd === 'duress_scrub_partitions') return { scrubbed: 4096 };
     return { ok: true };
 };
 
@@ -167,6 +207,8 @@ const sandbox = {
         removeEventListener() {},
         getElementById: (id) => $(id),
         createElement: (t) => { const e = makeEl(t); e.tag = t; e.tagName = t.toUpperCase(); if (t === 'button') sandbox.__btnCreated = (sandbox.__btnCreated || 0) + 1; return e; },
+        // 3.0.1（#32 修复）：mountRows 用 DocumentFragment 挂载列表行
+        createDocumentFragment: () => { const e = makeEl('fragment'); e.tagName = '#DOCUMENT-FRAGMENT'; e.tag = 'fragment'; return e; },
         querySelector: (s) => (s === '#dialog-body' ? makeEl('dialog-body') : null),
         querySelectorAll: () => [],
         body: makeEl('body'),
@@ -219,7 +261,14 @@ try {
         await new Promise(r => setImmediate(r));
         const listened = sandbox.__listened || [];
         const ok = [];
-        ok.push(['startup modal shown', calls.startup > 0 || $('startup-dialog').classList.contains === undefined ? true : true]);
+        // 3.0.1（#33 修复）：「启动弹窗已显示」由永真式（? true : true）改为
+        // 真实可观测信号 —— showStartupModal() 的类副作用 + 启动列表真实渲染
+        const sd = $('startup-dialog');
+        ok.push(['startup modal shown (no hidden + overlay modal + body has-modal)',
+            !sd.classList.contains('hidden')
+            && $('overlay').classList.contains('startup-modal')
+            && sandbox.document.body.classList.contains('has-modal')]);
+        ok.push(['startup list rendered 1 item', $('startup-list').children.length === 1]);
         ok.push(['drag-drop registered', sandbox.__dragRegistered === true]);
         ok.push(['event listeners', (listened.includes('vault-file-requested') && listened.includes('vault-locked') && listened.includes('import-progress'))]);
 
@@ -292,6 +341,18 @@ try {
         })()`, sandbox);
         for (const [name, pass] of await enterResult) {
             ok.push([name, pass]);
+        }
+
+        // ── 3.0.1（#32 修复）：列表渲染链冒烟 —— listFolder → renderList →
+        // buildFileRow（×2 行）→ mountRows（fragment 挂载）。旧 mock 形状错误
+        // 使 .map 抛错走 catch，buildFileRow 0 覆盖且冒烟 PASS。
+        await vm.runInContext("(async () => { await listFolder('/'); })()", sandbox);
+        {
+            const fl = $('file-list');
+            const frag = fl.children[0];
+            ok.push(['list rendering chain (buildFileRow x2 mounted)',
+                fl.children.length === 1 && frag && frag.children && frag.children.length === 2
+                && frag.children[0].className === 'file-item']);
         }
 
         console.log('DEBUG: parsed inputs =', sandbox.__parsed || 0);

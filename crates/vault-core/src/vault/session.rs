@@ -143,6 +143,12 @@ impl Vault {
             file.set_len(0)?;
             file.seek(SeekFrom::End(0))?;
         }
+        // 3.0.1（P0 #1 修复）：同名旧保险柜崩溃遗留的头部日志在此清除 ——
+        // 否则新建柜首次打开时恢复逻辑会把**旧**头部快照覆盖到**新**柜上。
+        // 此刻目标已被截断/新建，旧日志不再有任何恢复价值。
+        {
+            let _ = std::fs::remove_file(super::header::journal_path(path));
+        }
         // 2.6.1：创建即为独占会话，避免与另一实例并发写同一文件
         lock_vault_exclusive(&file)
             .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
@@ -459,10 +465,14 @@ impl Vault {
         if self.is_open() {
             return Err(VaultError::AlreadyOpen);
         }
-        let mut file = open_vault_rw(path, false)?;
+        let mut file = open_vault_rw(path)?;
         // 2.6.1：独占打开 —— 第二个实例（或同进程重复打开）必须失败而非并发写入
         lock_vault_exclusive(&file)
             .map_err(|_| VaultError::Other("保险柜文件已被另一个实例占用".into()))?;
+        // 3.0.1（P0 #1 修复）：先收敛上一次头部写入崩溃遗留的日志边车
+        //（若有）—— 恢复发生在任何读取判定之前，保证本次打开看到的是
+        // 一致的头部（写入完成态或上一轮快照，二者必居其一）。
+        recover_header_from_journal(&mut file, path);
         // 2.8.0：先嗅探 magic + 版本字节，再按格式读取对应大小的头部
         // （v4 文件总长可能不足 2048 字节，不能直接按 v5 头部大小读取）
         // 3.0.0（M-2）：嗅探扩展到 41 字节 —— 顺手读出头部保留区的挑战盐
@@ -597,7 +607,14 @@ impl Vault {
         // 分区做范围检查 —— 诱饵分区（受害者没有其密码，永不命中）的越界值
         // 会随会话状态保留，直到「删除分区」时直接驱动破坏性 7-pass 擦除。
         // 伪条目是随机字节，offset/length 无意义，不参与校验。
-        Self::validate_parsed_partition_ranges(&file, &parsed)?;
+        // 3.0.1（3.0.1 F1 假阳性收口）：范围越界不再立即拒绝开柜 —— 伪条目
+        // 是纯随机字节（create 时整体填充），有 ~0.5%/条概率恰好形成 1-2 字符
+        // 的「合理别名」+ 随机偏移，F1 的全量硬校验会把这样的**正常保险柜**
+        // 永久拒绝打开（假阳性砖化）。现改为：违例条目在下方 real_partitions
+        // 过滤时**排除出会话**（与伪条目同等处理，其偏移永远不会驱动破坏性
+        // 擦除 —— 擦除层另有硬边界兜底）；认证命中的条目若自身越界，仍由
+        // try_authenticate_partition 的边界检查按篡改拒绝（错误语义不变）。
+        let range_violations = Self::find_partition_range_violations(&file, &parsed)?;
 
         // C9 修复 + 2.3.0 + 2.4.1：始终对**全部 8 个条目**执行完整 Argon2id 派生
         // （即使中途匹配），消除计时侧信道 —— 总派生工作量恒定，与真实分区数量无关。
@@ -635,7 +652,9 @@ impl Vault {
         // 认证比较阶段（此时重计算已完成，循环本身极轻）
         let mut matched_idx: Option<usize> = None;
         let mut matched_index: Option<Index> = None;
-        let mut matched_keys: Option<([u8; 32], [u8; 32], [u8; 32])> = None;
+        // 3.0.1（#19 修复）：匹配密钥以 KeyMaterial（ZeroizeOnDrop）携带，
+        // 不再是裸元组 —— 任何早退路径出作用域即清零
+        let mut matched_keys: Option<KeyMaterial> = None;
         for (idx, keys) in keys_list.iter_mut().enumerate() {
             let p = &parsed[idx];
             // 2.6.1：用「绑定头部」的认证标签校验 —— 头部前缀 + 本条目别名字段 + salt
@@ -651,11 +670,25 @@ impl Vault {
                 &p.auth_tag,
             );
             if matched_idx.is_none() && tag_ok {
+                // 3.0.1：认证命中的条目自身越界 = 篡改 —— 保持 F1 的原样硬拒
+                //（错误语义与 3.0.1 一致）；非命中条目的越界已在下方过滤为伪条目
+                if range_violations.contains(&idx) {
+                    for k in keys_list.iter_mut() {
+                        k.zeroize();
+                    }
+                    return Err(VaultError::Other(
+                        "分区表校验失败：分区索引范围超出文件边界（头部可能被篡改或损坏）".into(),
+                    ));
+                }
                 match Self::try_authenticate_partition(&mut file, &parsed, idx, keys) {
                     Ok(index) => {
                         matched_idx = Some(idx);
                         matched_index = Some(index);
-                        matched_keys = Some((keys.enc_key, keys.auth_key, keys.sign_key));
+                        matched_keys = Some(KeyMaterial {
+                            enc_key: keys.enc_key,
+                            auth_key: keys.auth_key,
+                            sign_key: keys.sign_key,
+                        });
                     }
                     Err(e) => {
                         // 匹配分区但头部/索引校验失败 → 视为篡改，中止并清理全部密钥
@@ -688,14 +721,18 @@ impl Vault {
             k.zeroize();
         }
 
-        if let (Some(idx), Some(index), Some((enc_key, auth_key, sign_key))) =
-            (matched_idx, matched_index, matched_keys)
-        {
+        if let (Some(idx), Some(index), Some(keys)) = (matched_idx, matched_index, matched_keys) {
             // 过滤出真实分区（别名合理的条目；伪条目随机数据几乎不可能通过校验）
+            // 3.0.1（#31 修复）：以**认证命中的条目**为锚无条件保留 —— 别名
+            // 带 '.' 等字形的旧分区会被 is_plausible_alias 过滤剔除，恒定时间
+            // 查找随即失败并报「头部与数据不匹配」；认证已证明该条目真实。
             let real_partitions: Vec<PartitionInfo> = parsed
                 .iter()
-                .filter(|p| is_plausible_alias(&p.alias))
-                .cloned()
+                .enumerate()
+                .filter(|(i, p)| {
+                    *i == idx || (is_plausible_alias(&p.alias) && !range_violations.contains(i))
+                })
+                .map(|(_, p)| p.clone())
                 .collect();
             let matched_salt = parsed[idx].salt;
             let matched_tag = parsed[idx].auth_tag;
@@ -731,7 +768,7 @@ impl Vault {
             let canonical_prefix = auth_tag_header_prefix(&salt, VERSION_V4);
             if header[..105] == canonical_prefix {
                 let migrated_tag = create_auth_tag_bound(
-                    &auth_key,
+                    &keys.auth_key,
                     &canonical_prefix,
                     &header[moff..moff + 16],
                     &header[moff + 16..moff + 48],
@@ -741,11 +778,11 @@ impl Vault {
                 }
             }
 
-            self.enc_key = Some(LockedKey::new(enc_key));
-            self.auth_key = Some(LockedKey::new(auth_key));
-            self.sign_key = Some(LockedKey::new(sign_key));
+            self.enc_key = Some(LockedKey::new(keys.enc_key));
+            self.auth_key = Some(LockedKey::new(keys.auth_key));
+            self.sign_key = Some(LockedKey::new(keys.sign_key));
 
-            let mut audit = AuditLog::from_entries(index.audit.clone(), auth_key);
+            let mut audit = AuditLog::from_entries(index.audit.clone(), keys.auth_key);
             // 2.8.2：恢复时丢弃过尾部条目 → 显式写入告警（不再静默截断）
             if audit.is_truncated() {
                 audit.add("警告：审计链存在无法校验的条目，部分历史记录可能被篡改或损坏");
@@ -780,16 +817,15 @@ impl Vault {
 
         // 全部失败：2.3.0 起真正递增锁定计数（公开密钥可计算 HMAC，无需正确密码）。
         // 5 次错误 → 锁定 30 分钟；锁定期间 is_locked() 直接拒绝（包括正确密码）。
+        // 3.0.1（P0 #1 修复）：锁定区更新同样经日志边车防撕裂（41 字节小写
+        // 撕裂同样会让下次打开报「头部可能被篡改」）
         lock_state.record_failure();
         let mut lock_buf = [0u8; 41];
         lock_buf[0] = lock_state.lock_count;
         lock_buf[1..9].copy_from_slice(&lock_state.lock_until.to_le_bytes());
         let hmac = lock_state.compute_hmac(&mac_key);
         lock_buf[9..41].copy_from_slice(&hmac);
-        file.seek(SeekFrom::Start(LOCK_OFFSET_V4 as u64))?;
-        file.write_all(&lock_buf)?;
-        file.flush()?;
-        file.sync_all()?;
+        write_lock_region_journaled(&mut file, path, LOCK_OFFSET_V4, &lock_buf)?;
 
         Err(VaultError::AuthFailed)
     }
@@ -887,7 +923,14 @@ impl Vault {
         }
 
         // 3.0.1（F1 修复）：同 v4 —— 全部真实分区的索引范围统一校验（见上方说明）
-        Self::validate_parsed_partition_ranges(&file, &parsed)?;
+        // 3.0.1（3.0.1 F1 假阳性收口）：范围越界不再立即拒绝开柜 —— 伪条目
+        // 是纯随机字节（create 时整体填充），有 ~0.5%/条概率恰好形成 1-2 字符
+        // 的「合理别名」+ 随机偏移，F1 的全量硬校验会把这样的**正常保险柜**
+        // 永久拒绝打开（假阳性砖化）。现改为：违例条目在下方 real_partitions
+        // 过滤时**排除出会话**（与伪条目同等处理，其偏移永远不会驱动破坏性
+        // 擦除 —— 擦除层另有硬边界兜底）；认证命中的条目若自身越界，仍由
+        // try_authenticate_partition 的边界检查按篡改拒绝（错误语义不变）。
+        let range_violations = Self::find_partition_range_violations(&file, &parsed)?;
 
         // 阶段 1：8 × Argon2id（KEK 派生），分块并行（与 v4 相同的调度优化）。
         // 2.8.1：KEK 用 Zeroizing 包裹 —— `?` 提前返回（派生失败）时已派生的
@@ -987,6 +1030,16 @@ impl Vault {
             }
             if matched.is_none() {
                 if let Some((keys, dk)) = candidate {
+                    // 3.0.1：认证命中的条目自身越界 = 篡改 —— 保持 F1 的原样硬拒
+                    if range_violations.contains(&idx) {
+                        for k in kek_list.iter_mut() {
+                            k.zeroize();
+                        }
+                        return Err(VaultError::Other(
+                            "分区表校验失败：分区索引范围超出文件边界（头部可能被篡改或损坏）"
+                                .into(),
+                        ));
+                    }
                     match Self::try_authenticate_partition(&mut file, &parsed, idx, &keys) {
                         Ok(index) => matched = Some((idx, index, keys, dk, candidate_via_yk)),
                         Err(e) => {
@@ -1035,10 +1088,16 @@ impl Vault {
             // 该窗口，不得再以「v6 根治」误导后续审计。
             let legacy_signature = !verify_header_signature_v5(&header, &keys.sign_key);
             // 过滤出真实分区（伪条目随机数据几乎不可能通过认证）
+            // 3.0.1（#31 修复）：以**认证命中的条目**为锚无条件保留 —— 别名
+            // 带 '.' 等字形的旧分区会被 is_plausible_alias 过滤剔除，恒定时间
+            // 查找随即失败并报「头部与数据不匹配」；认证已证明该条目真实。
             let real_partitions: Vec<PartitionInfo> = parsed
                 .iter()
-                .filter(|p| is_plausible_alias(&p.alias))
-                .cloned()
+                .enumerate()
+                .filter(|(i, p)| {
+                    *i == idx || (is_plausible_alias(&p.alias) && !range_violations.contains(i))
+                })
+                .map(|(_, p)| p.clone())
                 .collect();
             let matched_salt = parsed[idx].salt;
             let matched_tag = parsed[idx].auth_tag;
@@ -1121,17 +1180,15 @@ impl Vault {
             return Ok(active);
         }
 
-        // 全部失败：递增锁定计数（v5 偏移）
+        // 全部失败：递增锁定计数（v5 偏移）。
+        // 3.0.1（P0 #1 修复）：同 v4 —— 锁定区更新经日志边车防撕裂
         lock_state.record_failure();
         let mut lock_buf = [0u8; 41];
         lock_buf[0] = lock_state.lock_count;
         lock_buf[1..9].copy_from_slice(&lock_state.lock_until.to_le_bytes());
         let hmac = lock_state.compute_hmac(&mac_key);
         lock_buf[9..41].copy_from_slice(&hmac);
-        file.seek(SeekFrom::Start(LOCK_OFFSET_V5 as u64))?;
-        file.write_all(&lock_buf)?;
-        file.flush()?;
-        file.sync_all()?;
+        write_lock_region_journaled(&mut file, path, LOCK_OFFSET_V5, &lock_buf)?;
 
         Err(VaultError::AuthFailed)
     }
@@ -1142,23 +1199,25 @@ impl Vault {
     /// 必须在进入会话状态之前拒绝。合法保险柜的索引恒写入文件内部，
     /// 该校验对正常文件永真；越界即「头部被篡改或损坏」，与锁区校验失败
     /// 同级处理（直接拒绝，不计入口令错误锁定计数）。
-    fn validate_parsed_partition_ranges(
+    fn find_partition_range_violations(
         file: &File,
         parsed: &[PartitionInfo],
-    ) -> Result<(), VaultError> {
+    ) -> Result<Vec<usize>, VaultError> {
         let file_size = file.metadata()?.len();
-        for p in parsed.iter().filter(|p| is_plausible_alias(&p.alias)) {
+        let mut violations = Vec::new();
+        for (i, p) in parsed.iter().enumerate() {
+            if !is_plausible_alias(&p.alias) {
+                continue;
+            }
             let in_bounds = match p.index_offset.checked_add(p.index_length) {
                 Some(end) => end <= file_size,
                 None => false,
             };
             if !in_bounds {
-                return Err(VaultError::Other(
-                    "分区表校验失败：分区索引范围超出文件边界（头部可能被篡改或损坏）".into(),
-                ));
+                violations.push(i);
             }
         }
-        Ok(())
+        Ok(violations)
     }
 
     /// 2.4.1 新增（从 open_and_authenticate 抽取）：对已通过 auth_tag（头部绑定）校验的
@@ -1266,9 +1325,6 @@ impl Vault {
         if let Some(audit) = &self.audit {
             index.audit = audit.to_vec();
         }
-        // 3.0.0（审计锚点）：计数与本次落盘的索引内容一致 —— 头部与索引的
-        // 写入顺序（先索引后头部）保证任意崩溃点两者自洽
-        self.partitions[active].audit_count = index.audit.len() as u32;
         let idx = index;
 
         let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
@@ -1276,7 +1332,11 @@ impl Vault {
         // 步骤 1：写新索引到末尾（不擦旧索引）
         let (new_off, new_len) = save_index_to_file(file, enc_key, &idx)?;
 
-        // 步骤 2：更新内存中的分区信息
+        // 步骤 2：更新内存中的分区信息。
+        // 3.0.1（#4 修复）：审计锚点推进移到**索引写入成功之后** —— 旧实现
+        // 落盘前就改内存锚，写入失败后内存锚超前于磁盘，后续任意一次头部
+        // 重写会把错位锚持久化 → 下次开柜「锚点不符」假篡改警告。
+        self.partitions[active].audit_count = idx.audit.len() as u32;
         self.partitions[active].index_offset = new_off;
         self.partitions[active].index_length = new_len;
 
@@ -1296,17 +1356,43 @@ impl Vault {
 
     // ═══════════════ 头部更新 ═══════════════
 
+    /// 3.0.1（P0 #1 修复）：头部更新改经日志边车防撕裂（对已存在的保险柜文件
+    /// 原地覆写 2 KiB 头部，掉电撕裂 = 整柜不可恢复）。
     pub(crate) fn update_header(&mut self) -> Result<(), VaultError> {
-        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
-        let sign_key = self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
+        let path = self.path.clone().ok_or(VaultError::NotOpen)?;
+        let sign_key = **self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
         let yk_salt = self.yk_challenge_salt;
-        write_header_to_file(
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+        write_header_journaled(
             file,
+            &path,
             self.format_version,
             &self.lock_state,
             &self.salt,
             &self.partitions,
-            sign_key,
+            &sign_key,
+            &yk_salt,
+        )
+    }
+
+    /// 3.0.1（P0 #1 修复）：以指定的分区表写入头部（add/remove_partition 等
+    /// 「先写头部、成功后才提交内存」的调用点共用；同样经日志边车）。
+    pub(crate) fn write_header_with(
+        &mut self,
+        partitions: &[PartitionInfo],
+    ) -> Result<(), VaultError> {
+        let path = self.path.clone().ok_or(VaultError::NotOpen)?;
+        let sign_key = **self.sign_key.as_ref().ok_or(VaultError::NotOpen)?;
+        let yk_salt = self.yk_challenge_salt;
+        let file = self.file.as_mut().ok_or(VaultError::NotOpen)?;
+        write_header_journaled(
+            file,
+            &path,
+            self.format_version,
+            &self.lock_state,
+            &self.salt,
+            partitions,
+            &sign_key,
             &yk_salt,
         )
     }

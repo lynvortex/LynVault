@@ -53,6 +53,9 @@ impl Vault {
         let mut ok = 0usize;
         let mut fail = 0usize;
         let mut errors: Vec<String> = Vec::new();
+        // 3.0.1（#50 修复）：file_progress 移入循环逐文件上报（旧实现在循环后
+        // 一次调用，进度 0% → 100% 跳变）
+        let mut done = 0usize;
         for p in src_paths {
             let src = std::path::Path::new(p);
             let name = src
@@ -71,9 +74,10 @@ impl Vault {
                     log::warn!("批量导入有失败项（明细已随返回值反馈）");
                 }
             }
-        }
-        if let Some(cb) = file_progress {
-            cb(src_paths.len(), src_paths.len());
+            done += 1;
+            if let Some(cb) = file_progress {
+                cb(done, src_paths.len());
+            }
         }
         // 2.4.1（P1-14）：批量操作记一条摘要审计，不再逐文件刷审计链
         if ok > 0 || fail > 0 {
@@ -105,6 +109,17 @@ impl Vault {
         // M5 修复：归一化 + 校验虚拟路径（2.8.2：收敛到 clean_vpath 单一来源）
         let vpath =
             Index::clean_vpath(vpath).ok_or_else(|| VaultError::Other("无效的虚拟路径".into()))?;
+        // 3.0.1（#28）：文件键拒绝根目录（同 IndexManager::add_file）
+        if !Index::is_file_vpath_allowed(&vpath) {
+            return Err(VaultError::Other("文件路径不能是根目录".into()));
+        }
+        // 3.0.1（#30）：同父目录大小写不敏感查重（同 IndexManager::add_file）
+        if Index::case_insensitive_sibling_exists(&index.files, &vpath) {
+            return Err(VaultError::Other(format!(
+                "同目录已存在仅大小写不同的文件名（Windows 提取时会冲突）: {}",
+                vpath
+            )));
+        }
 
         // C5 修复：检查重名，避免静默覆盖
         // 2.8.1：同时检查文件夹命名空间 —— file/folder 同名碰撞会让
@@ -176,9 +191,14 @@ impl Vault {
                         match (&*src_ref).read_exact(&mut b) {
                             Ok(()) => {
                                 pos += n as u64;
-                                // send 失败 = 主线程已退出（出错路径）：通道另一端
-                                // 已断开，缓冲不可能被消费 —— 清零后丢弃
-                                if tx.send(Ok(b)).is_err() {
+                                // 3.0.1（#23 修复）：send 失败 = 主线程已退出
+                                //（出错路径）：SendError 会把载荷原样带回，
+                                // 取回并清零（旧实现注释写「清零后丢弃」但
+                                // 实际丢弃的 Err 载荷未经零化）
+                                if let Err(send_err) = tx.send(Ok(b)) {
+                                    if let Ok(mut b) = send_err.0 {
+                                        b.zeroize();
+                                    }
                                     break;
                                 }
                             }
@@ -427,6 +447,8 @@ impl Vault {
         let mut collected: Vec<(PathBuf, String, bool)> = Vec::new();
         let mut entries_seen = 0usize;
         let mut skipped_symlinks = 0usize;
+        // 3.0.1（#49 修复）：FIFO / 设备文件等非常规条目与符号链接同等计数
+        let mut skipped_special = 0usize;
         Self::collect_import_files(
             src,
             &format!("{}/{}", base_clean, base_name),
@@ -434,6 +456,7 @@ impl Vault {
             &mut entries_seen,
             &mut collected,
             &mut skipped_symlinks,
+            &mut skipped_special,
         )?;
 
         // 阶段 2：单份索引逐文件导入，最后一次落盘
@@ -457,11 +480,11 @@ impl Vault {
         if collected.is_empty() {
             // 空目录：仅登记文件夹本身
             self.log_event(&format!(
-                "导入空文件夹 '{}'（含 0 个文件，跳过 {} 个符号链接）",
-                base_name, skipped_symlinks
+                "导入空文件夹 '{}'（含 0 个文件，跳过 {} 个符号链接、{} 个特殊条目）",
+                base_name, skipped_symlinks, skipped_special
             ));
             self.save_index(index)?;
-            return Ok((0, 0, skipped_symlinks));
+            return Ok((0, 0, skipped_symlinks + skipped_special));
         }
 
         let mut ok = 0usize;
@@ -505,8 +528,8 @@ impl Vault {
             }
         }
         self.log_event(&format!(
-            "导入文件夹 '{}'：成功 {} 个文件，失败 {} 个，跳过 {} 个符号链接",
-            base_name, ok, fail, skipped_symlinks
+            "导入文件夹 '{}'：成功 {} 个文件，失败 {} 个，跳过 {} 个符号链接、{} 个特殊条目",
+            base_name, ok, fail, skipped_symlinks, skipped_special
         ));
         // 2.8.2：失败但根文件夹是新登记时也要落盘（保持「文件夹已导入」语义）
         if ok > 0 || root_folder_new {
@@ -517,7 +540,7 @@ impl Vault {
             }
             self.save_index(index)?;
         }
-        Ok((ok, fail, skipped_symlinks))
+        Ok((ok, fail, skipped_symlinks + skipped_special))
     }
 
     /// 2.4.1 新增：递归收集待导入文件（原 walk_import 的遍历部分，去掉了 self 依赖）。
@@ -530,6 +553,7 @@ impl Vault {
         entries_seen: &mut usize,
         out: &mut Vec<(PathBuf, String, bool)>,
         skipped_symlinks: &mut usize,
+        skipped_special: &mut usize,
     ) -> Result<(), VaultError> {
         if depth > MAX_IMPORT_DEPTH {
             return Err(VaultError::Other("导入目录层级超过安全上限".into()));
@@ -566,9 +590,15 @@ impl Vault {
                     entries_seen,
                     out,
                     skipped_symlinks,
+                    skipped_special,
                 )?;
             } else if meta.is_file() {
                 out.push((path, dest_path, false));
+            } else {
+                // 3.0.1（#49 修复）：FIFO / 设备文件等非常规条目不再静默丢弃 ——
+                // 与符号链接同等计数并随返回值/审计报告
+                *skipped_special += 1;
+                log::warn!("跳过特殊条目（FIFO/设备文件等，已随返回值反馈）");
             }
         }
         Ok(())
