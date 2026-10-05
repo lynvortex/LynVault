@@ -22,8 +22,14 @@ pub struct AppState {
 /// 导入/提取命令必须凭令牌取路径，且要求 IPC 传入路径与登记**逐条完全一致**，
 /// 令牌用后即焚 —— 被攻陷的 WebView 无法再直接 `invoke('import_files_batch',
 /// { src_paths: [...] })` 读取任意用户文件（渲染层任意文件读取等价物）。
-/// 用 Vec<(token, paths)> 而非 HashMap（static 初始化须为 const，条目数 ≤ 64）。
-static DIALOG_TOKENS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+/// 用 Vec<(token, paths, 签发时刻)> 而非 HashMap（static 初始化须为 const，
+/// 条目数 ≤ 64）。
+/// 3.0.1（F16 修复）：条目带签发时刻，登记时清理超过 10 分钟的旧令牌 ——
+/// peek 不消费令牌，旧表会无限期保留「已选但未验证」的路径。
+static DIALOG_TOKENS: Mutex<Vec<(String, Vec<String>, Instant)>> = Mutex::new(Vec::new());
+
+/// 3.0.1（F16）：对话框令牌有效期 —— 正常流程（选完即导入/提取）远短于此
+const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(600);
 
 /// 3.0.0（优化2）：媒体流式预览令牌表 —— (token, vpath)。
 /// 非一次性（播放/拖动进度条会对同一 URL 发多次 Range 请求），随会话
@@ -36,6 +42,34 @@ static MEDIA_TOKENS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 pub fn clear_media_tokens() {
     if let Ok(mut guard) = MEDIA_TOKENS.lock() {
         guard.clear();
+    }
+}
+
+/// 3.0.1（F13 修复）：媒体请求并发闸 —— 被攻陷的 WebView 可对
+/// `lynvault-media://` 发起大量并发 Range 请求，每个最多分配 16 MiB 明文
+/// 并排队占用全局保险柜互斥锁（可用性 DoS，数据暴露面已受令牌约束）。
+/// try-acquire 语义：闸满直接 404（播放器会自行重试），请求不排队堆积。
+static MEDIA_INFLIGHT: Mutex<usize> = Mutex::new(0);
+const MEDIA_MAX_INFLIGHT: usize = 4;
+
+struct MediaSlot;
+
+impl MediaSlot {
+    fn try_acquire() -> Option<MediaSlot> {
+        let mut guard = MEDIA_INFLIGHT.lock().ok()?;
+        if *guard >= MEDIA_MAX_INFLIGHT {
+            return None;
+        }
+        *guard += 1;
+        Some(MediaSlot)
+    }
+}
+
+impl Drop for MediaSlot {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = MEDIA_INFLIGHT.lock() {
+            *guard = guard.saturating_sub(1);
+        }
     }
 }
 
@@ -109,11 +143,13 @@ fn register_dialog_paths(paths: Vec<String>) -> Result<String, String> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
+    // 3.0.1（F16）：先清理过期令牌（peek 不消费，旧条目否则无限期滞留）
+    guard.retain(|(_, _, issued)| issued.elapsed() < DIALOG_TOKEN_TTL);
     // 防御：令牌表无限膨胀（恶意高频调用对话框命令），超限时最旧条目淘汰
     if guard.len() > 64 {
         guard.remove(0);
     }
-    guard.push((token.clone(), paths));
+    guard.push((token.clone(), paths, Instant::now()));
     Ok(token)
 }
 
@@ -138,9 +174,13 @@ fn verify_dialog_paths(token: &str, paths: &[String]) -> Result<(), String> {
     };
     let pos = guard
         .iter()
-        .position(|(t, _)| ct_eq_str(t, token))
+        .position(|(t, _, _)| ct_eq_str(t, token))
         .ok_or_else(|| "对话框令牌无效或已使用".to_string())?;
-    let (_, registered) = guard.remove(pos);
+    let (_, registered, issued) = guard.remove(pos);
+    // 3.0.1（F16）：过期令牌视为无效
+    if issued.elapsed() >= DIALOG_TOKEN_TTL {
+        return Err("对话框令牌无效或已使用".to_string());
+    }
     if registered.len() != paths.len() || registered.iter().zip(paths.iter()).any(|(a, b)| a != b) {
         return Err("传入路径与对话框登记不一致（请求可能被伪造）".to_string());
     }
@@ -157,8 +197,8 @@ fn peek_dialog_paths(token: &str) -> Result<Vec<String>, String> {
     // I2（审计整理）：与 verify_dialog_paths 同一恒定时间纪律
     guard
         .iter()
-        .find(|(t, _)| ct_eq_str(t, token))
-        .map(|(_, paths)| paths.clone())
+        .find(|(t, _, _)| ct_eq_str(t, token))
+        .map(|(_, paths, _)| paths.clone())
         .ok_or_else(|| "对话框令牌无效或已使用".to_string())
 }
 
@@ -298,16 +338,17 @@ pub async fn create_vault(
             state.check_auth_cooldown()?;
             // 3.0.0（M-1）：UNC / 设备路径守卫
             ensure_local_path(&path)?;
-            // 3.0.0（H-1 审计修复）：目标已存在（覆盖分支）必须凭后端对话框令牌 ——
-            // 被攻陷的 WebView 此前可绕过保存对话框的确认直接清零任意可写文件
-            //（与「读任意文件进柜」对称的破坏性原语）。新文件路径走 create_new
-            //（目标存在即失败），本身安全，无需令牌。
-            if std::path::Path::new(&path).exists() {
-                let token = token
-                    .as_deref()
-                    .ok_or("缺少对话框令牌（请通过「新建保险柜」对话框选择位置）")?;
-                verify_dialog_paths(token, std::slice::from_ref(&path))?;
-            }
+            // 3.0.0（H-1 审计修复）：必须凭后端对话框令牌 —— 被攻陷的 WebView
+            // 此前可绕过保存对话框的确认直接清零任意可写文件（与「读任意文件
+            // 进柜」对称的破坏性原语）。
+            // 3.0.1（F12 修复）：令牌要求**无条件** —— 旧实现只对「目标已存在」
+            // 分支核验，WebView 可在无原生确认的情况下于任意可写路径创建新文件
+            //（新文件走 create_new 不会覆盖，但属于免确认的文件创建原语）。
+            // 前端本就总是先经 dialog_pick_save 取令牌，对正常流程零影响。
+            let token = token
+                .as_deref()
+                .ok_or("缺少对话框令牌（请通过「新建保险柜」对话框选择位置）")?;
+            verify_dialog_paths(token, std::slice::from_ref(&path))?;
             let key_data = load_key_file(&key_file_path)?;
             let created: Result<(), String> = (|| {
                 // 2.4.1（P2-20）：Vault::create 成功即进入已解锁会话
@@ -333,13 +374,33 @@ pub async fn create_vault(
     .await
 }
 
+/// 3.0.1（F2 修复）：硬件密钥响应一律由后端在用点现场挑战 —— WebView 不再
+/// 接触响应字节。旧 `yubikey_challenge` 命令把 20 字节响应交给 JS 且无认证、
+/// 无限速、不消费，使「第二因子」退化为对任意文件快照静态可重放的秘密。
+/// 现在响应只在 open / 改密 / 胁迫标记等命令内部派生，用完即弃。
+fn compute_yk_response(salt: &[u8; 32]) -> Result<[u8; 20], String> {
+    let challenge = vault_core::crypto::derive_yubikey_challenge(salt);
+    crate::yubikey::challenge_response(&challenge).map_err(|e| format!("硬件密钥验证失败：{}", e))
+}
+
+/// 3.0.1（F2 修复）：会话内命令的响应获取 —— 当前分区已启用二因子时现场
+/// 挑战硬件；普通分区返回 None（不做任何硬件调用）。
+fn session_yk_response(vault: &Vault) -> Result<Option<[u8; 20]>, String> {
+    if vault.is_yubikey_2fa_active().map_err(|e| e.to_string())? {
+        let salt = vault.yubikey_challenge_salt().map_err(|e| e.to_string())?;
+        Ok(Some(compute_yk_response(&salt)?))
+    } else {
+        Ok(None)
+    }
+}
+
 #[tauri::command]
 pub async fn open_vault(
     app: AppHandle,
     path: String,
     mut password: String,
     key_file_path: Option<String>,
-    yk_response: Option<Vec<u8>>,
+    use_yubikey: Option<bool>,
 ) -> Result<usize, String> {
     run_blocking(&app, "open_vault", move |state| {
         // 2.8.1：冷却检查移入内层（同 create_vault，覆盖密码零化）
@@ -348,8 +409,16 @@ pub async fn open_vault(
             // 3.0.0（M-1）：UNC / 设备路径守卫
             ensure_local_path(&path)?;
             let key_data = load_key_file(&key_file_path)?;
-            // 3.0.0：硬件密钥响应（20 字节 HMAC-SHA1；None = 不使用）
-            let yk = parse_yk_response(&yk_response)?;
+            // 3.0.1（F2）：前端只声明意图（useYubikey），响应由后端现场挑战
+            // 硬件计算 —— 旧实现接受 WebView 提供的任意 20 字节（静态重放面）
+            let yk = match use_yubikey {
+                Some(true) => {
+                    let salt = vault_core::read_vault_yk_salt(Path::new(&path))
+                        .map_err(|e| e.to_string())?;
+                    Some(compute_yk_response(&salt)?)
+                }
+                _ => None,
+            };
             let opened: Result<usize, String> = (|| {
                 let mut vault = Vault::default();
                 let idx = vault
@@ -1075,6 +1144,8 @@ pub async fn destroy_vault(app: AppHandle) -> Result<(), String> {
         // 2.8.1：清空会话槽位 —— 旧实现残留 Some（is_open=false 的空壳），
         // 后续命令报「保险柜未打开」的内部态而非干净的用户语义
         *guard = None;
+        // 3.0.1（F16）：销毁同样是会话结束点 —— 媒体令牌一并作废
+        clear_media_tokens();
         Ok(())
     })
     .await;
@@ -1325,7 +1396,6 @@ pub async fn change_password(
     mut current_password: String,
     mut new_password: String,
     key_file_path: Option<String>,
-    yk_response: Option<Vec<u8>>,
 ) -> Result<(), String> {
     run_blocking(&app, "change_password", move |state| {
         let result: Result<(), String> = (|| {
@@ -1333,10 +1403,11 @@ pub async fn change_password(
             // 不再无限制速（口令复用场景的在线猜测面收敛）
             state.check_auth_cooldown()?;
             let key_data = load_key_file(&key_file_path)?;
-            let yk = parse_yk_response(&yk_response)?;
             let changed: Result<(), String> = (|| {
                 let mut guard = lock_vault(state)?;
                 let vault = guard.as_mut().ok_or("保险柜未打开")?;
+                // 3.0.1（F2）：二因子分区的验证响应由后端现场挑战硬件
+                let yk = session_yk_response(vault)?;
                 vault
                     .change_password(
                         &current_password,
@@ -1372,7 +1443,6 @@ pub async fn set_duress_mark(
     target_alias: String,
     mut target_password: String,
     key_file_path: Option<String>,
-    yk_response: Option<Vec<u8>>,
 ) -> Result<(), String> {
     run_blocking(&app, "set_duress_mark", move |state| {
         let result: Result<(), String> = (|| {
@@ -1380,10 +1450,11 @@ pub async fn set_duress_mark(
             // 不再无限制速（口令复用场景的在线猜测面收敛）
             state.check_auth_cooldown()?;
             let key_data = load_key_file(&key_file_path)?;
-            let yk = parse_yk_response(&yk_response)?;
             let marked: Result<(), String> = (|| {
                 let mut guard = lock_vault(state)?;
                 let vault = guard.as_mut().ok_or("保险柜未打开")?;
+                // 3.0.1（F2）：二因子分区的验证响应由后端现场挑战硬件
+                let yk = session_yk_response(vault)?;
                 // UX 重构：在当前会话中直接标记目标分区（含当前分区——
                 // 用户打开它放好诱饵文件后原地标记是自然流程）
                 vault
@@ -1413,7 +1484,6 @@ pub async fn clear_duress_mark(
     target_alias: String,
     mut target_password: String,
     key_file_path: Option<String>,
-    yk_response: Option<Vec<u8>>,
 ) -> Result<(), String> {
     run_blocking(&app, "clear_duress_mark", move |state| {
         let result: Result<(), String> = (|| {
@@ -1421,10 +1491,11 @@ pub async fn clear_duress_mark(
             // 不再无限制速（口令复用场景的在线猜测面收敛）
             state.check_auth_cooldown()?;
             let key_data = load_key_file(&key_file_path)?;
-            let yk = parse_yk_response(&yk_response)?;
             let cleared: Result<(), String> = (|| {
                 let mut guard = lock_vault(state)?;
                 let vault = guard.as_mut().ok_or("保险柜未打开")?;
+                // 3.0.1（F2）：二因子分区的验证响应由后端现场挑战硬件
+                let yk = session_yk_response(vault)?;
                 vault
                     .clear_duress_mark_on(
                         &target_alias,
@@ -1474,17 +1545,17 @@ pub async fn duress_rehearsal(
     app: AppHandle,
     mut duress_password: String,
     key_file_path: Option<String>,
-    yk_response: Option<Vec<u8>>,
 ) -> Result<serde_json::Value, String> {
     run_blocking(&app, "duress_rehearsal", move |state| {
         let result: Result<serde_json::Value, String> = (|| {
             // 3.0.0（L-11）：同款认证冷却（演练会真实验证胁迫密码）
             state.check_auth_cooldown()?;
             let key_data = load_key_file(&key_file_path)?;
-            let yk = parse_yk_response(&yk_response)?;
             let rehearsal: Result<serde_json::Value, String> = (|| {
                 let mut guard = lock_vault(state)?;
                 let vault = guard.as_mut().ok_or("保险柜未打开")?;
+                // 3.0.1（F2）：二因子分区的验证响应由后端现场挑战硬件
+                let yk = session_yk_response(vault)?;
                 let wiped = vault
                     .duress_rehearsal(&duress_password, key_data.as_deref(), yk.as_ref())
                     .map_err(|e| e.to_string())?;
@@ -1501,18 +1572,8 @@ pub async fn duress_rehearsal(
     .await
 }
 
-/// 3.0.0：IPC 响应字节校验 —— 必须 20 字节（HMAC-SHA1）；None 原样通过
-fn parse_yk_response(raw: &Option<Vec<u8>>) -> Result<Option<[u8; 20]>, String> {
-    match raw {
-        None => Ok(None),
-        Some(v) if v.len() == 20 => {
-            let mut out = [0u8; 20];
-            out.copy_from_slice(v);
-            Ok(Some(out))
-        }
-        Some(v) => Err(format!("硬件密钥响应长度错误（{} 字节，应为 20）", v.len())),
-    }
-}
+// 3.0.1（F2 修复）：删除 `parse_yk_response` —— IPC 不再传递响应字节，
+// 响应由后端 `compute_yk_response` / `session_yk_response` 现场挑战硬件获得。
 
 /// 3.0.0（优化2）：为媒体流式预览签发令牌 —— 校验「柜已开 + 文件存在 +
 /// 扩展名白名单 + 分块布局（Legacy 拒绝）」，返回登记的会话级令牌。
@@ -1603,6 +1664,11 @@ fn media_stream_inner(
     let ext = vpath.rsplit('.').next().unwrap_or("");
     let Some(mime) = media_mime(ext) else {
         return not_found();
+    };
+    // 3.0.1（F13）：并发闸 —— 满载直接 404，不排队
+    let _media_slot = match MediaSlot::try_acquire() {
+        Some(s) => s,
+        None => return not_found(),
     };
 
     let state = app.state::<AppState>();
@@ -1700,9 +1766,7 @@ pub async fn enable_yubikey_2fa(
                 //「排他锁出」（主人拿真钥匙永久打不开）。现由后端对在位钥匙
                 // 现场挑战（设备不在位 = 明确报错，启用二因子必须持有实体钥匙）。
                 let salt = vault.yubikey_challenge_salt().map_err(|e| e.to_string())?;
-                let challenge = vault_core::crypto::derive_yubikey_challenge(&salt);
-                let yk = crate::yubikey::challenge_response(&challenge)
-                    .map_err(|e| format!("硬件密钥验证失败：{}", e))?;
+                let yk = compute_yk_response(&salt)?;
                 vault
                     .enable_yubikey_2fa(&confirm_password, key_data.as_deref(), &yk)
                     .map_err(|e| e.to_string())
@@ -1737,9 +1801,7 @@ pub async fn disable_yubikey_2fa(
                 // L2（审计修复）：解除同样后端自算响应 —— 持有实体钥匙是
                 //「启用」与「解除」的同一必要条件
                 let salt = vault.yubikey_challenge_salt().map_err(|e| e.to_string())?;
-                let challenge = vault_core::crypto::derive_yubikey_challenge(&salt);
-                let yk = crate::yubikey::challenge_response(&challenge)
-                    .map_err(|e| format!("硬件密钥验证失败：{}", e))?;
+                let yk = compute_yk_response(&salt)?;
                 vault
                     .disable_yubikey_2fa(&confirm_password, key_data.as_deref(), &yk)
                     .map_err(|e| e.to_string())
@@ -1774,26 +1836,12 @@ pub async fn yubikey_status(app: AppHandle) -> Result<serde_json::Value, String>
     .await
 }
 
-/// 3.0.0：对在位的硬件密钥执行挑战-响应（挑战由保险柜盐派生 —— 盐是头部
-/// 公开字段，开柜前即可读取；响应的计算能力在物理钥匙内）。
-#[tauri::command]
-pub async fn yubikey_challenge(app: AppHandle, path: String) -> Result<serde_json::Value, String> {
-    run_blocking(&app, "yubikey_challenge", move |_state| {
-        // 2.8.1：远程/设备路径拒绝（与单实例预检同一防线，防 NTLM 泄露）
-        if crate::single_instance::is_remote_or_device_path(&path) {
-            return Err("不支持的保险柜路径".into());
-        }
-        // 3.0.0（M-2 审计修复）：挑战从头部保留区的「挑战盐」派生（不再恒定于库盐）
-        // —— 挑战盐每次成功开柜轮换，响应因此一次性，被截获的旧响应立即失效。
-        // 盐是头部公开字段（签名覆盖），开柜前可读；计算能力在物理钥匙内。
-        let yk_salt =
-            vault_core::read_vault_yk_salt(Path::new(&path)).map_err(|e| e.to_string())?;
-        let challenge = vault_core::crypto::derive_yubikey_challenge(&yk_salt);
-        let response = crate::yubikey::challenge_response(&challenge)?;
-        Ok(serde_json::json!({ "response": response.to_vec() }))
-    })
-    .await
-}
+// 3.0.1（F2 修复）：**已删除 `yubikey_challenge` 命令** —— 旧命令把 20 字节
+// 硬件响应原文交给 WebView，且无认证、无限速、不消费（CWE-306/294）：
+// 被攻陷的 WebView 可对任意本地 `.lyt` 路径无限次取响应，使第二因子退化为
+// 对文件快照静态可重放的秘密，同时构成不限速硬件 oracle 与文件存在性探测。
+// 响应现在只在 open_vault / change_password / 胁迫命令 / 启用解除二因子的
+// 后端路径内由 `compute_yk_response` / `session_yk_response` 现场挑战获得。
 
 /// 2.8.0：移动文件/文件夹到目标目录（跨目录移动只改索引，不重加密）。
 /// 2.8.1（性能）：走 vault-core 批量 API —— 单次 load/save，N 项一次索引落盘
@@ -1908,9 +1956,17 @@ pub async fn verify_vault_integrity(app: AppHandle) -> Result<serde_json::Value,
 pub async fn get_lock_info(path: String) -> Result<serde_json::Value, String> {
     // 3.0.0（M-1）：UNC / 设备路径守卫（读取头部也是文件打开）
     ensure_local_path(&path)?;
+    // 3.0.1（F9 修复）：扩展名门 + 失败统一泛化 —— 旧实现对任意本地路径
+    // 区分「BadMagic / 版本不支持 / 成功」三类结果，是被攻陷 WebView 的
+    // 免认证本地文件类型探测原语
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".lyt") && !lower.ends_with(".vault") {
+        return Err("无法读取保险柜信息".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         catch("get_lock_info", || {
-            let info = vault_core::read_lock_info(Path::new(&path)).map_err(|e| e.to_string())?;
+            let info = vault_core::read_lock_info(Path::new(&path))
+                .map_err(|_| "无法读取保险柜信息".to_string())?;
             Ok(serde_json::json!({
                 "failedCount": info.failed_count,
                 "locked": info.locked,
@@ -1928,14 +1984,14 @@ pub async fn get_lock_info(path: String) -> Result<serde_json::Value, String> {
 pub async fn get_settings() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         catch("get_settings", || match crate::settings::load_active() {
-            Some((path, s)) => Ok(serde_json::json!({
+            // 3.0.1（F9 修复）：不再返回配置文件绝对路径 —— 它泄露安装/
+            // 配置目录布局，且前端无功能性依赖
+            Some((_, s)) => Ok(serde_json::json!({
                 "enabled": true,
-                "path": path.to_string_lossy(),
                 "settings": serde_json::to_value(&s).map_err(|e| e.to_string())?,
             })),
             None => Ok(serde_json::json!({
                 "enabled": false,
-                "path": serde_json::Value::Null,
                 "settings": serde_json::to_value(crate::settings::Settings::default())
                     .map_err(|e| e.to_string())?,
             })),
@@ -2037,6 +2093,8 @@ pub fn system_lock_vault(app: &AppHandle) -> Result<(), String> {
             v.close();
         }
         *guard = None;
+        // 3.0.1（F16）：锁定同样是会话结束点 —— 媒体令牌一并作废
+        clear_media_tokens();
         Ok(())
     })?;
     crate::clipboard_guard::stop();
@@ -2049,10 +2107,10 @@ pub fn system_lock_vault(app: &AppHandle) -> Result<(), String> {
 /// 扫描指定目录下（非递归）的 .lyt / .vault 文件，返回文件名列表（按修改时间倒序）。
 /// 用于启动时的快速打开弹窗。
 ///
-/// `dir` 参数支持两种形式：
-///   1. Tauri 路径变量占位符：`$DESKTOP` / `$DOCUMENT` / `$DOWNLOAD` / `$HOME`
-///      由后端解析为实际路径
-///   2. 绝对路径：直接使用
+/// `dir` 参数只支持 Tauri 路径变量占位符：`$DESKTOP` / `$DOCUMENT` /
+/// `$DOWNLOAD` / `$HOME`，由后端解析为实际目录。
+/// 3.0.1（F11 整理）：删除「绝对路径：直接使用」的过时说明 —— 该分支已在
+/// 3.0.0 L1 审计修复中移除（任意目录扫描是保险柜清单枚举原语）。
 ///
 /// 2.4.1（P0-1）：目录扫描移入阻塞线程池（网络驱动器/大目录不会冻结 UI）。
 #[tauri::command]
@@ -2381,7 +2439,13 @@ fn read_windows_file_icon(ext: &str) -> Result<String, String> {
         return Err("图标尺寸无效".into());
     }
     let abs_h = h.unsigned_abs();
-    let img_size = (w as usize) * (abs_h as usize) * 4;
+    // 3.0.1（F14）：尺寸来自 Windows 图标缓存而非攻击者字节，但
+    // overflow-checks=true 下无界乘法仍是 panic 面 —— checked + 合理上限。
+    let img_size: usize = (w as usize)
+        .checked_mul(abs_h as usize)
+        .and_then(|v| v.checked_mul(4))
+        .filter(|v| *v <= 512 * 1024 * 1024)
+        .ok_or("图标尺寸异常")?;
     let mut pixels: Vec<u8> = vec![0u8; img_size];
 
     // 第二次调用取像素

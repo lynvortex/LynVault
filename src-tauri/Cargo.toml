@@ -1,6 +1,6 @@
 [package]
 name = "LynVault"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"
 # cargo-deny licenses 门禁要求 manifest 显式声明（与仓库根 LICENSE 一致）
 license = "MIT"

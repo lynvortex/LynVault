@@ -92,6 +92,25 @@ async function loadSettings() {
         settingsEnabled = !!raw.enabled;
         if (raw.settings) appSettings = raw.settings;
         applyTheme(appSettings.theme);
+        // 3.0.1（F22 修复）：安全相关开关被配置为「关闭」时给出可见提示 ——
+        // settings.json 无完整性保护，可被同目录可写主体静默篡改（便携模式 /
+        // 过松 ACL）。缺失的是「完整性信号」：提示使用户主动设置与外部篡改
+        // 可区分。仅提示、不阻拦（用户显式关闭属合法配置）。
+        if (settingsEnabled && appSettings) {
+            const autolockOff = Number(appSettings.autolock_minutes) === 0;
+            const antiOff = appSettings.anti_screenshot === false;
+            if (autolockOff || antiOff) {
+                const which = [
+                    autolockOff ? '空闲自动锁柜' : null,
+                    antiOff ? '防截屏保护' : null,
+                ].filter(Boolean).join('、');
+                uiMessage(
+                    '检测到以下安全功能当前被配置为关闭：' + which + '。\n\n' +
+                    '如果这不是你本人的设置，配置文件可能已被外部修改，请检查 settings.json 并尽快恢复。',
+                    { title: '安全提示', type: 'warning' }
+                );
+            }
+        }
     } catch (e) {
         console.warn('[LynVault] 读取设置失败（使用默认值）:', e);
     }
@@ -1859,7 +1878,6 @@ async function openSettings() {
         `<label class="theme-swatch" title="${t}"><input type="radio" name="cfg-theme" value="${t}" ${s.theme === t ? 'checked' : ''}><span class="swatch swatch-${t}"></span></label>`
     ).join('');
     showDialog('设置',
-        `<div class="settings-path">配置文件：${escapeHtml(data.path)}</div>` +
         `<div class="settings-row"><label>主题：</label><div class="theme-swatches">${themeSwatches}</div></div>` +
         `<div class="settings-row"><label>自动锁定（分钟，0=禁用）：</label><input type="text" id="cfg-autolock" value="${escapeAttr(String(s.autolock_minutes))}"></div>` +
         `<div class="settings-row"><label>窗口尺寸：</label><span class="win-size"><input type="text" id="cfg-w" value="${escapeAttr(String(Math.round(s.window_width)))}"> × <input type="text" id="cfg-h" value="${escapeAttr(String(Math.round(s.window_height)))}"></span></div>` +
@@ -1939,9 +1957,8 @@ async function changePassword() {
                 if ([...np].length < 12) { err.textContent = '新密码长度至少 12 位（按字符计）'; return false; }
                 try {
                     setStatus('正在修改密码…（v4 老保险柜会自动升级并重加密，可能耗时较长）');
-                    // 3.0.0（M-4）：二因子分区需携带硬件密钥响应（由后端设备挑战）
-                    const yk = await _ykResponseIfEnabled();
-                    await invoke('change_password', { currentPassword: cur, newPassword: np, keyFilePath: null, ykResponse: yk });
+                    // 3.0.1（F2）：二因子分区的响应由后端现场挑战硬件 —— 前端不传响应字节
+                    await invoke('change_password', { currentPassword: cur, newPassword: np, keyFilePath: null });
                     setStatus('密码修改成功');
                     return true;
                 } catch (e) {
@@ -2189,18 +2206,8 @@ async function _confirmDuressTwice() {
 }
 
 // 新建胁迫分区：别名 + 密码 → add_partition → 标记 → 引导添加诱饵文件
-// 3.0.0（M-4）：二因子分区的敏感操作需要响应时按需取 —— 由后端对在位
-// 钥匙现场挑战（真硬件），未启用或无设备时返回 null（零打扰）。
-async function _ykResponseIfEnabled() {
-    try {
-        const st = data_of(await invoke('yubikey_status'));
-        if (!(st && st.enabled && st.present)) return null;
-        const ch = data_of(await invoke('yubikey_challenge', { path: state.vaultPath }));
-        return (ch && ch.response) || null;
-    } catch (_) {
-        return null; // 探测失败按未启用走（后端会给出准确报错）
-    }
-}
+// 3.0.1（F2）：响应不再经前端 —— 后端在用点现场挑战硬件（当前分区已启用
+// 二因子时），前端只传口令与意图，WebView 全程不接触响应字节。
 
 // 3.0.0：硬件密钥管理（当前分区启用 / 解除）。
 // L2（审计修复）：响应由后端对在位钥匙现场计算 —— IPC 不传响应字节，
@@ -2279,8 +2286,7 @@ async function flowNewDuress() {
     try {
         await invoke('add_partition', { alias, password: pwd, keyFilePath: null });
         // 3.0.0（M-4 兼容）：二因子分区的验证需要响应（由后端设备挑战）
-        const yk = await _ykResponseIfEnabled();
-        await invoke('set_duress_mark', { targetAlias: alias, targetPassword: pwd, keyFilePath: null, ykResponse: yk });
+        await invoke('set_duress_mark', { targetAlias: alias, targetPassword: pwd, keyFilePath: null });
         setStatus('胁迫分区已创建并标记');
         showDialog('胁迫分区已就绪',
             '<p>分区 <b>' + escapeHtml(alias) + '</b> 已创建并标记为胁迫分区。</p>' +
@@ -2311,8 +2317,7 @@ async function flowMarkExisting(parts, active) {
                 if (!pwd) return false;
                 if (!(await _confirmDuressTwice())) return false;
                 try {
-                    const yk = await _ykResponseIfEnabled();
-                    await invoke('set_duress_mark', { targetAlias: target, targetPassword: pwd, keyFilePath: null, ykResponse: yk });
+                    await invoke('set_duress_mark', { targetAlias: target, targetPassword: pwd, keyFilePath: null });
                     setStatus(`分区「${target}」已标记为胁迫分区`);
                 } catch (e) {
                     showError(String(e));
@@ -2336,8 +2341,7 @@ async function flowClearDuress(parts) {
                 const pwd = await _inputPassword('解除胁迫标记', `输入「${target}」分区的密码：`);
                 if (!pwd) return false;
                 try {
-                    const yk = await _ykResponseIfEnabled();
-                    await invoke('clear_duress_mark', { targetAlias: target, targetPassword: pwd, keyFilePath: null, ykResponse: yk });
+                    await invoke('clear_duress_mark', { targetAlias: target, targetPassword: pwd, keyFilePath: null });
                     setStatus(`分区「${target}」的胁迫标记已解除`);
                 } catch (e) {
                     showError(String(e));
@@ -2364,13 +2368,11 @@ async function flowRehearseDuress(parts) {
                 if (!pwd) return false;
                 setStatus('演练进行中：创建临时副本并完整触发…');
                 try {
-                    const yk = await _ykResponseIfEnabled();
                     // 演练无需指定目标：副本开柜时「带标记的分区」自动触发；
                     // 若所选分区未带标记，验证阶段会明确报错
                     const r = data_of(await invoke('duress_rehearsal', {
                         duressPassword: pwd,
                         keyFilePath: null,
-                        ykResponse: yk,
                     }));
                     showDialog('演练完成',
                         '<p>机制验证通过：副本上 <b>' + (r ? r.wiped : '?') + '</b> 个其他分区条目已被随机覆写' +
@@ -2392,7 +2394,7 @@ async function flowRehearseDuress(parts) {
 //（启用二因子的分区需要；未启用的分区两种路径都可开）。零格式变更设计。
 async function invokeOpenVault(filePath, pwd) {
     try {
-        const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null, ykResponse: null });
+        const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null });
         state.vaultPath = filePath;
         return r;
     } catch (e) {
@@ -2408,9 +2410,8 @@ async function invokeOpenVault(filePath, pwd) {
             { title: '硬件密钥', type: 'info' }
         );
         if (!useKey) throw e;
-        const ch = data_of(await invoke('yubikey_challenge', { path: filePath }));
-        if (!ch || !ch.response) throw e;
-        const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null, ykResponse: ch.response });
+        // 3.0.1（F2）：只声明意图（useYubikey），响应由后端现场挑战硬件
+        const r = await invoke('open_vault', { path: filePath, password: pwd, keyFilePath: null, useYubikey: true });
         state.vaultPath = filePath;
         return r;
     }

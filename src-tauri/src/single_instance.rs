@@ -48,7 +48,23 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 /// 2.6.1 新增：单实例连接的最大并发处理数。每个连接独立线程处理（见
 /// `server_loop`），无上限会让本地恶意进程通过快速建立大量连接耗尽线程栈；
 /// 正常使用（用户双击 .lyt）远不会超过该值。
+/// 3.0.1（F24 修复）：该槽位改为**令牌握手通过后**才占用 —— 旧实现 accept
+/// 即计数，8 条未认证空闲连接即可占满槽位整整 5 秒（读超时），让所有合法
+/// 转发失败、单实例退化为双实例。
 const MAX_CONCURRENT_CONNS: usize = 8;
+
+/// 3.0.1（F24）：待处理连接上限（宽松，只为限制线程数）—— 未认证连接
+/// 不再占用上面的并发槽位，但线程总数仍需有界。
+const MAX_PENDING_CONNS: usize = 64;
+
+/// 3.0.1（F24）：panic 安全的并发槽位释放（Drop 兜底，处理线程 catch_unwind
+/// 不再泄漏计数）
+struct ConnSlotGuard(Arc<AtomicUsize>);
+impl Drop for ConnSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// si.json 配置（2.8.2 / L2）：随机端口 + 随机令牌，随安装持久化
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -64,34 +80,24 @@ static SI: Mutex<Option<SiConfig>> = Mutex::new(None);
 static LISTENER: Mutex<Option<TcpListener>> = Mutex::new(None);
 
 /// 读取（或首装生成）单实例配置。
-/// 位置：`%LOCALAPPDATA%\LynVault\si.json`，不可用时回退 `%TEMP%\LynVault\si.json`。
-/// 文件缺失 / 损坏 / 字段非法 → 重新随机生成并覆写。
+/// 位置：`%LOCALAPPDATA%\LynVault\si.json`。
+/// 3.0.1（F20 修复）：**删除 %TEMP% 回退** —— TEMP 的风险面超出模块文档
+/// 声明（环境重定向 / 共享临时目录），且 si.json 本就无敏感信息：配置不可用
+/// 时纯内存运行即可（本次进程内自洽，单实例转发退化为尽力而为语义）。
+/// 文件缺失 / 捅坏 / 字段非法 → 重新随机生成并覆写。
 fn load_or_create_si_config() -> SiConfig {
     fn config_path() -> Option<PathBuf> {
         #[cfg(windows)]
         let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
         #[cfg(not(windows))]
         let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"));
-        let dir = base.map(|b| b.join("LynVault"))?;
-        Some(dir)
+        base.map(|b| b.join("LynVault").join("si.json"))
     }
-    fn temp_config_path() -> PathBuf {
-        std::env::temp_dir().join("LynVault").join("si.json")
-    }
-
-    // 回退表：LOCALAPPDATA 不可用时用 TEMP（si.json 无敏感信息，明文 JSON）
-    let candidates = {
-        let mut v = Vec::new();
-        if let Some(dir) = config_path() {
-            v.push(dir.join("si.json"));
-        }
-        v.push(temp_config_path());
-        v
-    };
 
     // 尝试读取既有配置
-    for path in &candidates {
-        if let Ok(text) = std::fs::read_to_string(path) {
+    let path = config_path();
+    if let Some(p) = &path {
+        if let Ok(text) = std::fs::read_to_string(p) {
             if let Ok(cfg) = serde_json::from_str::<SiConfig>(&text) {
                 // 字段合法性：端口在授权区间、令牌为 32 位 hex（128-bit）
                 if (20000..40000).contains(&cfg.port) && cfg.token.len() == 32 {
@@ -111,18 +117,88 @@ fn load_or_create_si_config() -> SiConfig {
     let token: String = tb.iter().map(|b| format!("{:02x}", b)).collect();
     let cfg = SiConfig { port, token };
 
-    // 持久化（目录不存在则创建；全部失败时仍用内存配置，本次进程内自洽）
-    for path in &candidates {
-        if let Some(parent) = path.parent() {
+    // 持久化（目录不存在则创建；写入失败时仍用内存配置，本次进程内自洽）
+    if let Some(p) = &path {
+        if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string(&cfg) {
-            if std::fs::write(path, json).is_ok() {
-                break;
+            if write_si_config(p, &json).is_ok() {
+                return cfg;
             }
         }
     }
     cfg
+}
+
+/// 3.0.1（F21 修复）：si.json 安全写入 —— 旧实现 `std::fs::write`
+///（= File::create + write_all）**跟随符号链接**且以默认权限创建：首次运行前
+/// 在候选路径预置链接，配置 JSON 会写进链接目标（任意文件覆写/创建）。
+/// 与 settings.rs 的 save_at / main.rs 日志同一威胁模型同一套检查：
+/// 随机临时名 create_new + 不跟随重解析点 + 句柄级「非重解析点 + 硬链接数
+/// 为 1」校验，rename 原子替换。
+fn write_si_config(path: &Path, json: &str) -> std::io::Result<()> {
+    use rand::RngCore;
+    use std::io::Write;
+    let mut suffix = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    let name = format!(
+        "si.json.tmp.{}",
+        suffix
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    );
+    let tmp = path.with_file_name(name);
+    let f = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+            opts.mode(0o600);
+        }
+        opts.open(&tmp)?
+    };
+    #[cfg(windows)]
+    {
+        // 句柄级确认（create_new 新文件本应满足；失败 = 竞态，放弃）
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let ok =
+            unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle() as isize), &mut info) }
+                .map(|_| info.nNumberOfLinks == 1)
+                .unwrap_or(false);
+        let attrs = f.metadata().map(|m| m.file_attributes()).unwrap_or(0xFFFF);
+        if !ok || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "单实例配置临时文件校验失败（疑似链接注入）",
+            ));
+        }
+    }
+    {
+        let mut f = f;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn si_config() -> SiConfig {
@@ -276,28 +352,32 @@ pub fn server_loop(handle: AppHandle) {
     };
     let expected_token = cfg.token;
 
-    let inflight = Arc::new(AtomicUsize::new(0));
+    // 3.0.1（F24）：两个独立计数器 —— pending（accept 起算，限线程数，宽松）
+    // 与 active（令牌握手通过后才占用，限真实处理并发）。旧实现共用一个
+    // accept 侧计数，8 条未认证空闲连接即可占满槽位 5 秒。
+    let pending = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        // 并发上限：超限直接丢弃（仅影响同一时刻的并发打开请求，不影响正常单次双击）
-        if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNS {
-            inflight.fetch_sub(1, Ordering::SeqCst);
+        if pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_CONNS {
+            pending.fetch_sub(1, Ordering::SeqCst);
             drop(stream);
             continue;
         }
         let handle = handle.clone();
-        let inflight = inflight.clone();
+        let pending = pending.clone();
+        let active = active.clone();
         let expected_token = expected_token.clone();
         std::thread::spawn(move || {
-            // 2.8.2：处理线程 panic 不得泄漏并发计数（否则累计 8 次后
-            // 单实例转发永久失效）
+            // 2.8.2：处理线程 panic 不得泄漏计数（否则累计后单实例转发
+            // 永久失效）
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_connection(&handle, stream, &expected_token);
+                handle_connection(&handle, stream, &expected_token, active);
             }));
             if result.is_err() {
                 log::warn!("单实例连接处理线程 panic（已恢复）");
             }
-            inflight.fetch_sub(1, Ordering::SeqCst);
+            pending.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -306,7 +386,12 @@ pub fn server_loop(handle: AppHandle) {
 /// 在独立线程中运行，因此 `handle_vault_request` 等待前端就绪（最长 60 秒）
 /// 不再阻塞 accept 循环。
 /// 2.8.2（L2）：令牌不符直接断开，不回执、不收路径。
-fn handle_connection(handle: &AppHandle, stream: TcpStream, expected_token: &str) {
+fn handle_connection(
+    handle: &AppHandle,
+    stream: TcpStream,
+    expected_token: &str,
+    active: Arc<AtomicUsize>,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let mut reader = BufReader::new(stream);
@@ -332,6 +417,14 @@ fn handle_connection(handle: &AppHandle, stream: TcpStream, expected_token: &str
     if !proto_ok || !token_ok {
         return; // 令牌不符直接断开（无回执、无路径）
     }
+    // 3.0.1（F24）：并发槽位在**令牌握手通过后**才占用。panic 经
+    // ConnSlotGuard 的 Drop 兜底释放（外层 catch_unwind 的 unwind 过程中
+    // guard 正常析构）。
+    if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNS {
+        active.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let _slot = ConnSlotGuard(active);
     if reader.get_mut().write_all(b"OK\n").is_err() {
         return;
     }

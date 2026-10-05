@@ -82,18 +82,12 @@ pub fn probe() -> Result<bool, String> {
 }
 
 /// 对槽 2 执行 HMAC-SHA1 挑战-响应，返回 20 字节响应。
-/// `challenge` 超过 64 字节将被拒绝（YubiKey 协议上限）。
+/// `challenge` 类型即 64 字节（YubiKey 协议上限）—— 3.0.1（F15）：删除
+/// 对 `&[u8; 64]` 永假的长度检查。
 pub fn challenge_response(challenge: &[u8; 64]) -> Result<[u8; HMAC_LEN], String> {
     let (_ctx, card) = connect_first_yubikey()?;
     transmit_checked(&card, &APDU_SELECT)?;
 
-    if challenge.len() > MAX_CHALLENGE {
-        return Err(format!(
-            "挑战长度超限（{} 字节，上限 {}）",
-            challenge.len(),
-            MAX_CHALLENGE
-        ));
-    }
     let mut apdu = Vec::with_capacity(5 + MAX_CHALLENGE);
     apdu.extend_from_slice(&[
         0x00,

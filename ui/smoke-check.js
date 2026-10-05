@@ -152,7 +152,6 @@ const tauriInvoke = async (cmd, args) => {
     if (cmd === 'clear_duress_mark') return {};
     if (cmd === 'enable_yubikey_2fa') return {};
     if (cmd === 'duress_rehearsal') return { wiped: 1 };
-    if (cmd === 'yubikey_challenge') return { response: [0, 1, 2] };
     return { ok: true };
 };
 

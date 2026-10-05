@@ -567,10 +567,10 @@ fn main() {
             commands::get_duress_status,
             commands::duress_rehearsal,
             // 3.0.0 新增：硬件密钥二因子（可选，YubiKey HMAC-SHA1 挑战-响应）
+            // 3.0.1（F2）：yubikey_challenge 已删除 —— 响应不再出后端
             commands::enable_yubikey_2fa,
             commands::disable_yubikey_2fa,
             commands::yubikey_status,
-            commands::yubikey_challenge,
             // 3.0.0（优化2）：媒体流式预览令牌
             commands::mint_media_token,
         ])

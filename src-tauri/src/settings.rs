@@ -204,12 +204,25 @@ fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
 fn open_tmp_secure(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     // O_NOFOLLOW：拒绝指向已有符号链接的目标
-    std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(tmp)
+        .open(tmp)?;
+    // 3.0.1（F23 修复）：与 Windows 分支对称 —— O_NOFOLLOW 挡符号链接但
+    // 挡不住在固定可预测名（settings.json.tmp）上预置的**硬链接**；
+    // 句柄级校验硬链接数为 1
+    {
+        use std::os::unix::fs::MetadataExt;
+        if f.metadata()?.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "配置临时文件校验失败（疑似硬链接注入）",
+            ));
+        }
+    }
+    Ok(f)
 }
 
 /// 把配置写到指定路径（save_settings 更新现有配置时使用）
