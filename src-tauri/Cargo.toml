@@ -47,8 +47,19 @@ rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 # 3.1.0：备用 GUI（egui 直染，不依赖 WebView）—— 主窗口创建失败时的完整前端。
-# 与 Tauri 并存于同一进程但互不依赖；egui 显式声明以便 gui 模块直接使用
-eframe = "0.29"
+# 与 Tauri 并存于同一进程但互不依赖；egui 显式声明以便 gui 模块直接使用。
+# 3.1.1（安全门禁）：关闭默认特性中的 accesskit / web_screen_reader ——
+# 屏幕阅读器桥接会引入 accesskit → atspi/zbus/zvariant/quick-xml 与
+# accesskit_windows → paste 整条依赖链（其中含 quick-xml 0.30 的 DoS 公告与
+# 多个无修复版本的上游弃维护 crate）。备用界面不需要无障碍树，关闭后
+# 依赖面显著收敛；剪贴板 / 链接 / 平台后端由 eframe 自身的 egui-winit
+# 依赖特性与下面的 glow/wayland/x11 保留。
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.29"
 rfd = "0.15"
 

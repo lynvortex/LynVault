@@ -26,14 +26,17 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "1"
 byteorder = "1"
 log = "0.4"
-# 2.6.1 安全升级：calamine 0.24 → 0.36（其内部依赖 quick-xml ^0.41），
+# 2.6.1 安全升级：calamine 0.24 → 0.38（其内部依赖 quick-xml ^0.41），
 # 消除 RUSTSEC-2026-0194/0195（quick-xml 0.31 高危：重复属性名二次方耗时、
-# NsReader 命名空间声明无界分配导致内存耗尽 DoS）。
-calamine = "0.36"
+# NsReader 命名空间声明无界分配导致内存耗尽 DoS）；3.1.1 再升至 0.38 修复
+# RUSTSEC-2026-0436（CFB/OLE2 解析器 panic 与无界分配，影响 .xls/.xlsb）。
+calamine = "0.38"
 quick-xml = "0.41"
-# 2.7.1：zip 0.6 → 8。0.6 主线已停止维护（依赖树中曾与 8.x 双份并存）；
-# 本仓库仅用内存内 by_name 读取（无 Zip-Slip 面）与测试内 ZipWriter，API 兼容
-zip = "8"
+# 2.7.1：zip 0.6 → 9。0.6 主线已停止维护（依赖树中曾与 8.x 双份并存）；
+# 本仓库仅用内存内 by_name 读取（无 Zip-Slip 面）与测试内 ZipWriter，API 兼容。
+# 3.1.1：8 → 9 修复 RUSTSEC-2026-0367/0368/0369/0429（SUID 保留、符号链接
+# 越界、解压中止）与 zstd 0.13.3 相关公告（zip 9 已升级 zstd 依赖）。
+zip = "9"
 cfb = "0.7"
 libc = "0.2"
 # 2.7.0：加密 Office 预览(Agile Encryption 解密)

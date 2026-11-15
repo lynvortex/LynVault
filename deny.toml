@@ -16,11 +16,18 @@ ignore = [
   # glib-macros → gtk 传入（Tauri 2 的 Linux/GTK 构建专属依赖链），
   # Windows 发布产物不受影响；待 gtk-rs/tauri 上游换用替代宏库后移除。
   "RUSTSEC-2024-0370",
-  # RUSTSEC-2024-0429（glib 0.18.5 unsound）：#41 补记录 —— 无可用升级
-  #（0.18 系列无修复版），仅经 Tauri 2 的 Linux/GTK 链路传入（glib →
-  # gtk），Windows 发布产物不受影响；soundness 缺陷在本项目的使用面
-  #（信号/对象包装）未触及。跟踪 gtk-rs 上游升级后移除。
-  "RUSTSEC-2024-0429",
+  # RUSTSEC-2026-0192（ttf-parser 上游弃维护）：egui/epaint 的字体解析链路
+  #（ab_glyph → owned_ttf_parser → ttf-parser）尚无替代版本；仅解析内置字体
+  # 与系统字体文件，不解析用户/保险柜数据。待 egui 升级到改用 skrifa 的
+  # 版本后移除。
+  "RUSTSEC-2026-0192",
+  # RUSTSEC-2026-0370 / 0371 / 0372（zvariant / zbus_names / zvariant_derive
+  # 已并入 zbus 6，不再作为独立 crate 维护）：经 rfd（Linux 文件对话框，
+  # ashpd）与 tauri-plugin-opener 的 zbus 5 依赖链传入，属 Linux D-Bus
+  # 客户端；Windows 发布产物不包含这条链路。上游升级 zbus 6 后移除。
+  "RUSTSEC-2026-0370",
+  "RUSTSEC-2026-0371",
+  "RUSTSEC-2026-0372",
 ]
 
 # ── 许可证合规 ────────────────────────────────────────────────────────

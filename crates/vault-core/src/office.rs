@@ -1185,7 +1185,13 @@ fn prescan_xlsx(data: &[u8]) -> Result<(), String> {
             MAX_XLSX_ZIP_ENTRIES
         ));
     }
-    let mut names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    // zip 9：名称解码失败（非 UTF-8 等）以 Err 返回 —— 这类条目本就无法按名
+    // 读取，跳过即可；物理条目仍会在下面的按索引循环中逐一计量。
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter_map(|s| s.ok())
+        .map(|s| s.to_string())
+        .collect();
     // 3.0.1（#52 修复）：名称去重 —— zip 的 by_name 恒取**最后一个**同名条目，
     // 重复名称会让被遮蔽条目从未被计量（第一遍实测不完整）；按唯一名称集合
     // 计量与 calamine 的解析目标（按名读取）一致。
@@ -1200,7 +1206,10 @@ fn prescan_xlsx(data: &[u8]) -> Result<(), String> {
         let mut f = archive
             .by_index(i)
             .map_err(|e| format!("ZIP 条目 #{} 读取失败: {}", i, e))?;
-        let entry_name = f.name().to_string();
+        let entry_name = match f.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => format!("条目 #{}", i),
+        };
         let mut entry_total: u64 = 0;
         let mut buf = [0u8; 65536];
         loop {
