@@ -57,7 +57,33 @@ pub(crate) const MAX_INMEM_BUFFER: usize = 256 * 1024 * 1024;
 /// v6 单文件大小上限（1 TiB）—— sanity 上限，实际受磁盘空间约束
 pub(crate) const MAX_VAULT_FILE: u64 = 1024u64 * 1024 * 1024 * 1024;
 /// v6 分块布局的明文块大小（4 MiB）—— 每块独立 nonce + GCM tag，
-/// 常量内存流式加解密的单位
-pub(crate) const CHUNK_SIZE_V6: u64 = 4 * 1024 * 1024;
+/// 常量内存流式加解密的单位。
+/// 3.1.1：定义已上移到叶子模块 [`crate::chunk`]（切断 index → vault 的常量回边），
+/// 此处仅 re-export —— `use super::consts::*` 的既有调用点无需改动。
+pub(crate) use crate::chunk::CHUNK_SIZE_V6;
+
+// ───────── 3.1.1（审计修复）：头部公共字段偏移的单一来源 ─────────
+//
+// 旧实现把 73 / 105 / 106 / 41 这些偏移以裸字面量散落在 header.rs 与 session.rs
+// 的六处（read_lock_info / read_vault_salt / build_header_v4 /
+// build_header_envelope / auth_tag_header_prefix / write_lock_region_journaled）。
+// 这是**格式兼容性决策被复制了六次**：任何一次布局微调只要漏改一处，后果就是
+// 「旧柜打不开 / 新柜错位」。现全部收敛到本组常量，代码内禁止再出现裸偏移。
+//
+// v4 与 v5/v6 的 magic / 版本 / 保留区 / 保险柜 salt / 条目数位置一致。
+/// 保险柜 salt 偏移（头部公开字段，与 read_lock_info 同级）
+pub(crate) const SALT_OFFSET: usize = 73;
+/// 保险柜 salt 长度（亦为硬件密钥挑战盐长度）
+pub(crate) const SALT_LEN: usize = 32;
+/// 头部前缀长度 = magic(8) + version(1) + 保留区(64) + salt(32)
+pub(crate) const HEADER_PREFIX_LEN: usize = 105;
+/// 分区条目数量字段（恒写 MAX_PARTITIONS，隐藏真实分区数）
+pub(crate) const ENTRY_COUNT_OFFSET: usize = 105;
+/// 第一个分区条目的起始偏移
+pub(crate) const ENTRY_BASE: usize = 106;
+/// 硬件密钥挑战盐字段结束偏移（9 + 32 = 41）
+pub(crate) const YK_SALT_END: usize = YK_SALT_OFFSET + SALT_LEN;
+/// 锁定区大小：count(1) + until(8) + HMAC(32)
+pub(crate) const LOCK_REGION_SIZE: usize = 41;
 pub(crate) const MAX_IMPORT_DEPTH: usize = 64;
 pub(crate) const MAX_IMPORT_ENTRIES: usize = 100_000;

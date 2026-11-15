@@ -212,3 +212,106 @@ impl AuditLog {
         log
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! 3.1.1（审计修复）：链式 HMAC 的恢复语义（篡改位点 / 尾部截断 /
+    //! 错误密钥）此前没有直接用例，而这正是「审计链被动手脚」的唯一检出点。
+
+    use super::*;
+
+    fn key() -> [u8; 32] {
+        [5u8; 32]
+    }
+
+    #[test]
+    fn chain_roundtrip_and_tamper_detection() {
+        let mut log = AuditLog::new(key());
+        for i in 0..3 {
+            log.add(&format!("事件 {}", i));
+        }
+        let entries = log.to_vec();
+
+        // 完整链：恢复后不标记截断
+        let restored = AuditLog::from_entries(entries.clone(), key());
+        assert!(!restored.is_truncated(), "完整链不得标记截断");
+        assert_eq!(restored.to_vec().len(), 3);
+
+        // 篡改中间条目 → 从该条起全部丢弃，并标记截断
+        let mut bad = entries.clone();
+        bad[1].event = "被篡改".into();
+        let r = AuditLog::from_entries(bad, key());
+        assert!(r.is_truncated(), "篡改必须被检出");
+        assert_eq!(r.to_vec().len(), 1, "只保留篡改点之前的条目");
+
+        // 尾部截断：剩余链本身仍有效（截断由头部锚点另行检出）
+        let short = entries[..2].to_vec();
+        let r = AuditLog::from_entries(short, key());
+        assert_eq!(r.to_vec().len(), 2);
+        assert!(!r.is_truncated(), "尾部截断不破坏剩余链的有效性");
+    }
+
+    #[test]
+    fn wrong_auth_key_rejects_everything() {
+        let mut log = AuditLog::new(key());
+        log.add("x");
+        let r = AuditLog::from_entries(log.to_vec(), [6u8; 32]);
+        assert!(r.is_truncated());
+        assert!(r.to_vec().is_empty());
+    }
+
+    #[test]
+    fn rekey_preserves_history_and_rejects_tamper() {
+        let mut log = AuditLog::new(key());
+        log.add("a");
+        log.add("b");
+        let new_key = [9u8; 32];
+        log.rekey(&key(), new_key).expect("合法链必须可换钥");
+        // 换钥后旧密钥不再有效，新密钥有效
+        let entries = log.to_vec();
+        assert!(AuditLog::from_entries(entries.clone(), key()).is_truncated());
+        let r = AuditLog::from_entries(entries, new_key);
+        assert!(!r.is_truncated());
+        assert_eq!(r.to_vec().len(), 2);
+
+        // 换钥前先硬校验：链内条目被篡改时必须中止（不静默截断）。
+        // 直接用同模块可访问的私有字段构造「已入内存但已被改」的状态 ——
+        // from_entries 会把无效条目过滤掉，无法覆盖这条路径。
+        let mut raw = AuditLog::new(key());
+        raw.add("a");
+        raw.add("b");
+        raw.entries[1].event = "被改".into();
+        assert!(raw.rekey(&key(), new_key).is_err(), "篡改链换钥必须失败");
+    }
+
+    #[test]
+    fn add_enforces_runtime_cap() {
+        let mut log = AuditLog::new(key());
+        for i in 0..(AUDIT_MAX_EVENTS + 5) {
+            log.add(&i.to_string());
+        }
+        assert_eq!(
+            log.to_vec().len(),
+            AUDIT_MAX_EVENTS,
+            "超出运行期上限应淘汰最旧条目"
+        );
+    }
+
+    #[test]
+    fn capped_deserialization_guards_oversized_array() {
+        // 超硬上限 → 解析期即拒绝（内存放大 DoS 收口）；恰为上限 → 通过
+        let entry = r#"{"ts":0.0,"event":"","hmac":""}"#;
+        let over = vec![entry; AUDIT_PARSE_HARD_CAP + 1].join(",");
+        let json = format!(r#"{{"files":{{}},"folders":{{}},"audit":[{}]}}"#, over);
+        assert!(
+            serde_json::from_str::<crate::index::Index>(&json).is_err(),
+            "超过硬上限的审计数组必须拒绝解析"
+        );
+        let at_cap = vec![entry; AUDIT_PARSE_HARD_CAP].join(",");
+        let json = format!(r#"{{"files":{{}},"folders":{{}},"audit":[{}]}}"#, at_cap);
+        assert!(
+            serde_json::from_str::<crate::index::Index>(&json).is_ok(),
+            "恰好等于硬上限必须通过（避免误伤历史合法数据）"
+        );
+    }
+}

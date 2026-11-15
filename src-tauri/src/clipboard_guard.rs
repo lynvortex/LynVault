@@ -306,10 +306,12 @@ fn do_clear_clipboard() {
         CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
     };
     // 清空前的基准序列号
+    // 3.1.1（审计修复）：旧实现连续读了两次并分别命名 seq_before / seq，
+    // 两次调用之间没有任何操作 —— 读者会误以为存在「清空前基准」与「当前值」
+    // 两个不同量。实际只有一次读有意义（S0），清空后的 S1 在下方单独读取。
     let seq_before = unsafe { GetClipboardSequenceNumber() };
     // 回声检查：序列号没变说明仍是上一轮我们自己清空后的状态
-    let seq = unsafe { GetClipboardSequenceNumber() };
-    if seq != 0 && seq == LAST_CLEARED_SEQ.load(Ordering::Relaxed) {
+    if seq_before != 0 && seq_before == LAST_CLEARED_SEQ.load(Ordering::Relaxed) {
         return;
     }
     unsafe {

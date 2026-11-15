@@ -339,7 +339,7 @@ impl Vault {
         let alias_field = alias_field16(&old_part.alias);
         let salt = self.salt;
         let lock_state = self.lock_state.clone();
-        let result = (|| -> Result<PartitionInfo, VaultError> {
+        let result = (|| -> Result<(PartitionInfo, [u8; 32]), VaultError> {
             // 7a. 临时文件 + v5 占位头部
             // 3.0.1（F10）：0600 落盘（见 create_scratch_file）
             let mut tmp_file = crate::vault::fs_util::create_scratch_file(&temp_path)?;
@@ -464,11 +464,14 @@ impl Vault {
             self.file = None;
             replace_vault_file(&temp_path, &vault_path)?;
             sync_parent_dir(&vault_path);
-            Ok(new_part)
+            // 3.1.1（审计修复）：挑战盐随返回值带出 —— 旧实现的成功分支从不
+            // 更新 self.yk_challenge_salt，下一次任意 update_header 都会把刚写入
+            // 的随机盐覆盖回会话里的全 0，与 F19「盐终生不变」的不变量矛盾。
+            Ok((new_part, yk_salt))
         })();
 
         match result {
-            Ok(new_part) => {
+            Ok((new_part, yk_salt)) => {
                 // 8. 备份已无用（替换已提交）：DoD 擦除。
                 // 3.0.1（F29 修复）：与失败路径同一纪律 —— .bak 是**旧口令仍能
                 // 打开的整柜副本**，改口令通常正因为旧口令可能已泄露，残留副本
@@ -542,6 +545,9 @@ impl Vault {
                 };
                 self.file = Some(file);
                 self.format_version = VERSION_V6;
+                // 3.1.1：把本次生成的挑战盐固化进会话（否则下一次 update_header
+                // 会用旧值覆盖刚写入头部的随机盐）
+                self.yk_challenge_salt = yk_salt;
                 self.data_key = Some(LockedKey::new(*data_key)); // Zeroizing 解包 → 装箱驻留
                 self.enc_key = Some(LockedKey::new(new_keys.enc_key));
                 self.auth_key = Some(LockedKey::new(new_keys.auth_key));

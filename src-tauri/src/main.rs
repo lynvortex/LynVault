@@ -2,12 +2,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+// 3.2.0：持久化配置的 LYCFG 容器（加密 + 防伪造），settings / single_instance 共用
+mod config_codec;
 // 2.8.0：剪贴板保护 —— 模块本身跨平台（start/stop 在非 Windows 为空实现），
 // 内部 win32 代码全部 cfg(windows) 隔离；不要在声明处 gate，
 // 否则 commands.rs 的无条件调用在 Linux 编译失败
 mod clipboard_guard;
+// 3.1.0：备用 GUI（egui 直染，不依赖 WebView）—— --gui 显式启用，
+// 主窗口创建全部降级重试失败后自动切换（见 main 的 created 分支）
 #[cfg(windows)]
 mod file_assoc;
+mod gui;
 mod settings;
 mod single_instance;
 // 3.0.0：可选硬件密钥二因子 —— PC/SC 直连 YubiKey HMAC-SHA1 挑战-响应
@@ -440,7 +445,19 @@ fn main() {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    commands::set_launch_vault_arg(single_instance::extract_vault_arg(argv.iter().cloned()));
+    let launch_vault = single_instance::extract_vault_arg(argv.iter().cloned());
+    commands::set_launch_vault_arg(launch_vault.clone());
+
+    // 3.1.0：--gui 显式使用备用界面（日常可用的完整文件管理前端，非应急通道）。
+    // 直接进入 egui 界面，不启动 Tauri / WebView；不参与单实例竞争
+    //（与主界面并行运行由保险柜文件的独占打开互斥兜底）。
+    if argv.iter().any(|a| a == "--gui") {
+        if let Err(e) = gui::run(launch_vault) {
+            log::error!("备用界面异常退出: {}", e);
+            fatal_startup_error("LynVault 备用界面", &format!("备用界面异常退出：{}", e));
+        }
+        return;
+    }
 
     // 单实例竞争：非首实例在此转发参数并退出（不创建窗口，无闪烁）
     if !single_instance::acquire_or_forward(argv) {
@@ -540,11 +557,13 @@ fn main() {
             commands::scan_vault_files,
             commands::check_extract_all_dest,
             commands::extract_all_files,
-            commands::get_file_icon,
+            commands::icon::get_file_icon,
             // 2.4.1 新增：.lyt 自动识别 + 前端就绪通知
             commands::check_vault_file,
             commands::get_launch_vault_arg,
             commands::frontend_ready,
+            // 3.1.1：启动检测弹窗「GUI启动」—— 切换内置 GUI（egui）版
+            commands::launch_gui_mode,
             // 2.8.0 新增：改密码 / 移动 / 搜索 / 审计 / 体检 / 锁定信息 / 设置
             commands::change_password,
             commands::move_items,
@@ -574,7 +593,7 @@ fn main() {
             commands::disable_yubikey_2fa,
             commands::yubikey_status,
             // 3.0.0（优化2）：媒体流式预览令牌
-            commands::mint_media_token,
+            commands::media::mint_media_token,
         ])
         .build(tauri::generate_context!())
     {
@@ -649,16 +668,25 @@ fn main() {
     }
     if !created {
         let err = last_err.unwrap_or_default();
-        log::error!("主窗口创建失败（含全部降级重试）: {}", err);
+        log::error!("主窗口创建失败（含全部降级重试），切换备用界面: {}", err);
+        // 3.1.0：主界面彻底无法启动（WebView Runtime 缺失/损坏、数据目录故障等）
+        // 时不再止步于弹窗 —— 自动切换到不依赖 WebView 的备用 GUI，
+        // 用户仍可完成开柜/浏览/导入/提取/预览/编辑全链路。
         fatal_startup_error(
-            "LynVault 启动失败",
+            "LynVault 主界面无法启动",
             &format!(
                 "主窗口创建失败：{}
 
-常见原因：WebView2 Runtime 缺失或损坏、用户数据目录无写权限或被占用。请修复后重新启动。",
+即将进入内置备用界面（功能为基础文件管理）。
+
+常见原因：WebView2 Runtime 缺失或损坏、用户数据目录无写权限或被占用。",
                 err
             ),
         );
+        if let Err(e) = gui::run(launch_vault) {
+            log::error!("备用界面异常退出: {}", e);
+            fatal_startup_error("LynVault 备用界面", &format!("备用界面异常退出：{}", e));
+        }
         return;
     }
 

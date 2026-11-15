@@ -46,12 +46,12 @@ pub fn read_lock_info(path: &Path) -> Result<LockInfo, VaultError> {
         VERSION_V5 | VERSION_V6 => LOCK_OFFSET_V5,
         v => return Err(VaultError::Other(format!("不支持的保险柜格式版本 {}", v))),
     };
-    // 保险柜 salt 在 v4/v5 布局中位置一致（73..105）
-    f.seek(SeekFrom::Start(73))?;
-    let mut salt = [0u8; 32];
+    // 保险柜 salt 在 v4/v5 布局中位置一致（3.1.1：偏移取自 consts 单一来源）
+    f.seek(SeekFrom::Start(SALT_OFFSET as u64))?;
+    let mut salt = [0u8; SALT_LEN];
     f.read_exact(&mut salt)?;
     f.seek(SeekFrom::Start(lock_offset as u64))?;
-    let mut buf = [0u8; 41];
+    let mut buf = [0u8; LOCK_REGION_SIZE];
     f.read_exact(&mut buf)?;
     let mut lock_until = f64::from_le_bytes(buf[1..9].try_into().unwrap());
     // 2.8.1：拒绝非有限值（与打开路径同一防护）
@@ -64,7 +64,7 @@ pub fn read_lock_info(path: &Path) -> Result<LockInfo, VaultError> {
         lock_until_monotonic: None,
     };
     let mac_key = derive_lock_mac_key(&salt);
-    if !lock_state.verify_hmac(&mac_key, &buf[9..41].try_into().unwrap()) {
+    if !lock_state.verify_hmac(&mac_key, &buf[9..LOCK_REGION_SIZE].try_into().unwrap()) {
         return Err(VaultError::Other(
             "头部锁定区校验失败 —— 头部可能被篡改".into(),
         ));
@@ -90,8 +90,8 @@ pub fn read_vault_salt(path: &Path) -> Result<[u8; 32], VaultError> {
         VERSION_V4 | VERSION_V5 | VERSION_V6 => {}
         v => return Err(VaultError::Other(format!("不支持的保险柜格式版本 {}", v))),
     }
-    f.seek(SeekFrom::Start(73))?;
-    let mut salt = [0u8; 32];
+    f.seek(SeekFrom::Start(SALT_OFFSET as u64))?;
+    let mut salt = [0u8; SALT_LEN];
     f.read_exact(&mut salt)?;
     Ok(salt)
 }
@@ -111,7 +111,7 @@ pub fn read_vault_yk_salt(path: &Path) -> Result<[u8; 32], VaultError> {
         v => return Err(VaultError::Other(format!("不支持的保险柜格式版本 {}", v))),
     }
     f.seek(SeekFrom::Start(YK_SALT_OFFSET as u64))?;
-    let mut yk_salt = [0u8; 32];
+    let mut yk_salt = [0u8; SALT_LEN];
     f.read_exact(&mut yk_salt)?;
     Ok(yk_salt)
 }
@@ -264,10 +264,28 @@ pub(crate) fn write_header_bytes_journaled(
 /// 之前）。静默容错：任何失败都不阻塞打开（最坏保持现状，日志留给下次）。
 pub(crate) fn recover_header_from_journal(file: &mut File, vault_path: &Path) {
     let jp = journal_path(vault_path);
-    let Ok(data) = std::fs::read(&jp) else {
+    // 3.1.1（审计修复）：先按元数据封顶再读 —— 旧实现 `std::fs::read` 无上限，
+    // 同目录被塞入数 GB 的 `.hdr.journal`（云同步回灌 / 本地低权限写者）会让
+    // 打开保险柜时一次性分配至 OOM/abort（可用性 DoS：整柜打不开）。
+    let Ok(meta) = std::fs::metadata(&jp) else {
         return; // 无日志 = 常态
     };
-    let size = data.len();
+    // 有效日志必为完整头部快照（≤ HEADER_SIZE_V5）
+    if meta.len() > HEADER_SIZE_V5 as u64 {
+        let _ = std::fs::remove_file(&jp);
+        sync_parent_dir(vault_path);
+        return;
+    }
+    let size = meta.len() as usize;
+    let mut data = vec![0u8; size];
+    {
+        let Ok(mut jf) = File::open(&jp) else {
+            return;
+        };
+        if jf.read_exact(&mut data).is_err() {
+            return; // 读取期间被改动：留给下次打开
+        }
+    }
     // 日志必须是完整头部快照：长度与版本字节互相印证（防半截日志被当成
     // 有效头部恢复）
     let valid = (size == HEADER_SIZE_V4 || size == HEADER_SIZE_V5)
@@ -320,7 +338,7 @@ pub(crate) fn write_lock_region_journaled(
     file: &mut File,
     vault_path: &Path,
     lock_offset: usize,
-    lock_buf: &[u8; 41],
+    lock_buf: &[u8; LOCK_REGION_SIZE],
 ) -> Result<(), VaultError> {
     let header_size = if lock_offset == LOCK_OFFSET_V4 {
         HEADER_SIZE_V4
@@ -330,7 +348,7 @@ pub(crate) fn write_lock_region_journaled(
     let mut header = vec![0u8; header_size];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
-    header[lock_offset..lock_offset + 41].copy_from_slice(lock_buf);
+    header[lock_offset..lock_offset + LOCK_REGION_SIZE].copy_from_slice(lock_buf);
     write_header_bytes_journaled(file, vault_path, &header)
 }
 
@@ -357,11 +375,11 @@ pub(crate) fn build_header_v4(
     header[8] = VERSION_V4;
     // bytes 9..40 reserved
     // bytes 41..73: was lock_key (plaintext) — now zeroed (lock_key is derived from salt)
-    header[73..105].copy_from_slice(salt);
+    header[SALT_OFFSET..HEADER_PREFIX_LEN].copy_from_slice(salt);
     // num_partitions always MAX_PARTITIONS to hide real count
-    header[105] = MAX_PARTITIONS as u8;
+    header[ENTRY_COUNT_OFFSET] = MAX_PARTITIONS as u8;
 
-    let mut off = 106;
+    let mut off = ENTRY_BASE;
     for i in 0..MAX_PARTITIONS {
         if let Some(p) = partitions.get(i) {
             // M7 修复：按字符截断而非字节，避免切断多字节字符产生无效 UTF-8
@@ -433,11 +451,11 @@ pub(crate) fn build_header_envelope(
     // 重建，语义不变），仅用于派生挑战。
     // 3.0.1（F19）：盐在 create 时随机生成一次、此后终生不变 —— 开柜路径
     // **禁止**轮换本盐（历史上轮换过一次即砖死二因子保险柜，见 session.rs）。
-    header[YK_SALT_OFFSET..YK_SALT_OFFSET + 32].copy_from_slice(yk_challenge_salt);
-    header[73..105].copy_from_slice(salt);
-    header[105] = MAX_PARTITIONS as u8;
+    header[YK_SALT_OFFSET..YK_SALT_END].copy_from_slice(yk_challenge_salt);
+    header[SALT_OFFSET..HEADER_PREFIX_LEN].copy_from_slice(salt);
+    header[ENTRY_COUNT_OFFSET] = MAX_PARTITIONS as u8;
 
-    let mut off = 106;
+    let mut off = ENTRY_BASE;
     for i in 0..MAX_PARTITIONS {
         let mut entry = [0u8; PARTITION_ENTRY_SIZE_V5];
         // 真实/伪条目统一先填随机：保留区不留可区分标记（与 v4 同一策略的延伸）
@@ -549,11 +567,14 @@ pub(crate) fn alias_field16(alias: &str) -> [u8; 16] {
 /// 2.6.1：头部绑定认证标签所用的「头部前缀」，与 `write_header_to_file` 写出的
 /// `header[..105]` 逐字节一致：magic(8) || version(1) || 保留区(64, 全 0) || 保险柜 salt(32)。
 /// 2.8.0：版本字节参数化（v4 前缀与历史格式逐字节一致）。
-pub(crate) fn auth_tag_header_prefix(vault_salt: &[u8; 32], version: u8) -> [u8; 105] {
-    let mut p = [0u8; 105];
+pub(crate) fn auth_tag_header_prefix(
+    vault_salt: &[u8; 32],
+    version: u8,
+) -> [u8; HEADER_PREFIX_LEN] {
+    let mut p = [0u8; HEADER_PREFIX_LEN];
     p[..8].copy_from_slice(MAGIC);
     p[8] = version;
-    p[73..105].copy_from_slice(vault_salt);
+    p[SALT_OFFSET..HEADER_PREFIX_LEN].copy_from_slice(vault_salt);
     p
 }
 
@@ -574,12 +595,12 @@ pub(crate) fn bound_auth_tag(
 /// 把包裹体绑定到头部全局字段与该条目自身：调包两个分区的 wrapped_key、或
 /// 篡改头部版本/salt 都会让解包失败（与 auth_tag 的绑定互相独立、互为备份）。
 pub(crate) fn key_wrap_aad(
-    header_prefix: &[u8; 105],
+    header_prefix: &[u8; HEADER_PREFIX_LEN],
     entry_alias: &[u8],
     entry_salt: &[u8; 32],
 ) -> Vec<u8> {
     const DOMAIN: &[u8] = b"LYNVAULT-KEY-WRAP-V5";
-    let mut aad = Vec::with_capacity(DOMAIN.len() + 105 + 16 + 32);
+    let mut aad = Vec::with_capacity(DOMAIN.len() + HEADER_PREFIX_LEN + 16 + 32);
     aad.extend_from_slice(DOMAIN);
     aad.extend_from_slice(header_prefix);
     aad.extend_from_slice(entry_alias);
@@ -596,7 +617,7 @@ pub(crate) fn key_wrap_aad(
 ///   auth_tag AAD、key_wrap AAD、锁区 HMAC 的任何覆盖范围内）都会破坏签名。
 pub(crate) fn canonical_signed_bytes_v5(header: &[u8; HEADER_SIZE_V5]) -> Vec<u8> {
     let mut canonical = *header;
-    canonical[LOCK_OFFSET_V5..LOCK_OFFSET_V5 + 41].fill(0);
+    canonical[LOCK_OFFSET_V5..LOCK_OFFSET_V5 + LOCK_REGION_SIZE].fill(0);
     canonical[..SIGNED_LENGTH_V5].to_vec()
 }
 
@@ -614,4 +635,94 @@ pub(crate) fn verify_header_signature_v5(
     computed
         .ct_eq(&header[SIGNATURE_OFFSET_V5..SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE])
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    //! 3.1.1（审计修复）：头部布局不变量与别名字段截断此前没有直接用例。
+    //! 布局常量一旦漂移，后果是「旧柜打不开 / 新柜错位」—— 这些断言把
+    //! consts 里的单一来源与两侧（构建 / 绑定前缀）钉在一起。
+
+    use super::*;
+
+    #[test]
+    fn layout_constants_are_self_consistent() {
+        assert_eq!(HEADER_PREFIX_LEN, SALT_OFFSET + SALT_LEN);
+        assert_eq!(ENTRY_COUNT_OFFSET, HEADER_PREFIX_LEN);
+        assert_eq!(ENTRY_BASE, HEADER_PREFIX_LEN + 1);
+        // 预留区 9..41 为硬件密钥盐，41..73 为审计锚点 —— 两段首尾相接
+        assert_eq!(YK_SALT_END, AUDIT_COUNT_OFFSET);
+        // v5/v6：条目区结束处正是锁定区起点
+        assert_eq!(
+            LOCK_OFFSET_V5,
+            ENTRY_BASE + MAX_PARTITIONS * PARTITION_ENTRY_SIZE_V5
+        );
+        // 签名区恰好填满头部尾部
+        assert_eq!(SIGNATURE_OFFSET_V5 + SIGNATURE_SIZE, HEADER_SIZE_V5);
+        // 锁定区不越界（编译期断言：布局常量一旦漂移立即构建失败）
+        const { assert!(LOCK_OFFSET_V5 + LOCK_REGION_SIZE <= SIGNED_LENGTH_V5) };
+        const { assert!(LOCK_OFFSET_V4 + LOCK_REGION_SIZE <= HEADER_SIZE_V4) };
+    }
+
+    #[test]
+    fn v4_header_matches_declared_offsets() {
+        let salt = [0x5Au8; 32];
+        let sign_key = [1u8; 32];
+        let lock = LockState::new();
+        let parts = [PartitionInfo {
+            alias: DEFAULT_PARTITION.into(),
+            salt: [2u8; 32],
+            auth_tag: [3u8; 32],
+            index_offset: 1024,
+            index_length: 32,
+            wrapped_key: None,
+            audit_count: 0,
+        }];
+        let header = build_header_v4(&lock, &salt, &parts, &sign_key);
+
+        assert_eq!(&header[..8], &MAGIC[..]);
+        assert_eq!(header[8], VERSION_V4);
+        assert_eq!(&header[SALT_OFFSET..HEADER_PREFIX_LEN], salt.as_slice());
+        assert_eq!(header[ENTRY_COUNT_OFFSET], MAX_PARTITIONS as u8);
+        // v4 头部恒为规范形：前缀必须与 auth_tag_header_prefix 逐字节一致
+        //（F27 的 legacy → bound 迁移门槛依赖这一点）
+        assert_eq!(
+            &header[..HEADER_PREFIX_LEN],
+            &auth_tag_header_prefix(&salt, VERSION_V4)[..]
+        );
+        // 签名可验证
+        assert!(verify_header_signature(&header, &sign_key));
+    }
+
+    #[test]
+    fn alias_field16_truncates_on_char_boundary() {
+        // 多字节字符不得在字节中间被切断（2.7.1 修复的回归防线）
+        let field = alias_field16("中文别名测试abcdef");
+        let s = String::from_utf8(field.to_vec()).expect("16 字节字段必须是有效 UTF-8");
+        assert!(!s.contains('\u{FFFD}'), "截断点必须落在字符边界上");
+        assert!(s.chars().count() < 9);
+        // ASCII 别名的字节序列与历史实现逐字节一致
+        assert_eq!(&alias_field16("Main")[..4], b"Main");
+        // 全零填充（供解析侧按 NUL 截断）
+        assert_eq!(alias_field16("A")[1], 0);
+    }
+
+    #[test]
+    fn plausible_alias_accepts_legacy_and_rejects_random() {
+        // 解析已有头部用宽松字符集：不能收紧为 ASCII-only（会误判旧分区）
+        assert!(is_plausible_alias("分区一"));
+        assert!(is_plausible_alias("Main"));
+        // 新录入别名收紧为 ASCII-only
+        assert!(!is_valid_alias("分区一"));
+        assert!(is_valid_alias("Main_1-x"));
+        // 16 字节上限（字节数）
+        assert!(!is_valid_alias(&"a".repeat(17)));
+        // 随机字节经 lossy 转换后基本必然含替换字符 → 判为伪条目
+        let mut rnd = [0u8; 64];
+        for (i, b) in rnd.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(97).wrapping_add(13);
+        }
+        let lossy = String::from_utf8_lossy(&rnd).to_string();
+        assert!(!is_plausible_alias(&lossy));
+    }
 }

@@ -236,3 +236,73 @@ fn mark_delete_on_close(file: &File) -> bool {
     };
     ok.is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    //! 3.1.1（审计修复）：擦除层的硬边界（F1）与 7-pass 行为此前只有集成测试
+    //! 间接覆盖。越界覆写是「数据毁灭」级别的缺陷，必须有直接用例。
+
+    use super::*;
+    use std::io::Read;
+
+    fn temp_file(tag: &str, len: usize) -> (std::path::PathBuf, File) {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "lynvault-wipe-test-{}-{}.bin",
+            tag,
+            std::process::id()
+        ));
+        // 读写打开：断言需要回读覆写结果
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)
+            .expect("创建临时文件失败");
+        f.set_len(len as u64).expect("设置长度失败");
+        (p, f)
+    }
+
+    #[test]
+    fn overwrite_rejects_out_of_bounds_without_growing_file() {
+        let (p, mut f) = temp_file("oob", 1024);
+        // 越过 EOF 的区间必须拒绝 —— 旧实现的 write_all 会把文件撑大
+        assert!(dod_overwrite_range(&mut f, 512, 1024).is_err());
+        assert!(dod_overwrite_range(&mut f, 0, 2048).is_err());
+        // offset + length 溢出必须显式报错而不是 panic
+        assert!(dod_overwrite_range(&mut f, u64::MAX - 8, 32).is_err());
+        assert_eq!(
+            f.metadata().unwrap().len(),
+            1024,
+            "拒绝路径不得改变文件长度"
+        );
+        // 合法区间照常执行；零长区间是无操作
+        assert!(dod_overwrite_range(&mut f, 0, 1024).is_ok());
+        assert!(dod_overwrite_range(&mut f, 1024, 0).is_ok());
+        drop(f);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn overwrite_scribbles_the_range() {
+        let (p, mut f) = temp_file("scribble", 64);
+        dod_overwrite_range(&mut f, 0, 64).expect("合法区间必须可覆写");
+        let mut buf = vec![0u8; 64];
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        // 7-pass 的最后一轮是随机数据 —— 结果不应仍是全零
+        assert!(buf.iter().any(|&b| b != 0), "7-pass 覆写后不应仍是全零");
+        drop(f);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn secure_wipe_vec_clears_before_release() {
+        let mut v = vec![0xAAu8; 32];
+        // 手工模拟：零化后内容必须全 0（函数会 shrink_to_fit，无法再读取）
+        v.as_mut_slice().zeroize();
+        assert!(v.iter().all(|&b| b == 0));
+        secure_wipe_vec(v); // 仅验证不 panic
+    }
+}

@@ -513,3 +513,128 @@ pub fn mix_kek_with_response(kek: &[u8; 32], response: &[u8; 20]) -> [u8; 32] {
         .expect("HKDF expand 32 字节恒在合法范围");
     mixed
 }
+
+#[cfg(test)]
+mod tests {
+    //! 3.1.1（审计修复）：加密原语的错误路径此前**没有任何直接用例** ——
+    //! 集成测试只走 happy path，而本文件聚集了最贵的一批修复（L5 就地零化、
+    //! 认证失败不留残留、F27 只接受 bound 标签）。这些用例是纯函数级、毫秒量级。
+
+    use super::*;
+    use crate::vault::consts::{HEADER_PREFIX_LEN, WRAPPED_KEY_SIZE};
+
+    fn key() -> [u8; 32] {
+        [7u8; 32]
+    }
+
+    #[test]
+    fn decrypt_into_rejects_tampered_and_wrong_aad() {
+        let ct = encrypt_gcm(&key(), b"secret payload", b"aad", None).unwrap();
+        assert_eq!(
+            decrypt_into(&key(), ct.clone(), b"aad").as_deref(),
+            Some(&b"secret payload"[..])
+        );
+        // 篡改最后一个字节（GCM tag）→ 认证失败
+        let mut bad = ct.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x01;
+        assert!(decrypt_into(&key(), bad, b"aad").is_none());
+        // AAD 不匹配 → 认证失败（域分离）
+        assert!(decrypt_into(&key(), ct.clone(), b"other").is_none());
+        // 长度不足 12 + 16 → 拒绝而不是 panic / 越界
+        assert!(decrypt_into(&key(), vec![0u8; 27], b"aad").is_none());
+        assert!(decrypt_into(&key(), Vec::new(), b"aad").is_none());
+    }
+
+    #[test]
+    fn decrypt_into_handles_empty_plaintext() {
+        let ct = encrypt_gcm(&key(), b"", b"aad", None).unwrap();
+        assert_eq!(ct.len(), 28, "空明文的密文恰为 nonce + tag");
+        let plain = decrypt_into(&key(), ct, b"aad").expect("空明文必须可解");
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn encrypt_into_matches_wire_format() {
+        // encrypt_into 与 encrypt_gcm 的线格式必须逐字节同构（长度可互换）
+        let a = encrypt_gcm(&key(), b"payload", b"aad", None).unwrap();
+        let b = encrypt_into(&key(), b"payload".to_vec(), b"aad").unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.len(), 12 + 7 + 16);
+    }
+
+    #[test]
+    fn unwrap_data_key_validates_shape() {
+        let kek = key();
+        let dk = [3u8; 32];
+        let wrapped = encrypt_gcm(&kek, &dk, b"wrap", None).unwrap();
+        assert_eq!(wrapped.len(), WRAPPED_KEY_SIZE, "包裹体必须恰为 60 字节");
+        assert_eq!(unwrap_data_key(&kek, &wrapped, b"wrap"), Some(dk));
+        // 长度不符 / AAD 不符 / 错误 KEK 一律 None
+        assert!(unwrap_data_key(&kek, &wrapped[..WRAPPED_KEY_SIZE - 1], b"wrap").is_none());
+        assert!(unwrap_data_key(&kek, &wrapped, b"other").is_none());
+        assert!(unwrap_data_key(&[8u8; 32], &wrapped, b"wrap").is_none());
+    }
+
+    #[test]
+    fn bound_auth_tag_only_rejects_legacy_tag() {
+        // F27：信封路径只接受 bound 标签 —— legacy AUTH_OK 必须被拒绝，
+        // 否则「篡改后重打 legacy 标签」即可洗白头部。
+        let auth_key = key();
+        let prefix = [0u8; HEADER_PREFIX_LEN];
+        let alias = [0u8; 16];
+        let salt = [9u8; 32];
+        let legacy = create_auth_tag(&auth_key);
+        assert!(!verify_auth_tag_bound_only(
+            &auth_key, &prefix, &alias, &salt, &legacy
+        ));
+        let bound = create_auth_tag_bound(&auth_key, &prefix, &alias, &salt);
+        assert!(verify_auth_tag_bound_only(
+            &auth_key, &prefix, &alias, &salt, &bound
+        ));
+        // 任一绑定字段变化都必须失配（头部前缀 / 别名 / 条目 salt）
+        assert!(!verify_auth_tag_bound_only(
+            &auth_key,
+            &[1u8; HEADER_PREFIX_LEN],
+            &alias,
+            &salt,
+            &bound
+        ));
+        assert!(!verify_auth_tag_bound_only(
+            &auth_key, &prefix, &[1u8; 16], &salt, &bound
+        ));
+        assert!(!verify_auth_tag_bound_only(
+            &auth_key, &prefix, &alias, &[8u8; 32], &bound
+        ));
+        // 过短的标签直接拒绝（不越界）
+        assert!(!verify_auth_tag_bound_only(
+            &auth_key,
+            &prefix,
+            &alias,
+            &salt,
+            &bound[..31]
+        ));
+    }
+
+    #[test]
+    fn chunk_aad_binds_every_component() {
+        assert_ne!(chunk_aad("/f.bin", 0, 3), chunk_aad("/f.bin", 1, 3));
+        assert_ne!(chunk_aad("/f.bin", 0, 3), chunk_aad("/f.bin", 0, 4));
+        assert_ne!(chunk_aad("/f.bin", 0, 3), chunk_aad("/g.bin", 0, 3));
+        // 同输入必须同输出（确定性 AAD）
+        assert_eq!(chunk_aad("/f.bin", 2, 3), chunk_aad("/f.bin", 2, 3));
+    }
+
+    #[test]
+    fn header_signature_roundtrip_and_short_header() {
+        let sig_key = key();
+        assert!(!verify_header_signature(&[0u8; 1023], &sig_key));
+        let mut header = vec![0u8; 1024];
+        let sig = compute_header_signature(&header[..SIGNED_LENGTH], &sig_key);
+        header[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE].copy_from_slice(&sig);
+        assert!(verify_header_signature(&header, &sig_key));
+        // 签名覆盖范围内的任一字节变化都必须失配
+        header[0] ^= 0x01;
+        assert!(!verify_header_signature(&header, &sig_key));
+    }
+}

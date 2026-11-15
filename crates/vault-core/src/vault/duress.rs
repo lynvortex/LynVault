@@ -142,9 +142,10 @@ impl Vault {
         let target_keys = expand_keys(&dk)?;
 
         // 2. 解密目标分区的索引（新开只读句柄，不干扰会话句柄游标）
+        // 3.1.1：改用 open_read_nofollow —— 旧 `File::open` 按路径跟随链接
         let path = self.path.clone().ok_or(VaultError::NotOpen)?;
         let mut index = {
-            let mut ro = File::open(&path)?;
+            let mut ro = crate::vault::fs_util::open_read_nofollow(&path)?;
             load_index_from_file(
                 &mut ro,
                 &target_keys.enc_key,

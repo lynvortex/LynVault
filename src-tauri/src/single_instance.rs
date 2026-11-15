@@ -90,6 +90,10 @@ static LISTENER: Mutex<Option<TcpListener>> = Mutex::new(None);
 /// 声明（环境重定向 / 共享临时目录），且 si.json 本就无敏感信息：配置不可用
 /// 时纯内存运行即可（本次进程内自洽，单实例转发退化为尽力而为语义）。
 /// 文件缺失 / 捅坏 / 字段非法 → 重新随机生成并覆写。
+/// 3.2.0：si.json 落盘改为 LYCFG 容器（config_codec）—— 端口/令牌被篡改
+/// 可把第二实例握手重定向到攻击者监听的端口，属于合法值域内的危险篡改面；
+/// 机器本地文件优先 DPAPI（Windows），校验失败不再当「捅坏」静默重生成，
+/// 而是记 warn 后重生成（重生成即令牌轮换，攻击者的重定向随之失效）。
 fn load_or_create_si_config() -> SiConfig {
     fn config_path() -> Option<PathBuf> {
         #[cfg(windows)]
@@ -99,14 +103,57 @@ fn load_or_create_si_config() -> SiConfig {
         base.map(|b| b.join("LynVault").join("si.json"))
     }
 
+    // si.json 是机器本地文件（不跨机器）：Windows 走 DPAPI，其他平台 HMAC
+    fn si_mode() -> crate::config_codec::Mode {
+        #[cfg(windows)]
+        {
+            crate::config_codec::Mode::Dpapi
+        }
+        #[cfg(not(windows))]
+        {
+            crate::config_codec::Mode::Hmac
+        }
+    }
+
+    // 解析并校验字段合法性（端口在授权区间、令牌为 32 位 hex（128-bit））
+    fn parse_valid(bytes: &[u8]) -> Option<SiConfig> {
+        let cfg: SiConfig = serde_json::from_slice(bytes).ok()?;
+        if (20000..40000).contains(&cfg.port) && cfg.token.len() == 32 {
+            Some(cfg)
+        } else {
+            None
+        }
+    }
+
     // 尝试读取既有配置
     let path = config_path();
     if let Some(p) = &path {
-        if let Ok(text) = std::fs::read_to_string(p) {
-            if let Ok(cfg) = serde_json::from_str::<SiConfig>(&text) {
-                // 字段合法性：端口在授权区间、令牌为 32 位 hex（128-bit）
-                if (20000..40000).contains(&cfg.port) && cfg.token.len() == 32 {
-                    return cfg;
+        if let Ok(raw) = std::fs::read(p) {
+            match crate::config_codec::decode(&raw) {
+                Err(e) => {
+                    // 带容器头但校验失败：疑似篡改。令牌轮换使攻击者的
+                    // 重定向/伪装随之失效，代价是本次单实例转发可能退化
+                    log::warn!("si.json 完整性校验失败（疑似被篡改），将重新生成: {}", e);
+                }
+                Ok(crate::config_codec::Decoded::Container(bytes)) => {
+                    if let Some(cfg) = parse_valid(&bytes) {
+                        return cfg;
+                    }
+                }
+                Ok(crate::config_codec::Decoded::LegacyPlaintext(bytes)) => {
+                    // 旧版明文：合法则原位迁移为容器（best-effort）
+                    if let Some(cfg) = parse_valid(&bytes) {
+                        if let Ok(json) = serde_json::to_string(&cfg) {
+                            if let Ok(blob) =
+                                crate::config_codec::encode(json.as_bytes(), si_mode())
+                            {
+                                if write_si_config(p, &blob).is_ok() {
+                                    log::info!("si.json 已迁移到 LYCFG 容器格式");
+                                }
+                            }
+                        }
+                        return cfg;
+                    }
                 }
             }
         }
@@ -128,8 +175,10 @@ fn load_or_create_si_config() -> SiConfig {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string(&cfg) {
-            if write_si_config(p, &json).is_ok() {
-                return cfg;
+            if let Ok(blob) = crate::config_codec::encode(json.as_bytes(), si_mode()) {
+                if write_si_config(p, &blob).is_ok() {
+                    return cfg;
+                }
             }
         }
     }
@@ -142,7 +191,8 @@ fn load_or_create_si_config() -> SiConfig {
 /// 与 settings.rs 的 save_at / main.rs 日志同一威胁模型同一套检查：
 /// 随机临时名 create_new + 不跟随重解析点 + 句柄级「非重解析点 + 硬链接数
 /// 为 1」校验，rename 原子替换。
-fn write_si_config(path: &Path, json: &str) -> std::io::Result<()> {
+/// 3.2.0：入参从 JSON 字符串改为 LYCFG 容器字节（编码在调用方完成）。
+fn write_si_config(path: &Path, blob: &[u8]) -> std::io::Result<()> {
     use rand::RngCore;
     use std::io::Write;
     let mut suffix = [0u8; 8];
@@ -199,7 +249,7 @@ fn write_si_config(path: &Path, json: &str) -> std::io::Result<()> {
     }
     {
         let mut f = f;
-        f.write_all(json.as_bytes())?;
+        f.write_all(blob)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;

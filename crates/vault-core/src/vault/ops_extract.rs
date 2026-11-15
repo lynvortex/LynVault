@@ -84,7 +84,6 @@ impl Vault {
     /// - `aad` 由调用方用 `aad_bytes` 求值后传入（优先索引里冻结的 aad_tag），
     ///   不能再拿 vpath 现算 —— vpath 可能已被重命名。
     #[allow(clippy::too_many_arguments)] // 2.8.1：历史稳定内部 API，拆参数结构收益为负
-    #[allow(clippy::too_many_arguments)]
     fn extract_file_inner(
         &mut self,
         vpath: &str,

@@ -2608,6 +2608,21 @@ window.addEventListener('DOMContentLoaded', async () => {
     $('btn-open').disabled = true;
 
     // 启动弹窗按钮事件
+    // 3.1.1：GUI启动 —— 拉起内置 GUI（egui）版并关闭当前主窗口
+    $('sd-gui').onclick = async () => {
+        if (_startupProcessing) return;
+        _startupProcessing = true;
+        const btn = $('sd-gui');
+        btn.disabled = true;
+        try {
+            await invoke('launch_gui_mode');
+            // 后端会随即退出主窗口；若退出被延迟，保持按钮禁用以防重复拉起
+        } catch (e) {
+            btn.disabled = false;
+            _startupProcessing = false;
+            showError('GUI 版启动失败：' + String(e));
+        }
+    };
     $('sd-create').onclick = async () => {
         if (_startupProcessing) return;
         _startupProcessing = true;

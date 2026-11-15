@@ -9,6 +9,21 @@ use tauri_plugin_dialog::DialogExt;
 use vault_core::Vault;
 use zeroize::Zeroize;
 
+// ───────────────── 3.1.1（审计修复）：按领域拆分的子模块 ─────────────────
+//
+// commands.rs 曾是 2796 行 / 45 个命令的单文件，媒体协议与 Windows GDI 句柄
+// 守卫都与命令挤在一起 —— 协议层无法单测，review 面也无法收敛。现把两块
+// **零耦合**的自洽子系统移出，并对 main.rs 保持原有可见性。
+// 命令宏会在**定义处**生成隐藏的 `__cmd__*` 辅助项，`generate_handler!` 因此
+// 必须引用完整路径（`commands::media::mint_media_token`）—— 两个子模块对 crate
+// 可见；非命令的协议入口仍按原路径 re-export。
+pub(crate) mod icon;
+pub(crate) mod media;
+
+/// 会话结束点（开柜顶替 / 关柜 / 销毁 / 系统锁定）统一作废媒体令牌
+pub(crate) use media::clear_media_tokens;
+pub use media::media_stream_response;
+
 // ───────────────── 全局状态 ─────────────────
 
 /// 全局状态：保险柜实例 + 认证频率限制
@@ -31,77 +46,6 @@ static DIALOG_TOKENS: Mutex<Vec<(String, Vec<String>, Instant)>> = Mutex::new(Ve
 /// 3.0.1（F16）：对话框令牌有效期 —— 正常流程（选完即导入/提取）远短于此
 const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(600);
 
-/// 3.0.0（优化2）：媒体流式预览令牌表 —— (token, vpath, 签发时刻)。
-/// 非一次性（播放/拖动进度条会对同一 URL 发多次 Range 请求），随会话
-/// 生命周期：开柜时签发、关柜/锁定/销毁即全部作废。被攻陷的 WebView
-/// 最多流式读取「已由用户点开预览的那个文件」—— 与 load_file_content
-/// 的既有信任模型一致，且受扩展名白名单与分块布局双重约束。
-/// 3.0.1（#14 修复）：条目带签发时刻（15 分钟闲置过期）+ 按 vpath 去重
-///（重签发不挤出其他在播令牌）。
-static MEDIA_TOKENS: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
-
-/// 3.0.1（#14 修复）：媒体令牌闲置过期 —— 超过此时长的令牌失效（播放中
-/// 的令牌会随播放器请求不断刷新？否 —— 本实现按「签发时刻」判过期，
-/// 15 分钟足够覆盖一次连续预览会话；到期后由前端重新 mint）
-const MEDIA_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
-
-/// 清空媒体令牌（会话结束点调用）
-pub fn clear_media_tokens() {
-    if let Ok(mut guard) = MEDIA_TOKENS.lock() {
-        guard.clear();
-    }
-}
-
-/// 3.0.1（F13 修复）：媒体请求并发闸 —— 被攻陷的 WebView 可对
-/// `lynvault-media://` 发起大量并发 Range 请求，每个最多分配 16 MiB 明文
-/// 并排队占用全局保险柜互斥锁（可用性 DoS，数据暴露面已受令牌约束）。
-/// try-acquire 语义：闸满直接 404（播放器会自行重试），请求不排队堆积。
-static MEDIA_INFLIGHT: Mutex<usize> = Mutex::new(0);
-const MEDIA_MAX_INFLIGHT: usize = 4;
-
-struct MediaSlot;
-
-impl MediaSlot {
-    fn try_acquire() -> Option<MediaSlot> {
-        // 3.0.1（#13 修复）：锁中毒恢复（与命令层 into_inner() 纪律一致）——
-        // 一次 panic 后预览静默死亡到重启的路径就此关闭
-        let mut guard = match MEDIA_INFLIGHT.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        if *guard >= MEDIA_MAX_INFLIGHT {
-            return None;
-        }
-        *guard += 1;
-        Some(MediaSlot)
-    }
-}
-
-impl Drop for MediaSlot {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = MEDIA_INFLIGHT.lock() {
-            *guard = guard.saturating_sub(1);
-        }
-    }
-}
-
-/// 媒体扩展名 → MIME（白名单即映射表）
-fn media_mime(ext: &str) -> Option<&'static str> {
-    Some(match ext.to_ascii_lowercase().as_str() {
-        "mp4" | "m4v" => "video/mp4",
-        "webm" => "video/webm",
-        "mkv" => "video/x-matroska",
-        "mov" => "video/quicktime",
-        "mp3" => "audio/mpeg",
-        "ogg" | "oga" | "opus" => "audio/ogg",
-        "wav" => "audio/wav",
-        "flac" => "audio/flac",
-        "m4a" => "audio/mp4",
-        "aac" => "audio/aac",
-        _ => return None,
-    })
-}
-
 /// 2.8.2（H2）：主进程侧记录的真实拖放载荷（main.rs 的 on_window_event 写入）。
 /// 拖放导入不再信任 WebView 字符串 —— 命令要求传入路径与该载荷排序后完全一致。
 static DROPPED_PATHS: Mutex<Option<Vec<String>>> = Mutex::new(None);
@@ -119,7 +63,8 @@ pub fn record_dropped_paths(paths: Vec<String>) {
 /// 构成免交互 NTLM 凭据外泄/中继触发原语（2.8.2 H1 确立的原则）。
 /// 此前守卫只覆盖 check_vault_file / yubikey_challenge，本次统一收口
 ///（open_vault / create_vault / get_lock_info / scan_vault_files / load_key_file）。
-fn ensure_local_path(path: &str) -> Result<(), String> {
+/// 3.1.0：pub(crate) —— 备用 GUI（gui/mod.rs）进程内直调，与主界面同一守卫
+pub(crate) fn ensure_local_path(path: &str) -> Result<(), String> {
     if crate::single_instance::is_remote_or_device_path(path) {
         return Err("不支持的保险柜路径（远程或设备路径）".into());
     }
@@ -132,16 +77,23 @@ fn take_dropped_paths_matches(paths: &[String]) -> Result<(), String> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let recorded = guard
-        .take()
-        .ok_or_else(|| "没有已记录的拖放操作（请通过窗口拖放触发导入）".to_string())?;
-    let mut a = recorded.clone();
-    let mut b = paths.to_vec();
-    a.sort();
-    b.sort();
-    if a != b {
-        return Err("拖放路径与主进程记录不一致（请求可能被伪造）".to_string());
+    // 3.1.1（审计修复）：先比对、通过后才消费 —— 旧实现在比较之前就 take()，
+    // 一次不匹配的请求（含被攻陷 WebView 的探测）会把主进程记录的真实拖放
+    // 载荷焚毁，用户正当的拖放导入随即失败、必须重新拖一次。
+    {
+        let recorded = match guard.as_ref() {
+            Some(r) => r,
+            None => return Err("没有已记录的拖放操作（请通过窗口拖放触发导入）".to_string()),
+        };
+        let mut a = recorded.clone();
+        let mut b = paths.to_vec();
+        a.sort();
+        b.sort();
+        if a != b {
+            return Err("拖放路径与主进程记录不一致（请求可能被伪造）".to_string());
+        }
     }
+    guard.take();
     Ok(())
 }
 
@@ -188,14 +140,22 @@ fn verify_dialog_paths(token: &str, paths: &[String]) -> Result<(), String> {
         .iter()
         .position(|(t, _, _)| ct_eq_str(t, token))
         .ok_or_else(|| "对话框令牌无效或已使用".to_string())?;
-    let (_, registered, issued) = guard.remove(pos);
-    // 3.0.1（F16）：过期令牌视为无效
+    // 3.1.1（审计修复）：先校验、通过后才消费 —— 旧实现先 remove 再比对，
+    // 一次路径不符的请求（含被攻陷 WebView 的探测）会把用户正当选择的令牌
+    // 焚毁，用户必须重新打开对话框。与 take_dropped_paths_matches 同一纪律。
+    let (registered, issued) = {
+        let (_, r, i) = &guard[pos];
+        (r.clone(), *i)
+    };
+    // 3.0.1（F16）：过期令牌视为无效（并顺手清理）
     if issued.elapsed() >= DIALOG_TOKEN_TTL {
+        guard.remove(pos);
         return Err("对话框令牌无效或已使用".to_string());
     }
     if registered.len() != paths.len() || registered.iter().zip(paths.iter()).any(|(a, b)| a != b) {
         return Err("传入路径与对话框登记不一致（请求可能被伪造）".to_string());
     }
+    guard.remove(pos);
     Ok(())
 }
 
@@ -403,7 +363,8 @@ pub async fn create_vault(
 /// 接触响应字节。旧 `yubikey_challenge` 命令把 20 字节响应交给 JS 且无认证、
 /// 无限速、不消费，使「第二因子」退化为对任意文件快照静态可重放的秘密。
 /// 现在响应只在 open / 改密 / 胁迫标记等命令内部派生，用完即弃。
-fn compute_yk_response(salt: &[u8; 32]) -> Result<[u8; 20], String> {
+/// 3.1.0：pub(crate) —— 备用 GUI 解锁流程进程内直调（响应仍不出后端）
+pub(crate) fn compute_yk_response(salt: &[u8; 32]) -> Result<[u8; 20], String> {
     let challenge = vault_core::crypto::derive_yubikey_challenge(salt);
     crate::yubikey::challenge_response(&challenge).map_err(|e| format!("硬件密钥验证失败：{}", e))
 }
@@ -1350,7 +1311,8 @@ pub async fn update_file_content(
 
 // ───────────────── 辅助函数 ─────────────────
 
-fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
+/// 3.1.0：pub(crate) —— 备用 GUI 解锁/新建流程进程内直调
+pub(crate) fn load_key_file(path: &Option<String>) -> Result<Option<Vec<u8>>, String> {
     // 3.0.0（M-1）：UNC / 设备路径守卫（密钥文件读取也是文件打开，NTLM 面收口）
     if let Some(p) = path {
         ensure_local_path(p)?;
@@ -1435,6 +1397,38 @@ pub fn get_launch_vault_arg() -> Result<Option<String>, String> {
 #[tauri::command]
 pub fn frontend_ready() -> Result<(), String> {
     crate::single_instance::FRONTEND_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// 3.1.1：从主界面切换到内置 GUI（egui）版。
+///
+/// 拉起同一可执行文件的 `--gui` 子进程后退出主窗口 —— `--gui` 分支在 main 里
+/// 先于单实例竞争处理，因此不会与当前实例的端口冲突；父子进程不共享会话，
+/// 切换时机限定在启动检测弹窗（此时没有任何保险柜处于打开状态）。
+#[tauri::command]
+pub async fn launch_gui_mode(app: AppHandle) -> Result<(), String> {
+    // 防御性收尾：若此刻仍有打开的会话（正常路径下启动弹窗可见时不可能），
+    // 先走正常关柜（审计补落盘 + 密钥清零），并释放对保险柜文件的独占句柄，
+    // 否则刚拉起的 GUI 进程无法打开同一个保险柜。
+    let _ = run_blocking(&app, "launch_gui_mode", move |state| {
+        let mut guard = lock_vault(state)?;
+        if let Some(v) = guard.as_mut() {
+            v.close();
+        }
+        *guard = None;
+        crate::clipboard_guard::stop();
+        clear_media_tokens();
+        Ok(())
+    })
+    .await;
+
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位程序路径：{}", e))?;
+    std::process::Command::new(&exe)
+        .arg("--gui")
+        .spawn()
+        .map_err(|e| format!("启动 GUI 版失败：{}", e))?;
+    // 子进程已拉起，主窗口让位（避免两个前台界面并存）
+    app.exit(0);
     Ok(())
 }
 
@@ -1678,215 +1672,6 @@ pub async fn duress_scrub_partitions(
 
 // 3.0.1（F2 修复）：删除 `parse_yk_response` —— IPC 不再传递响应字节，
 // 响应由后端 `compute_yk_response` / `session_yk_response` 现场挑战硬件获得。
-
-/// 3.0.0（优化2）：为媒体流式预览签发令牌 —— 校验「柜已开 + 文件存在 +
-/// 扩展名白名单 + 分块布局（Legacy 拒绝）」，返回登记的会话级令牌。
-#[tauri::command]
-pub async fn mint_media_token(app: AppHandle, vpath: String) -> Result<String, String> {
-    run_blocking(&app, "mint_media_token", move |state| {
-        let ext = vpath.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        let mime = media_mime(&ext).ok_or("不支持的媒体格式（仅支持常见的音视频容器）")?;
-        let mut guard = lock_vault(state)?;
-        let vault = guard.as_mut().ok_or("保险柜未打开")?;
-        let (size, streamable) = vault.media_file_info(&vpath).map_err(|e| e.to_string())?;
-        if !streamable {
-            return Err(if size == 0 {
-                "空文件无法预览".into()
-            } else {
-                "该文件为旧版整段布局，不支持流式预览 —— 请提取后查看".into()
-            });
-        }
-        // 签发（按 vpath 去重：重签发替换同 vpath 旧令牌，不挤出其他在播
-        // 令牌；先清理过期条目；上限 64 超出才淘汰最旧）。
-        // 3.0.1（#14 修复）：锁失败显式报错（旧实现静默签发未注册令牌 ——
-        // 前端拿到一个必然 404 的死令牌）
-        use rand::RngCore;
-        let mut tb = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut tb);
-        let token: String = tb.iter().map(|b| format!("{:02x}", b)).collect();
-        {
-            let mut guard = match MEDIA_TOKENS.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard.retain(|(_, vp, issued)| vp != &vpath && issued.elapsed() < MEDIA_TOKEN_TTL);
-            if guard.len() >= 64 {
-                guard.remove(0);
-            }
-            guard.push((token.clone(), vpath, Instant::now()));
-        }
-        let _ = mime; // MIME 在协议层按扩展名再取（路径在此不含用户可控部分）
-        Ok(token)
-    })
-    .await
-}
-
-/// 3.0.1（#14 修复）：校验 URL 中的 b64url(vpath) 段与登记的 vpath 一致
-///（URL 安全 base64：`-`→`+`、`_`→`/`，补齐 padding 后按标准字母表解码，
-/// 与前端 _b64url 的编码方式互逆）。
-fn media_b64_matches(encoded: &str, vpath: &str) -> bool {
-    use base64::Engine;
-    let std_alpha = encoded.replace('-', "+").replace('_', "/");
-    let padded = match std_alpha.len() % 4 {
-        2 => format!("{}==", std_alpha),
-        3 => format!("{}=", std_alpha),
-        0 => std_alpha,
-        _ => return false, // 长度 %4 == 1 恒非法
-    };
-    base64::engine::general_purpose::STANDARD
-        .decode(padded.as_bytes())
-        .map(|b| b == vpath.as_bytes())
-        .unwrap_or(false)
-}
-
-/// 3.0.0（优化2）：媒体流式请求处理 —— 自定义协议 `lynvault-media://` 的
-/// Rust 侧。URL 路径 = `/<token>/<b64url(vpath)>`（两者均为 URL 安全字符集，
-/// 无需百分号编解码）；Range 请求映射到分块解密，明文内存占用 = 请求窗口。
-/// 安全：令牌随会话签发/作废（3.0.1 起带闲置过期）；扩展名白名单；分块布局
-/// 校验；响应 no-store（禁止 WebView 磁盘缓存，维持「明文不落盘」承诺）。
-pub fn media_stream_response(
-    app: &AppHandle,
-    request: &tauri::http::Request<Vec<u8>>,
-) -> tauri::http::Response<Vec<u8>> {
-    // L4（审计修复）：接入 catch() 纪律（panic 兜底为 500，与其余命令一致）
-    match catch("media_stream", || media_stream_inner(app, request)) {
-        Ok(resp) => resp,
-        Err(e) => {
-            log::warn!("媒体流式请求处理失败（区间已脱敏）: {}", e);
-            tauri::http::Response::builder()
-                .status(500)
-                .body(Vec::new())
-                .unwrap()
-        }
-    }
-}
-
-fn media_stream_inner(
-    app: &AppHandle,
-    request: &tauri::http::Request<Vec<u8>>,
-) -> Result<tauri::http::Response<Vec<u8>>, String> {
-    use tauri::Manager;
-
-    let not_found = || {
-        Ok(tauri::http::Response::builder()
-            .status(404)
-            .body(Vec::new())
-            .unwrap())
-    };
-    if request.method() != "GET" {
-        return not_found();
-    }
-    // 解析路径：<token>/<b64url(vpath)> —— vpath 以令牌登记为准（不信任 URL）。
-    // 3.0.1（#14 修复）：b64 段不再是死参数 —— 必须与登记 vpath 一致。
-    let path = request.uri().path().trim_start_matches('/');
-    let Some((token, b64_segment)) = path.split_once('/') else {
-        return not_found();
-    };
-    let vpath = {
-        let mut guard = match MEDIA_TOKENS.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        // 3.0.1（#14 修复）：过期令牌移除并 404（闲置过期）
-        match guard.iter().position(|(t, _, _)| ct_eq_str(t, token)) {
-            Some(pos) => {
-                if guard[pos].2.elapsed() >= MEDIA_TOKEN_TTL {
-                    guard.remove(pos);
-                    return not_found();
-                }
-                guard[pos].1.clone()
-            }
-            None => return not_found(),
-        }
-    };
-    // 3.0.1（#14 修复）：URL 中的 b64url(vpath) 段与登记 vpath 严格比对
-    if !media_b64_matches(b64_segment, &vpath) {
-        return not_found();
-    }
-    let ext = vpath.rsplit('.').next().unwrap_or("");
-    let Some(mime) = media_mime(ext) else {
-        return not_found();
-    };
-    // 3.0.1（F13）：并发闸 —— 满载直接 404，不排队
-    let _media_slot = match MediaSlot::try_acquire() {
-        Some(s) => s,
-        None => return not_found(),
-    };
-
-    let state = app.state::<AppState>();
-    // 3.0.1（#13 修复）：锁中毒恢复 —— 与命令层 into_inner() 纪律一致
-    let mut guard = match state.vault.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    let vault = match guard.as_mut() {
-        Some(v) => v,
-        None => return not_found(),
-    };
-    let (file_size, streamable) = match vault.media_file_info(&vpath) {
-        Ok(v) => v,
-        Err(_) => return not_found(),
-    };
-    if !streamable {
-        return not_found();
-    }
-
-    // Range 解析（缺省视为 bytes=0-）；窗口封顶 16 MiB
-    let range = request
-        .headers()
-        .get("range")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("bytes="))
-        .unwrap_or("0-");
-    const WINDOW: u64 = 16 * 1024 * 1024;
-    let (start, mut end) = if let Some(n) = range.strip_prefix('-') {
-        let n: u64 = n.parse().unwrap_or(0).min(file_size);
-        (file_size - n, file_size)
-    } else if let Some((a, b)) = range.split_once('-') {
-        let s: u64 = a.parse().unwrap_or(0).min(file_size);
-        let e = b
-            .parse::<u64>()
-            .map(|v| v.saturating_add(1).min(file_size))
-            .unwrap_or(file_size);
-        (s, e.max(s))
-    } else {
-        (0, file_size)
-    };
-    end = end.min(start + WINDOW).max(start);
-    if start >= end {
-        return Ok(tauri::http::Response::builder()
-            .status(416)
-            .header("Content-Range", format!("bytes */{}", file_size))
-            .body(Vec::new())
-            .unwrap());
-    }
-
-    match vault.read_media_range(&vpath, start, end) {
-        Ok(data) => {
-            let status = if request.headers().get("range").is_some() {
-                206
-            } else {
-                200
-            };
-            Ok(tauri::http::Response::builder()
-                .status(status)
-                .header("Content-Type", mime)
-                .header("Accept-Ranges", "bytes")
-                .header("Cache-Control", "no-store")
-                .header(
-                    "Content-Range",
-                    format!("bytes {}-{}/{}", start, end - 1, file_size),
-                )
-                .header("Content-Length", data.len().to_string())
-                .body(data)
-                .unwrap())
-        }
-        Err(e) => {
-            log::warn!("媒体流式读取失败（区间已脱敏）: {}", e);
-            not_found()
-        }
-    }
-}
 
 /// 3.0.0：为当前分区启用硬件密钥二因子（YubiKey HMAC-SHA1 挑战-响应）。
 #[tauri::command]
@@ -2484,255 +2269,55 @@ pub async fn extract_all_files(
     .await
 }
 
-// ───────────────── 文件类型图标（Windows 系统图标） ─────────────────
-// 对齐 1.3.4 的 QFileIconProvider 行为：按扩展名读取系统注册的文件类型图标。
-// 仅 Windows 实现；其他平台返回空串，前端 fallback 到 emoji 图标。
-//
-// 2.3.0 防卡死注意点：
-// - 用 SHGFI_USEFILEATTRIBUTES + 伪文件名 "dummy.ext" 查询，**不访问真实文件**
-//   （不走磁盘/网络，网络驱动器也不会挂起）；
-// - 命令为 async + spawn_blocking：Shell/GDI 调用在阻塞线程池执行，
-//   不占用 Tauri 主线程（UI 线程），大量文件渲染时界面不会冻结。
-#[tauri::command]
-pub async fn get_file_icon(ext: String) -> Result<String, String> {
-    // 清洗扩展名：去前导点、转小写、截断长度
-    let ext = ext.trim_start_matches('.').to_lowercase();
-    if ext.is_empty()
-        || ext.len() > 32
-        || !ext
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Ok(String::new());
-    }
-    #[cfg(windows)]
-    {
-        let ext_clone = ext.clone();
-        match tauri::async_runtime::spawn_blocking(move || read_windows_file_icon(&ext_clone)).await
-        {
-            Ok(Ok(b64)) => Ok(b64),
-            Ok(Err(e)) => {
-                log::warn!("get_file_icon 失败 ({}): {}", ext, e);
-                Ok(String::new())
-            }
-            Err(e) => {
-                log::warn!("get_file_icon 任务失败: {}", e);
-                Ok(String::new())
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = ext;
-        Ok(String::new())
-    }
-}
-
-#[cfg(windows)]
-fn read_windows_file_icon(ext: &str) -> Result<String, String> {
-    // 注：HICON/DestroyIcon/DeleteDC/HDC 在模块级导入（IconGuard/DcGuard 需要），
-    // 此处只导入本函数内使用的项。
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use windows::Win32::Graphics::Gdi::{
-        GetDIBits, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
-    };
-    use windows::Win32::UI::Shell::{
-        SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
-
-    // 构造伪文件名 "dummy.ext" 让 Shell 按扩展名查图标
-    let filename: Vec<u16> = format!("dummy.{}\0", ext).encode_utf16().collect();
-
-    let mut shfi = SHFILEINFOW::default();
-    let flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
-    let hinst = unsafe {
-        SHGetFileInfoW(
-            windows::core::PCWSTR(filename.as_ptr()),
-            // FILE_ATTRIBUTE_NORMAL 位于 Win32::Storage::FileSystem（windows 0.57）
-            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            Some(&mut shfi),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            flags,
-        )
-    };
-    // windows 0.57 中 SHGetFileInfoW 返回 usize（成功时非 0，失败为 0）；
-    // SHFILEINFOW.hIcon 是 HICON（非 Option）。
-    // 3.0.0（i686 修复）：SHFILEINFOW 在 32 位目标上是 packed 结构 —— 对字段
-    // 创建引用（is_invalid() 需要 &self）是未对齐引用（E0793 硬错误）；
-    // 按值拷贝到局部变量（编译器生成 unaligned read）后再判断。
-    let hicon: HICON = shfi.hIcon;
-    if hinst == 0 || hicon.is_invalid() {
-        return Err("SHGetFileInfoW 未返回图标".into());
-    }
-
-    // 取图标位图信息
-    let mut icon_info = ICONINFO::default();
-    let ok = unsafe { GetIconInfo(hicon, &mut icon_info) };
-    let _guard = IconGuard(hicon); // 确保最后 DestroyIcon
-
-    if ok.is_err() {
-        return Err("GetIconInfo 失败".into());
-    }
-    // 2.8.1：RAII 接管两个位图，覆盖本函数所有早退路径
-    let _bm_color = BitmapGuard(icon_info.hbmColor);
-    let _bm_mask = BitmapGuard(icon_info.hbmMask);
-
-    // 优先用 color bitmap
-    let hbm = icon_info.hbmColor;
-    if hbm.is_invalid() {
-        return Err("图标无 color bitmap".into());
-    }
-
-    // 创建兼容 DC 并选入位图
-    let hdc = unsafe { windows::Win32::Graphics::Gdi::CreateCompatibleDC(None) };
-    if hdc.is_invalid() {
-        return Err("CreateCompatibleDC 失败".into());
-    }
-    let _dc_guard = DcGuard(hdc);
-    let old_bm = unsafe { SelectObject(hdc, hbm) };
-
-    // 准备 BITMAPINFO 请求 RGBA。
-    // 注意（2.3.0 修复）：尺寸查询（lpvBits=NULL）时 biBitCount 必须为 0，
-    // 否则 GetDIBits 返回 0 + ERROR_INVALID_PARAMETER(87)，图标读取失败。
-    let mut bi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: 0,
-            biHeight: 0,
-            biPlanes: 1,
-            biBitCount: 0,
-            biCompression: 0, // BI_RGB
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
-        },
-        bmiColors: [Default::default()],
-    };
-
-    // 第一次调用取尺寸
-    let n = unsafe { GetDIBits(hdc, hbm, 0, 0, None, &mut bi, DIB_RGB_COLORS) };
-    if n == 0 {
-        return Err("GetDIBits 取尺寸失败".into());
-    }
-    let w = bi.bmiHeader.biWidth;
-    let h = bi.bmiHeader.biHeight; // 正数表示 bottom-up
-    if w <= 0 || h == 0 {
-        return Err("图标尺寸无效".into());
-    }
-    let abs_h = h.unsigned_abs();
-    // 3.0.1（F14）：尺寸来自 Windows 图标缓存而非攻击者字节，但
-    // overflow-checks=true 下无界乘法仍是 panic 面 —— checked + 合理上限。
-    let img_size: usize = (w as usize)
-        .checked_mul(abs_h as usize)
-        .and_then(|v| v.checked_mul(4))
-        .filter(|v| *v <= 512 * 1024 * 1024)
-        .ok_or("图标尺寸异常")?;
-    let mut pixels: Vec<u8> = vec![0u8; img_size];
-
-    // 第二次调用取像素
-    let n2 = unsafe {
-        GetDIBits(
-            hdc,
-            hbm,
-            0,
-            abs_h,
-            Some(pixels.as_mut_ptr() as *mut _),
-            &mut bi,
-            DIB_RGB_COLORS,
-        )
-    };
-    if n2 == 0 {
-        return Err("GetDIBits 取像素失败".into());
-    }
-
-    // 恢复 DC 旧对象
-    unsafe {
-        SelectObject(hdc, old_bm);
-    }
-
-    // BGRA → RGBA，并处理 bottom-up / top-down
-    let bottom_up = h > 0;
-    let mut rgba: Vec<u8> = Vec::with_capacity(pixels.len());
-    if bottom_up {
-        // 行序反转
-        let row = (w as usize) * 4;
-        for y in (0..abs_h as usize).rev() {
-            let off = y * row;
-            for px in pixels[off..off + row].chunks_exact(4) {
-                rgba.push(px[2]); // R
-                rgba.push(px[1]); // G
-                rgba.push(px[0]); // B
-                rgba.push(px[3]); // A
-            }
-        }
-    } else {
-        for px in pixels.chunks_exact(4) {
-            rgba.push(px[2]);
-            rgba.push(px[1]);
-            rgba.push(px[0]);
-            rgba.push(px[3]);
-        }
-    }
-
-    // PNG 编码
-    let img =
-        image::RgbaImage::from_raw(w as u32, abs_h as u32, rgba).ok_or("构造 RgbaImage 失败")?;
-    let mut png_buf = std::io::Cursor::new(Vec::with_capacity(4096));
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut png_buf, image::ImageFormat::Png)
-        .map_err(|e| format!("PNG 编码失败: {}", e))?;
-
-    Ok(format!(
-        "data:image/png;base64,{}",
-        STANDARD.encode(png_buf.into_inner())
-    ))
-}
-
-// windows 0.57：HICON 位于 Win32::UI::WindowsAndMessaging（0.58+ 才移到 Foundation），
-// 模块级导入供下方 RAII guard 使用
-#[cfg(windows)]
-use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, HBITMAP, HDC};
-#[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
-
-/// 2.8.1：GetIconInfo 返回的 hbmColor / hbmMask 都必须 DeleteObject ——
-/// 旧实现两者都不释放（每次查询新扩展名泄漏 2 个 GDI 句柄）。
-#[cfg(windows)]
-struct BitmapGuard(HBITMAP);
-#[cfg(windows)]
-impl Drop for BitmapGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.0 .0));
-        }
-    }
-}
-
-#[cfg(windows)]
-struct IconGuard(HICON);
-#[cfg(windows)]
-impl Drop for IconGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyIcon(self.0);
-        }
-    }
-}
-
-#[cfg(windows)]
-struct DcGuard(HDC);
-#[cfg(windows)]
-impl Drop for DcGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteDC(self.0);
-        }
-    }
-}
-
 // State 引用保留（run_blocking 内部经由 Manager::state 获取，此导入防止误删告警）
 #[allow(unused)]
 fn _state_type_check(_: State<AppState>) {}
+
+#[cfg(test)]
+mod tests {
+    //! 3.1.1（审计修复）：对话框令牌是「导入/提取只能操作用户亲手选过的路径」
+    //! 这一信任模型的唯一执行点，此前零测试。
+
+    use super::*;
+
+    #[test]
+    fn dialog_token_is_one_shot_and_path_bound() {
+        let a = "/tmp/lynvault-a.bin".to_string();
+        let token = register_dialog_paths(vec![a.clone()]).expect("签发令牌失败");
+        // 路径不一致 → 拒绝，且令牌不被消费（失败请求不得焚毁用户的正当选择）
+        assert!(verify_dialog_paths(&token, &["/tmp/other.bin".to_string()]).is_err());
+        // 正确路径仍可通过
+        assert!(verify_dialog_paths(&token, std::slice::from_ref(&a)).is_ok());
+        // 一次性：再用即失败
+        assert!(verify_dialog_paths(&token, &[a]).is_err());
+    }
+
+    #[test]
+    fn peek_does_not_consume_token() {
+        let a = "/tmp/lynvault-peek.bin".to_string();
+        let token = register_dialog_paths(vec![a.clone()]).expect("签发令牌失败");
+        let peeked = peek_dialog_paths(&token).expect("peek 失败");
+        assert_eq!(peeked, vec![a.clone()]);
+        // peek 不焚令牌 —— 两段式流程的最终提取仍可用
+        assert!(verify_dialog_paths(&token, &[a]).is_ok());
+    }
+
+    #[test]
+    fn unknown_token_rejected() {
+        assert!(verify_dialog_paths("deadbeef", &[]).is_err());
+        assert!(peek_dialog_paths("deadbeef").is_err());
+        // 空路径列表也不得凭空通过
+        assert!(verify_dialog_paths("deadbeef", &[String::new()]).is_err());
+    }
+
+    #[test]
+    fn remote_path_guard_covers_unc_and_device_forms() {
+        // 与 single_instance 的守卫同源：命令层一律不得触碰远程/设备路径
+        assert!(ensure_local_path(r"\\server\share\v.lyt").is_err());
+        assert!(ensure_local_path("//server/share/v.lyt").is_err());
+        assert!(ensure_local_path(r"\\?\UNC\server\share\v.lyt").is_err());
+        assert!(ensure_local_path(r"\\.\PhysicalDrive0").is_err());
+        assert!(ensure_local_path(r"C:\data\v.lyt").is_ok());
+        assert!(ensure_local_path(r"\\?\C:\data\v.lyt").is_ok());
+    }
+}

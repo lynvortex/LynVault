@@ -99,8 +99,12 @@ impl Index {
     ///   `length == size + 28*count`、末块明文 ∈ (0, chunk_size]
     /// - `offset + length ≤ 保险柜文件大小`
     pub fn validate(&self, file_size: u64) -> Result<(), VaultError> {
-        const OVERHEAD: u64 = 28; // nonce(12) + GCM tag(16)
-        let max_chunk = crate::vault::consts::CHUNK_SIZE_V6;
+        // 3.1.1（审计修复）：块几何校验改为调用 `crate::chunk::resolve_chunk_plan`
+        // —— 旧实现把 `full_ct_total` / `expected_last` / `expected_size` 三段算术
+        // 独立重写了一遍，与读取侧的解析器之间没有任何测试或类型约束保证等价。
+        // 现在「校验放过」与「读取能消费」按构造等价；常量也改从叶子模块取，
+        // 不再回引 `vault`（index → vault 的常量回边就此切断）。
+        let overhead = crate::chunk::CHUNK_OVERHEAD;
         for (vpath, meta) in &self.files {
             let end = meta
                 .offset
@@ -114,7 +118,7 @@ impl Index {
             }
             match &meta.layout {
                 ChunkLayout::Legacy => {
-                    if meta.length < OVERHEAD || meta.size != meta.length - OVERHEAD {
+                    if meta.length < overhead || meta.size != meta.length - overhead {
                         return Err(VaultError::Other(format!(
                             "{}: 密文长度与明文大小不一致（索引可能被篡改或损坏）",
                             vpath
@@ -125,31 +129,10 @@ impl Index {
                     chunk_size,
                     chunk_count,
                 } => {
-                    if *chunk_size == 0 || *chunk_size > max_chunk || *chunk_count == 0 {
-                        return Err(VaultError::Other(format!(
-                            "{}: 分块布局参数非法（索引可能被篡改或损坏）",
-                            vpath
-                        )));
-                    }
-                    let full_ct = chunk_size
-                        .checked_add(OVERHEAD)
-                        .ok_or_else(|| VaultError::Other(format!("{}: 分块布局参数非法", vpath)))?;
-                    let full_ct_total = full_ct.checked_mul(chunk_count - 1).ok_or_else(|| {
-                        VaultError::Other(format!("{}: 分块布局参数非法（块数溢出）", vpath))
-                    })?;
-                    let expected_last = match meta.length.checked_sub(full_ct_total) {
-                        Some(v) if v > OVERHEAD && v <= full_ct => v - OVERHEAD,
-                        _ => {
-                            return Err(VaultError::Other(format!(
-                                "{}: 分块密文长度与布局不一致（索引可能被篡改或损坏）",
-                                vpath
-                            )));
-                        }
-                    };
-                    let expected_size = (chunk_count - 1)
-                        .saturating_mul(*chunk_size)
-                        .saturating_add(expected_last);
-                    if meta.size != expected_size {
+                    let plan =
+                        crate::chunk::resolve_chunk_plan(meta.length, *chunk_size, *chunk_count)
+                            .map_err(|e| VaultError::Other(format!("{}: {}", vpath, e)))?;
+                    if meta.size != plan.plaintext_total() {
                         return Err(VaultError::Other(format!(
                             "{}: 明文大小与分块布局不一致（索引可能被篡改或损坏）",
                             vpath
@@ -243,6 +226,37 @@ impl Index {
             };
             kp == parent && kn.to_lowercase() == name_lower
         })
+    }
+
+    /// 3.1.1（审计修复）：补齐目标路径的**完整祖先链** folders 条目。
+    ///
+    /// 旧实现（`add_file` / `import_file_into_index`）只登记**直接父目录**：
+    /// 目标路径深度 > 2 且祖先链未登记时（`import_file` 接受任意深度 vpath），
+    /// 索引里会出现 `/a/b/c.txt` 而无 `folders["/a"]` —— `list_folder("/")`
+    /// 看不到 `/a`、`list_folder("/a")` 看不到 `/a/b`，该文件在 UI 中不可达，
+    /// 只能靠搜索命中。`rewrite_folder_keys` 的跨命名空间注释已把这种「遗留
+    /// 形态」当作必须防御的现实条件，此处从写入侧直接消除它。
+    ///
+    /// 与既有**文件**同名的前缀不登记（保持 file/folder 命名空间不碰撞；
+    /// 这种形态属已损坏索引，由调用方的前置检查处理）。
+    pub(crate) fn ensure_parent_folders(
+        files: &HashMap<String, FileMeta>,
+        folders: &mut HashMap<String, bool>,
+        vpath: &str,
+    ) {
+        let segs: Vec<&str> = vpath.split('/').skip(1).filter(|s| !s.is_empty()).collect();
+        if segs.len() < 2 {
+            return; // 根下的直接子项：没有祖先需要登记
+        }
+        let mut acc = String::new();
+        for seg in &segs[..segs.len() - 1] {
+            acc.push('/');
+            acc.push_str(seg);
+            if files.contains_key(&acc) {
+                break; // 前缀已是文件：不再继续制造同键
+            }
+            folders.entry(acc.clone()).or_insert(true);
+        }
     }
 
     /// 归一化虚拟路径：去掉多余的 '/'、结尾 '/'、'.' 段。
@@ -358,9 +372,10 @@ impl<'a> IndexManager<'a> {
                         parent
                     )));
                 }
-                index.folders.insert(parent.into(), true);
             }
         }
+        // 3.1.1：补齐完整祖先链（旧实现只登记直接父目录 → 深层路径在 UI 中不可达）
+        Index::ensure_parent_folders(&index.files, &mut index.folders, &vpath);
         self.vault.log_event(&format!("添加文件 '{}'", vpath));
         self.vault.save_index(index)?;
         Ok(())
@@ -988,5 +1003,82 @@ mod tests {
             },
         );
         assert!(super::rewrite_folder_keys(&idx2.files, &idx2.folders, "/a", "/b").is_err());
+    }
+
+    // 3.1.1（审计修复）：祖先链登记的回归 —— 旧实现只登记直接父目录，
+    // 深层路径在 list_folder 中整条不可达。
+    #[test]
+    fn ensure_parent_folders_registers_full_chain() {
+        let mut idx = Index::new();
+        Index::ensure_parent_folders(&idx.files, &mut idx.folders, "/a/b/c/d.txt");
+        assert!(idx.folders.contains_key("/a"));
+        assert!(idx.folders.contains_key("/a/b"));
+        assert!(idx.folders.contains_key("/a/b/c"));
+        // 目标自身不登记为文件夹
+        assert!(!idx.folders.contains_key("/a/b/c/d.txt"));
+        // 根下直接子项不需要任何祖先
+        let mut flat = Index::new();
+        Index::ensure_parent_folders(&flat.files, &mut flat.folders, "/x.txt");
+        assert!(flat.folders.is_empty());
+    }
+
+    // 3.1.1：祖先前缀已是文件时停止登记（不得制造 file/folder 同键）
+    #[test]
+    fn ensure_parent_folders_stops_at_file_prefix() {
+        let mut idx = Index::new();
+        idx.files.insert(
+            "/a".into(),
+            FileMeta {
+                name: "a".into(),
+                size: 1,
+                offset: 0,
+                length: 29,
+                aad_tag: None,
+                layout: ChunkLayout::Legacy,
+            },
+        );
+        Index::ensure_parent_folders(&idx.files, &mut idx.folders, "/a/b/c.txt");
+        assert!(!idx.folders.contains_key("/a"), "与文件同名的前缀不得登记");
+        assert!(!idx.folders.contains_key("/a/b"));
+    }
+
+    // 3.1.1：validate 与读取侧共用 resolve_chunk_plan —— 合法布局必须通过，
+    // 明文大小与布局矛盾必须拒绝（此前是两份独立算术）。
+    #[test]
+    fn validate_uses_shared_chunk_plan() {
+        use crate::chunk::{CHUNK_OVERHEAD, CHUNK_SIZE_V6};
+        let size = CHUNK_SIZE_V6 + 100; // 两块：满块 + 100 字节
+        let count = size.div_ceil(CHUNK_SIZE_V6);
+        let length = size + count * CHUNK_OVERHEAD;
+
+        let mut idx = Index::new();
+        idx.files.insert(
+            "/f.bin".into(),
+            FileMeta {
+                name: "f.bin".into(),
+                size,
+                offset: 0,
+                length,
+                aad_tag: None,
+                layout: ChunkLayout::Chunked {
+                    chunk_size: CHUNK_SIZE_V6,
+                    chunk_count: count,
+                },
+            },
+        );
+        assert!(idx.validate(1 << 40).is_ok(), "合法分块布局必须通过");
+
+        // 明文大小被改小 → 与布局矛盾 → 拒绝
+        idx.files.get_mut("/f.bin").unwrap().size = size - 1;
+        assert!(idx.validate(1 << 40).is_err(), "size 与布局矛盾必须拒绝");
+
+        // 分块大小超上限 → 拒绝（resolve_chunk_plan 的 chunk_size 闸门）
+        let meta = idx.files.get_mut("/f.bin").unwrap();
+        meta.size = size;
+        meta.layout = ChunkLayout::Chunked {
+            chunk_size: CHUNK_SIZE_V6 + 1,
+            chunk_count: 1,
+        };
+        assert!(idx.validate(1 << 40).is_err(), "块大小超上限必须拒绝");
     }
 }

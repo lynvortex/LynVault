@@ -294,11 +294,10 @@ impl Vault {
                 layout,
             },
         );
-        if let Some(pos) = vpath.rfind('/') {
-            if pos > 0 {
-                index.folders.insert(vpath[..pos].to_string(), true);
-            }
-        }
+        // 3.1.1（审计修复）：补齐**完整祖先链** folders 条目 —— 旧实现只登记
+        // 直接父目录，深层 vpath（`/a/b/c.txt`）会让 `/a` 缺席而整条路径在
+        // `list_folder` 中不可达（只能靠搜索命中）。
+        Index::ensure_parent_folders(&index.files, &mut index.folders, &vpath);
         Ok(())
     }
 

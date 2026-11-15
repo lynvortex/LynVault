@@ -106,6 +106,35 @@ pub(crate) fn create_scratch_file(path: &Path) -> std::io::Result<File> {
     opts.open(path)
 }
 
+/// 3.1.1（审计修复）：以只读 + 不跟随符号链接打开**既有**保险柜文件 ——
+/// 供次级只读句柄使用（如 `duress_mark_on` 读取目标分区的索引）。
+///
+/// 旧实现直接用 `File::open`（按路径、跟随链接）：同目录写权限者可在
+/// 「会话句柄已锚定 → 按路径重开」的窗口内把 `.lyt` 换成符号链接，让这次
+/// 读取命中另一个文件。与主会话句柄同一套防护：Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT` + 句柄级非符号链接校验；Unix `O_NOFOLLOW`。
+pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    #[cfg(windows)]
+    {
+        verify_no_reparse(&file)?;
+    }
+    Ok(file)
+}
+
 /// 2.7.1 新增：以 create_new 语义独占创建保险柜文件（目标已存在时失败，
 /// 绝不清零已有内容）。打开标志与 [`open_vault_rw`] 完全一致。
 pub(crate) fn open_vault_create_new(path: &Path) -> std::io::Result<File> {
@@ -438,88 +467,11 @@ pub(crate) fn read_decrypt_file_data(
     decrypt_into(enc_key, enc_data, aad).ok_or(VaultError::DecryptFailed)
 }
 
-/// 分块密文每块开销：nonce(12) + GCM tag(16)
-pub(crate) const CHUNK_OVERHEAD: u64 = 28;
-
-/// 3.0.1（F3/F4 统一收口）：分块布局解析结果 —— 逐块几何的唯一事实来源。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ChunkPlan {
-    pub chunk_size: u64,
-    pub chunk_count: u64,
-    /// 满块密文长度 = chunk_size + CHUNK_OVERHEAD
-    pub full_ct: u64,
-    /// 末块明文长度 ∈ (0, chunk_size]
-    pub expected_last: u64,
-}
-
-impl ChunkPlan {
-    /// 第 i 块的明文长度（末块 = expected_last，其余 = chunk_size）
-    pub fn plain_len(&self, i: u64) -> u64 {
-        if i + 1 == self.chunk_count {
-            self.expected_last
-        } else {
-            self.chunk_size
-        }
-    }
-
-    /// 第 i 块的密文长度
-    pub fn ct_len(&self, i: u64) -> u64 {
-        self.plain_len(i) + CHUNK_OVERHEAD
-    }
-
-    /// 明文总长（= 索引 size 字段在写入时的值）。
-    /// saturating：resolve_chunk_plan 的校验已保证真实值不溢出（(count-1)*full_ct
-    /// ≤ length），此处 saturate 仅作为纵深防御，杜绝任何 panic 路径。
-    pub fn plaintext_total(&self) -> u64 {
-        (self.chunk_count - 1)
-            .saturating_mul(self.chunk_size)
-            .saturating_add(self.expected_last)
-    }
-}
-
-/// 3.0.1（F3 修复）：由密文总长 + 索引布局解析分块几何 —— 所有读取路径
-/// （整段 / 流式提取 / 媒体区间 / 体检）共用，不得自行演算。校验：
-/// - `chunk_size ∈ (0, CHUNK_SIZE_V6]`：唯一曾是「非零」检查 —— chunk_count=1
-///   时 `length` 全额通过，`vec![0u8; 2^40]` 直接 alloc-abort 整个进程；
-///   写入方恒用 CHUNK_SIZE_V6 分块，超限值必属篡改/损坏；
-/// - `chunk_count > 0`，全程 checked 运算（release 档 overflow-checks 开启，
-///   但显式报错优于 panic）；
-/// - 末块明文 ∈ (0, chunk_size]：密文长度与索引布局矛盾即拒绝（截断/篡改）。
-pub(crate) fn resolve_chunk_plan(
-    length: u64,
-    chunk_size: u64,
-    chunk_count: u64,
-) -> Result<ChunkPlan, VaultError> {
-    if chunk_size == 0 || chunk_count == 0 {
-        return Err(VaultError::Other("分块布局参数非法".into()));
-    }
-    if chunk_size > CHUNK_SIZE_V6 {
-        return Err(VaultError::Other(format!(
-            "分块大小非法（{} 字节，超过上限 {} 字节）",
-            chunk_size, CHUNK_SIZE_V6
-        )));
-    }
-    let full_ct = chunk_size
-        .checked_add(CHUNK_OVERHEAD)
-        .ok_or_else(|| VaultError::Other("分块布局参数非法".into()))?;
-    let full_ct_total = full_ct
-        .checked_mul(chunk_count - 1)
-        .ok_or_else(|| VaultError::Other("分块布局参数非法（块数溢出）".into()))?;
-    let expected_last = match length.checked_sub(full_ct_total) {
-        Some(v) if v > CHUNK_OVERHEAD && v <= full_ct => v - CHUNK_OVERHEAD,
-        _ => {
-            return Err(VaultError::Other(
-                "分块密文长度与索引布局不一致（密文可能被截断或篡改）".into(),
-            ))
-        }
-    };
-    Ok(ChunkPlan {
-        chunk_size,
-        chunk_count,
-        full_ct,
-        expected_last,
-    })
-}
+/// 3.1.1（审计修复）：分块几何已收敛到叶子模块 [`crate::chunk`] ——
+/// 校验侧（`Index::validate`）与读取侧此前各自重写了一份等价算术，两份实现
+/// 之间没有任何测试或类型约束保证等价。现统一调用同一解析器，此处 re-export
+/// 保持 `use super::fs_util::*` 的既有调用点不变。
+pub(crate) use crate::chunk::resolve_chunk_plan;
 
 /// 3.0.0（v6）：布局感知的整段读取解密 —— Chunked 布局按块流式解密后拼接，
 /// 对外行为（返回完整明文 Vec）与 Legacy 一致；调用方仍需自行施加

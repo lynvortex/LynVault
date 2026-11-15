@@ -571,36 +571,8 @@ impl Vault {
             return Err(VaultError::Locked);
         }
 
-        // 解析分区表：始终扫描 MAX_PARTITIONS 个条目（2.3.0 起伪条目整体随机填充，
-        // 不再有「别名首字节 0」标记，因此不再跳过任何条目 —— 全部参与认证以保证恒定时间）
-        let mut parsed: Vec<PartitionInfo> = Vec::new();
-        let mut off = 106;
-        for _ in 0..MAX_PARTITIONS {
-            if off + PARTITION_ENTRY_SIZE_V4 > HEADER_SIZE_V4 {
-                break;
-            }
-            let alias_len = header[off..off + 16]
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(16);
-            let alias = String::from_utf8_lossy(&header[off..off + alias_len]).to_string();
-            let mut p_salt = [0u8; 32];
-            p_salt.copy_from_slice(&header[off + 16..off + 48]);
-            let mut auth_tag = [0u8; 32];
-            auth_tag.copy_from_slice(&header[off + 48..off + 80]);
-            let index_offset = u64::from_le_bytes(header[off + 80..off + 88].try_into().unwrap());
-            let index_length = u64::from_le_bytes(header[off + 88..off + 96].try_into().unwrap());
-            parsed.push(PartitionInfo {
-                alias,
-                salt: p_salt,
-                auth_tag,
-                index_offset,
-                index_length,
-                wrapped_key: None,
-                audit_count: 0,
-            });
-            off += PARTITION_ENTRY_SIZE_V4;
-        }
+        // 解析分区表（3.1.1：抽出 parse_entries_v4 —— 见该函数文档）
+        let parsed = Self::parse_entries_v4(&header);
 
         // 3.0.1（F1 修复）：对全部**真实分区**统一做索引范围校验。
         // index_offset/index_length 不在任何认证范围内；过去只对认证命中的
@@ -618,36 +590,8 @@ impl Vault {
 
         // C9 修复 + 2.3.0 + 2.4.1：始终对**全部 8 个条目**执行完整 Argon2id 派生
         // （即使中途匹配），消除计时侧信道 —— 总派生工作量恒定，与真实分区数量无关。
-        //
-        // 2.4.1 优化（P1-6）：8 组密钥改为分块并行派生（块大小 = min(CPU 逻辑核数, 4)），
-        // 串行约 1s 降至约 0.25-0.5s。并行只是调度优化：8 次派生仍 100% 完成后
-        // 才进入认证比较，恒定时间语义不变；并行度上限 4 同时把瞬时内存峰值
-        // 控制在 4×64MB，低配机器按核数自动降为 1（退化为旧行为）。
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // 3.0.0：并行上限 4 → 8 —— 8 核以上机器开柜约减半（8×Argon2id 各 64MB，
-        // 瞬时内存峰值 512MB，桌面场景可接受；低配机器按核数自动回落）
-        let parallel = cpus.clamp(1, 8);
-        let mut keys_list: Vec<KeyMaterial> = Vec::with_capacity(parsed.len());
-        for chunk in parsed.chunks(parallel) {
-            let results: Vec<Result<KeyMaterial, VaultError>> = std::thread::scope(|s| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|p| s.spawn(move || derive_keys(password, key_file_data, &p.salt)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err(VaultError::Other("密钥派生线程失败".into())))
-                    })
-                    .collect()
-            });
-            for r in results {
-                keys_list.push(r?);
-            }
-        }
+        // 3.1.1：分块并行派生抽为 derive_keys_parallel（恒定时间语义不变）。
+        let mut keys_list = Self::derive_keys_parallel(password, key_file_data, &parsed)?;
 
         // 认证比较阶段（此时重计算已完成，循环本身极轻）
         let mut matched_idx: Option<usize> = None;
@@ -661,10 +605,10 @@ impl Vault {
             // 都被纳入 HMAC，因此篡改头部必然使该分区匹配失败（不再依赖分区计数）。
             // 3.0.1（F27）：v4 保留 legacy 兼容（≤2.6.0 的合法旧柜只有 AUTH_OK
             // 标签）；迁移到 bound 标签有规范形门槛，见成功路径注释。
-            let eoff = 106 + idx * PARTITION_ENTRY_SIZE_V4;
+            let eoff = ENTRY_BASE + idx * PARTITION_ENTRY_SIZE_V4;
             let tag_ok = verify_auth_tag_bound(
                 &keys.auth_key,
-                &header[..105],
+                &header[..HEADER_PREFIX_LEN],
                 &header[eoff..eoff + 16],
                 &header[eoff + 16..eoff + 48],
                 &p.auth_tag,
@@ -722,29 +666,10 @@ impl Vault {
         }
 
         if let (Some(idx), Some(index), Some(keys)) = (matched_idx, matched_index, matched_keys) {
-            // 过滤出真实分区（别名合理的条目；伪条目随机数据几乎不可能通过校验）
-            // 3.0.1（#31 修复）：以**认证命中的条目**为锚无条件保留 —— 别名
-            // 带 '.' 等字形的旧分区会被 is_plausible_alias 过滤剔除，恒定时间
-            // 查找随即失败并报「头部与数据不匹配」；认证已证明该条目真实。
-            let real_partitions: Vec<PartitionInfo> = parsed
-                .iter()
-                .enumerate()
-                .filter(|(i, p)| {
-                    *i == idx || (is_plausible_alias(&p.alias) && !range_violations.contains(i))
-                })
-                .map(|(_, p)| p.clone())
-                .collect();
-            let matched_salt = parsed[idx].salt;
-            let matched_tag = parsed[idx].auth_tag;
-            // 恒定时间比较：避免按字节短路泄露「salt/tag 前多少字节匹配」的时序信息
-            let active = real_partitions.iter()
-                .position(|p| {
-                    use subtle::ConstantTimeEq;
-                    bool::from(p.salt.ct_eq(&matched_salt) & p.auth_tag.ct_eq(&matched_tag))
-                })
-                .ok_or_else(|| VaultError::Other(
-                    "头部与数据不匹配：找不到对应的分区（文件可能被篡改、损坏或与其他保险柜混用）".into(),
-                ))?;
+            // 3.1.1：真实分区过滤 + 恒定时间定位 active 收敛到共享函数
+            // （v4 与信封路径此前各自复制了一份，见 real_partitions_and_active）
+            let (real_partitions, active) =
+                Self::real_partitions_and_active(&parsed, idx, &range_violations)?;
 
             lock_state.reset();
             self.lock_state = lock_state;
@@ -764,9 +689,9 @@ impl Vault {
             // 头部无条件重打 bound 标签，等于把被篡改的头部「洗白」为已认证
             // 形态。非规范形（≤2.6.0 携带旧 lock_key 残留的合法旧柜）保持
             // legacy 标签原样落盘；update_header 落盘规范形后，下次打开自然迁移。
-            let moff = 106 + idx * PARTITION_ENTRY_SIZE_V4;
+            let moff = ENTRY_BASE + idx * PARTITION_ENTRY_SIZE_V4;
             let canonical_prefix = auth_tag_header_prefix(&salt, VERSION_V4);
-            if header[..105] == canonical_prefix {
+            if header[..HEADER_PREFIX_LEN] == canonical_prefix {
                 let migrated_tag = create_auth_tag_bound(
                     &keys.auth_key,
                     &canonical_prefix,
@@ -820,11 +745,11 @@ impl Vault {
         // 3.0.1（P0 #1 修复）：锁定区更新同样经日志边车防撕裂（41 字节小写
         // 撕裂同样会让下次打开报「头部可能被篡改」）
         lock_state.record_failure();
-        let mut lock_buf = [0u8; 41];
+        let mut lock_buf = [0u8; LOCK_REGION_SIZE];
         lock_buf[0] = lock_state.lock_count;
         lock_buf[1..9].copy_from_slice(&lock_state.lock_until.to_le_bytes());
         let hmac = lock_state.compute_hmac(&mac_key);
-        lock_buf[9..41].copy_from_slice(&hmac);
+        lock_buf[9..LOCK_REGION_SIZE].copy_from_slice(&hmac);
         write_lock_region_journaled(&mut file, path, LOCK_OFFSET_V4, &lock_buf)?;
 
         Err(VaultError::AuthFailed)
@@ -886,41 +811,8 @@ impl Vault {
             return Err(VaultError::Locked);
         }
 
-        // 解析 8 个 192 字节条目（含 60 字节包裹密钥；伪条目为随机字节，认证必然失败）
-        let mut parsed: Vec<PartitionInfo> = Vec::new();
-        let mut off = 106;
-        for _ in 0..MAX_PARTITIONS {
-            let alias_len = header[off..off + 16]
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(16);
-            let alias = String::from_utf8_lossy(&header[off..off + alias_len]).to_string();
-            let mut p_salt = [0u8; 32];
-            p_salt.copy_from_slice(&header[off + 16..off + 48]);
-            let mut auth_tag = [0u8; 32];
-            auth_tag.copy_from_slice(&header[off + 48..off + 80]);
-            let index_offset = u64::from_le_bytes(header[off + 80..off + 88].try_into().unwrap());
-            let index_length = u64::from_le_bytes(header[off + 88..off + 96].try_into().unwrap());
-            let mut wrapped = [0u8; WRAPPED_KEY_SIZE];
-            wrapped.copy_from_slice(&header[off + 96..off + 96 + WRAPPED_KEY_SIZE]);
-            // 3.0.0（审计锚点）：同时读出本槽的审计计数
-            let audit_count = u32::from_le_bytes(
-                header[AUDIT_COUNT_OFFSET + 4 * parsed.len()
-                    ..AUDIT_COUNT_OFFSET + 4 * (parsed.len() + 1)]
-                    .try_into()
-                    .unwrap(),
-            );
-            parsed.push(PartitionInfo {
-                alias,
-                salt: p_salt,
-                auth_tag,
-                index_offset,
-                index_length,
-                wrapped_key: Some(wrapped),
-                audit_count,
-            });
-            off += PARTITION_ENTRY_SIZE_V5;
-        }
+        // 解析 8 个 192 字节条目（3.1.1：抽出 parse_entries_envelope —— 见该函数文档）
+        let parsed = Self::parse_entries_envelope(&header);
 
         // 3.0.1（F1 修复）：同 v4 —— 全部真实分区的索引范围统一校验（见上方说明）
         // 3.0.1（3.0.1 F1 假阳性收口）：范围越界不再立即拒绝开柜 —— 伪条目
@@ -932,51 +824,8 @@ impl Vault {
         // try_authenticate_partition 的边界检查按篡改拒绝（错误语义不变）。
         let range_violations = Self::find_partition_range_violations(&file, &parsed)?;
 
-        // 阶段 1：8 × Argon2id（KEK 派生），分块并行（与 v4 相同的调度优化）。
-        // 2.8.1：KEK 用 Zeroizing 包裹 —— `?` 提前返回（派生失败）时已派生的
-        // KEK 不再以明文形式残留在堆上（数组没有 Drop，旧实现靠不到）
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // 3.0.0：并行上限 4 → 8 —— 8 核以上机器开柜约减半（8×Argon2id 各 64MB，
-        // 瞬时内存峰值 512MB，桌面场景可接受；低配机器按核数自动回落）
-        let parallel = cpus.clamp(1, 8);
-        let mut kek_list: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(parsed.len());
-        for chunk in parsed.chunks(parallel) {
-            let results: Vec<Result<[u8; 32], VaultError>> = std::thread::scope(|s| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|p| s.spawn(move || derive_kek(password, key_file_data, &p.salt)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err(VaultError::Other("密钥派生线程失败".into())))
-                    })
-                    .collect()
-            });
-            // 2.8.2：`?` 早退时 results 中尚未 push 的 KEK 是裸 [u8;32] 数组
-            // （Copy，drop 是空操作），会以明文残留堆内存 —— 改为先全部收进
-            // Zeroizing 容器再决定成败，任何路径 drop 即清零。
-            let mut chunk_keks: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(results.len());
-            let mut first_err: Option<VaultError> = None;
-            for r in results {
-                match r {
-                    Ok(k) => chunk_keks.push(Zeroizing::new(k)),
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
-                    }
-                }
-            }
-            if let Some(e) = first_err {
-                // chunk_keks 是 Zeroizing，drop 即清零
-                return Err(e);
-            }
-            kek_list.extend(chunk_keks);
-        }
+        // 阶段 1：8 × Argon2id（KEK 派生），3.1.1：抽为 derive_keks_parallel
+        let mut kek_list = Self::derive_keks_parallel(password, key_file_data, &parsed)?;
 
         // 阶段 2：逐条目解包 + 认证标签校验（轻量，全部尝试保持恒定时间语义）。
         // candidate 的 data_key 同样用 Zeroizing：无论走哪条分支（存入会话 /
@@ -986,7 +835,7 @@ impl Vault {
         let mut matched: Option<EnvelopeMatch> = None;
         for (idx, kek) in kek_list.iter().enumerate() {
             let p = &parsed[idx];
-            let eoff = 106 + idx * PARTITION_ENTRY_SIZE_V5;
+            let eoff = ENTRY_BASE + idx * PARTITION_ENTRY_SIZE_V5;
             let alias_field = &header[eoff..eoff + 16];
             let wrap_aad = key_wrap_aad(&prefix, alias_field, &p.salt);
             let stored_wrapped = p.wrapped_key.unwrap_or([0u8; WRAPPED_KEY_SIZE]);
@@ -1087,29 +936,9 @@ impl Vault {
             // 曾设想的 generation 计数器未引入，README「已知限制」已如实声明
             // 该窗口，不得再以「v6 根治」误导后续审计。
             let legacy_signature = !verify_header_signature_v5(&header, &keys.sign_key);
-            // 过滤出真实分区（伪条目随机数据几乎不可能通过认证）
-            // 3.0.1（#31 修复）：以**认证命中的条目**为锚无条件保留 —— 别名
-            // 带 '.' 等字形的旧分区会被 is_plausible_alias 过滤剔除，恒定时间
-            // 查找随即失败并报「头部与数据不匹配」；认证已证明该条目真实。
-            let real_partitions: Vec<PartitionInfo> = parsed
-                .iter()
-                .enumerate()
-                .filter(|(i, p)| {
-                    *i == idx || (is_plausible_alias(&p.alias) && !range_violations.contains(i))
-                })
-                .map(|(_, p)| p.clone())
-                .collect();
-            let matched_salt = parsed[idx].salt;
-            let matched_tag = parsed[idx].auth_tag;
-            // 恒定时间比较（与 v4 相同）
-            let active = real_partitions.iter()
-                .position(|p| {
-                    use subtle::ConstantTimeEq;
-                    bool::from(p.salt.ct_eq(&matched_salt) & p.auth_tag.ct_eq(&matched_tag))
-                })
-                .ok_or_else(|| VaultError::Other(
-                    "头部与数据不匹配：找不到对应的分区（文件可能被篡改、损坏或与其他保险柜混用）".into(),
-                ))?;
+            // 3.1.1：与 v4 共用同一实现（真实分区过滤 + 恒定时间定位 active）
+            let (real_partitions, active) =
+                Self::real_partitions_and_active(&parsed, idx, &range_violations)?;
 
             lock_state.reset();
             self.lock_state = lock_state;
@@ -1183,15 +1012,214 @@ impl Vault {
         // 全部失败：递增锁定计数（v5 偏移）。
         // 3.0.1（P0 #1 修复）：同 v4 —— 锁定区更新经日志边车防撕裂
         lock_state.record_failure();
-        let mut lock_buf = [0u8; 41];
+        let mut lock_buf = [0u8; LOCK_REGION_SIZE];
         lock_buf[0] = lock_state.lock_count;
         lock_buf[1..9].copy_from_slice(&lock_state.lock_until.to_le_bytes());
         let hmac = lock_state.compute_hmac(&mac_key);
-        lock_buf[9..41].copy_from_slice(&hmac);
+        lock_buf[9..LOCK_REGION_SIZE].copy_from_slice(&hmac);
         write_lock_region_journaled(&mut file, path, LOCK_OFFSET_V5, &lock_buf)?;
 
         Err(VaultError::AuthFailed)
     }
+    // ═══════════════ 打开认证的共享构件（3.1.1 抽出）═══════════════
+    //
+    // 抽出动机（审计 R1 / R3）：两条打开路径原本各是一百多行的单体函数，其中
+    // 「条目解析」「并行 Argon2id 派生」「真实分区过滤 + 恒定时间定位 active」
+    // 三段在 v4 与信封之间逐行重复 —— 任何一次修复都必须同时改两处（#31 已经
+    // 踩过一次）。现收敛为下列纯函数，两条路径只剩「格式判读 / 认证比较 /
+    // 会话提交」的差异部分。
+    //
+    // 认证**遍历本身**仍保持单趟线性、不因中途命中而提前返回：恒定时间语义
+    // 要求「每个条目都完整走完」，因此不再进一步拆分，以免把这条不变量藏进
+    // 多层控制流里。
+
+    /// 解析单个分区条目 —— v4 与 v5/v6 的前 96 字节布局完全一致。
+    /// `wrapped` 决定是否读取 60 字节包裹密钥（仅信封格式存在）；
+    /// `audit_count` 由调用方从头部保留区读出（仅信封格式有锚点）。
+    fn parse_entry(header: &[u8], off: usize, wrapped: bool, audit_count: u32) -> PartitionInfo {
+        let alias_len = header[off..off + 16]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(16);
+        let alias = String::from_utf8_lossy(&header[off..off + alias_len]).to_string();
+        let mut salt = [0u8; 32];
+        salt.copy_from_slice(&header[off + 16..off + 48]);
+        let mut auth_tag = [0u8; 32];
+        auth_tag.copy_from_slice(&header[off + 48..off + 80]);
+        let index_offset = u64::from_le_bytes(header[off + 80..off + 88].try_into().unwrap());
+        let index_length = u64::from_le_bytes(header[off + 88..off + 96].try_into().unwrap());
+        let wrapped_key = if wrapped {
+            let mut w = [0u8; WRAPPED_KEY_SIZE];
+            w.copy_from_slice(&header[off + 96..off + 96 + WRAPPED_KEY_SIZE]);
+            Some(w)
+        } else {
+            None
+        };
+        PartitionInfo {
+            alias,
+            salt,
+            auth_tag,
+            index_offset,
+            index_length,
+            wrapped_key,
+            audit_count,
+        }
+    }
+
+    /// 解析 v4 头部的 8 个 96 字节条目。始终扫描全部槽位（2.3.0 起伪条目整体
+    /// 随机填充，不再有「别名首字节 0」标记），以保证后续认证工作量恒定。
+    fn parse_entries_v4(header: &[u8; HEADER_SIZE_V4]) -> Vec<PartitionInfo> {
+        let mut parsed = Vec::with_capacity(MAX_PARTITIONS);
+        let mut off = ENTRY_BASE;
+        for _ in 0..MAX_PARTITIONS {
+            if off + PARTITION_ENTRY_SIZE_V4 > HEADER_SIZE_V4 {
+                break;
+            }
+            parsed.push(Self::parse_entry(header, off, false, 0));
+            off += PARTITION_ENTRY_SIZE_V4;
+        }
+        parsed
+    }
+
+    /// 解析 v5/v6 头部的 8 个 192 字节条目（含 60 字节包裹密钥与审计锚点）。
+    /// 伪条目为随机字节，认证必然失败 —— 但同样全部解析，保持恒定时间。
+    fn parse_entries_envelope(header: &[u8; HEADER_SIZE_V5]) -> Vec<PartitionInfo> {
+        let mut parsed = Vec::with_capacity(MAX_PARTITIONS);
+        for i in 0..MAX_PARTITIONS {
+            let off = ENTRY_BASE + i * PARTITION_ENTRY_SIZE_V5;
+            let audit_count = u32::from_le_bytes(
+                header[AUDIT_COUNT_OFFSET + 4 * i..AUDIT_COUNT_OFFSET + 4 * (i + 1)]
+                    .try_into()
+                    .unwrap(),
+            );
+            parsed.push(Self::parse_entry(header, off, true, audit_count));
+        }
+        parsed
+    }
+
+    /// KDF 并行度：按逻辑核数，上限 8（8×Argon2id 各 64 MB，瞬时峰值 512 MB）。
+    /// 并行只是调度优化 —— 全部派生仍 100% 完成后才进入认证比较。
+    fn kdf_parallelism() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+    }
+
+    /// 对全部条目并行完成 Argon2id 派生（v4：直接派生三把会话密钥）。
+    fn derive_keys_parallel(
+        password: &str,
+        key_file_data: Option<&[u8]>,
+        parsed: &[PartitionInfo],
+    ) -> Result<Vec<KeyMaterial>, VaultError> {
+        let parallel = Self::kdf_parallelism();
+        let mut keys_list: Vec<KeyMaterial> = Vec::with_capacity(parsed.len());
+        for chunk in parsed.chunks(parallel) {
+            let results: Vec<Result<KeyMaterial, VaultError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|p| s.spawn(move || derive_keys(password, key_file_data, &p.salt)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(VaultError::Other("密钥派生线程失败".into())))
+                    })
+                    .collect()
+            });
+            for r in results {
+                keys_list.push(r?);
+            }
+        }
+        Ok(keys_list)
+    }
+
+    /// 对全部条目并行完成 KEK 派生（v5/v6 信封）。
+    ///
+    /// 2.8.1：KEK 一律以 `Zeroizing` 持有 —— `?` 早退时已派生的密钥随 drop
+    /// 清零；2.8.2：`?` 早退前先把整块结果收进 `Zeroizing` 容器（裸 `[u8;32]`
+    /// 是 Copy，drop 是空操作，会以明文残留堆内存）。
+    fn derive_keks_parallel(
+        password: &str,
+        key_file_data: Option<&[u8]>,
+        parsed: &[PartitionInfo],
+    ) -> Result<Vec<Zeroizing<[u8; 32]>>, VaultError> {
+        let parallel = Self::kdf_parallelism();
+        let mut kek_list: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(parsed.len());
+        for chunk in parsed.chunks(parallel) {
+            let results: Vec<Result<[u8; 32], VaultError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|p| s.spawn(move || derive_kek(password, key_file_data, &p.salt)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(VaultError::Other("密钥派生线程失败".into())))
+                    })
+                    .collect()
+            });
+            let mut chunk_keks: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(results.len());
+            let mut first_err: Option<VaultError> = None;
+            for r in results {
+                match r {
+                    Ok(k) => chunk_keks.push(Zeroizing::new(k)),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                // chunk_keks 是 Zeroizing，出作用域即清零
+                return Err(e);
+            }
+            kek_list.extend(chunk_keks);
+        }
+        Ok(kek_list)
+    }
+
+    /// 由解析结果 + 越界集合还原「真实分区表 + 活动分区下标」。
+    ///
+    /// - 以**认证命中的条目**为锚无条件保留（3.0.1 #31）：别名带 '.' 等字形的
+    ///   旧分区会被 `is_plausible_alias` 剔除，导致恒定时间查找失败并误报
+    ///   「头部与数据不匹配」；
+    /// - 非命中条目要求别名合理且索引范围在界内（F1 假阳性收口）；
+    /// - active 用 `ct_eq` 比较 salt + auth_tag —— 避免按字节短路泄露
+    ///   「前多少字节匹配」的时序信息。
+    fn real_partitions_and_active(
+        parsed: &[PartitionInfo],
+        matched_idx: usize,
+        range_violations: &[usize],
+    ) -> Result<(Vec<PartitionInfo>, usize), VaultError> {
+        let real: Vec<PartitionInfo> = parsed
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| {
+                *i == matched_idx || (is_plausible_alias(&p.alias) && !range_violations.contains(i))
+            })
+            .map(|(_, p)| p.clone())
+            .collect();
+        let matched_salt = parsed[matched_idx].salt;
+        let matched_tag = parsed[matched_idx].auth_tag;
+        let active = real
+            .iter()
+            .position(|p| {
+                use subtle::ConstantTimeEq;
+                bool::from(p.salt.ct_eq(&matched_salt) & p.auth_tag.ct_eq(&matched_tag))
+            })
+            .ok_or_else(|| {
+                VaultError::Other(
+                    "头部与数据不匹配：找不到对应的分区（文件可能被篡改、损坏或与其他保险柜混用）"
+                        .into(),
+                )
+            })?;
+        Ok((real, active))
+    }
+
     /// 3.0.1（F1 修复）：头部解析后、任何密钥派生之前，对全部真实分区
     /// （别名合理条目）统一做索引范围校验。index_offset/index_length 不受
     /// 任何认证保护（auth_tag AAD / 包裹 AAD / 锁区 HMAC 均不覆盖，头部签名
@@ -1399,14 +1427,14 @@ impl Vault {
 
     /// 头部前缀解析（magic / 版本 / 保险柜 salt）—— 三个字段在 v4/v5 布局中位置一致。
     fn parse_header(header: &[u8]) -> Result<([u8; 8], u8, [u8; 32]), VaultError> {
-        if header.len() < 105 {
+        if header.len() < HEADER_PREFIX_LEN {
             return Err(VaultError::BadMagic);
         }
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&header[..8]);
         let version = header[8];
         let mut salt = [0u8; 32];
-        salt.copy_from_slice(&header[73..105]);
+        salt.copy_from_slice(&header[SALT_OFFSET..HEADER_PREFIX_LEN]);
         Ok((magic, version, salt))
     }
 }

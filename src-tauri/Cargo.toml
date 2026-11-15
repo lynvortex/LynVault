@@ -1,6 +1,6 @@
 [package]
 name = "LynVault"
-version = "3.0.1"
+version = "3.1.0"
 edition = "2021"
 # cargo-deny licenses 门禁要求 manifest 显式声明（与仓库根 LICENSE 一致）
 license = "MIT"
@@ -28,13 +28,29 @@ serde_json = "1"
 vault-core = { path = "../crates/vault-core" }
 zeroize = "1"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# 3.1.0：预览用图片解码在既有 png 之上补齐常见格式（主界面与备用 GUI 共用）
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+    "tiff",
+] }
 log = { version = "0.4", features = ["std"] }
 # 3.0.0：可选硬件密钥二因子 —— PC/SC 封装（Windows winscard / Linux pcsc-lite），
 # YubiKey HMAC-SHA1 挑战-响应直连（见 src/yubikey.rs 的协议注释）
 pcsc = "2"
 # 2.8.2（L2/H2）：单实例令牌与对话框令牌的随机生成（OsRng）
 rand = "0.8"
+# 3.2.0：LYCFG 配置容器 —— HMAC-SHA256 防篡改标签（DPAPI 模式在 Windows 走系统 API）
+hmac = "0.12"
+sha2 = "0.10"
+# 3.1.0：备用 GUI（egui 直染，不依赖 WebView）—— 主窗口创建失败时的完整前端。
+# 与 Tauri 并存于同一进程但互不依赖；egui 显式声明以便 gui 模块直接使用
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
 
 # Windows 专属依赖：系统图标读取 + .lyt 文件关联自注册（本应用仅面向 Windows 发布）
 # 2.8.0 新增 feature：
@@ -56,6 +72,8 @@ windows = { version = "0.57", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_UI_Input_KeyboardAndMouse",
+    # 3.2.0：LYCFG 容器 DPAPI 模式（CryptProtectData / CryptUnprotectData）
+    "Win32_Security_Cryptography",
     "ApplicationModel_DataTransfer",
     "Foundation",
 ] }

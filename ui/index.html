@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LynVault 3.0.1</title>
+    <title>LynVault 3.1.0</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -54,7 +54,7 @@
     <div id="file-list"></div>
 
     <!-- 2.4.1：开源地址已移至标题栏右侧；状态栏文案会被 setStatus 动态覆盖 -->
-    <div id="status-bar">©绘萤者 LynVault 3.0.1</div>
+    <div id="status-bar">©绘萤者 LynVault 3.1.0</div>
 
     <!-- 模态框 -->
     <div id="overlay" class="hidden"></div>
@@ -77,6 +77,7 @@
         <div class="sd-title">🔐 检测到附近的保险柜</div>
         <div class="sd-body" id="startup-list"></div>
         <div class="sd-buttons">
+            <button id="sd-gui" title="切换到内置 GUI 版（不依赖 WebView，会关闭当前窗口）">GUI启动</button>
             <button id="sd-create">新建保险柜</button>
             <button id="sd-open-other">打开其他保险柜</button>
         </div>

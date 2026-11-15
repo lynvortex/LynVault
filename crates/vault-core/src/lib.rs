@@ -4,6 +4,8 @@
 //! 所有敏感数据均实现零化擦除。
 
 pub mod audit;
+/// 3.1.1（审计修复）：分块布局几何的叶子模块（无 vault / index 依赖）。
+pub mod chunk;
 pub mod crypto;
 pub mod error;
 pub mod index;
@@ -21,7 +23,7 @@ pub fn resolve_chunk_plan_for_fuzz(
     chunk_size: u64,
     chunk_count: u64,
 ) -> Result<(u64, u64, u64, u64), VaultError> {
-    let p = vault::fs_util::resolve_chunk_plan(length, chunk_size, chunk_count)?;
+    let p = chunk::resolve_chunk_plan(length, chunk_size, chunk_count)?;
     Ok((p.chunk_size, p.chunk_count, p.full_ct, p.expected_last))
 }
 

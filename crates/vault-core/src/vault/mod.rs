@@ -182,15 +182,13 @@ impl Vault {
     /// 旧实现 close() 无条件 load+save（全量索引重写 + 7-pass 擦旧索引，
     /// 10 次 fsync）—— 而大多数时候索引内容早已随上一次操作落盘，
     /// 这次写入的唯一目的是把「保险柜已关闭」审计条目刷进索引。
-    /// 3.0.0（L-2 审计修复）：放弃会话 —— 打开成功路径的后置步骤
-    ///（头部重写 / 胁迫触发）失败时调用。与 close 的差异：**不落盘任何内容**
-    ///（close 会补写审计；此刻磁盘状态未知，任何写入都可能基于半程状态），
-    /// 仅清零全部会话字段，让「Err 返回 + 半开会话」的矛盾状态不再外泄。
-    /// 胁迫触发失败场景下内存分区可能已被随机化 —— 磁盘头部未动，下次打开如旧
-    /// （fail-closed 且无损）。
-    pub(crate) fn abandon_session(&mut self) {
+    /// 3.1.1（审计修复）：会话敏感字段的**统一清理**——`close` / `abandon_session`
+    /// / `Drop` 三处原本各有一份 15 行的近似副本（新增字段必须三处同时加，
+    /// `Drop` 那份最容易漏 → 密钥在堆上多活一次）。现收敛到一处。
+    pub(crate) fn clear_secrets(&mut self) {
         self.file = None;
         self.path = None;
+        // 清理索引缓存（含明文审计字符串/路径），避免敏感数据残留在堆上
         if let Some(mut idx) = self.cached_index.take() {
             idx.files.clear();
             idx.folders.clear();
@@ -207,6 +205,16 @@ impl Vault {
         self.audit_dirty = false;
         self.yubikey_wrapped = false;
         self.yk_challenge_salt = [0u8; 32];
+    }
+
+    /// 3.0.0（L-2 审计修复）：放弃会话 —— 打开成功路径的后置步骤
+    ///（头部重写 / 胁迫触发）失败时调用。与 close 的差异：**不落盘任何内容**
+    ///（close 会补写审计；此刻磁盘状态未知，任何写入都可能基于半程状态），
+    /// 仅清零全部会话字段，让「Err 返回 + 半开会话」的矛盾状态不再外泄。
+    /// 胁迫触发失败场景下内存分区可能已被随机化 —— 磁盘头部未动，下次打开如旧
+    /// （fail-closed 且无损）。
+    pub(crate) fn abandon_session(&mut self) {
+        self.clear_secrets();
     }
 
     pub fn close(&mut self) {
@@ -223,25 +231,7 @@ impl Vault {
                 log::error!("关闭保险柜时保存索引失败: {}", e);
             }
         }
-        self.file = None;
-        self.path = None;
-        // 2.4.1：清理索引缓存（含明文审计字符串），避免敏感数据残留在堆上
-        if let Some(mut idx) = self.cached_index.take() {
-            idx.files.clear();
-            idx.folders.clear();
-            idx.audit.clear();
-        }
-        // 3.0.0：LockedKey 的 Drop 自带解锁 + 清零，take 即完成清理
-        drop(self.enc_key.take());
-        drop(self.auth_key.take());
-        drop(self.sign_key.take());
-        drop(self.data_key.take());
-        self.format_version = 0;
-        self.yubikey_wrapped = false;
-        self.yk_challenge_salt = [0u8; 32];
-        self.active_partition = None;
-        self.audit = None;
-        self.audit_dirty = false;
+        self.clear_secrets();
     }
 }
 
@@ -249,21 +239,6 @@ impl Drop for Vault {
     fn drop(&mut self) {
         // M8 修复：避免在 Drop 中做可能 panic 的 I/O；close 已做错误处理
         // 仅清理密钥，不强制 save_index（防止 Drop 中二次失败）
-        self.file = None;
-        self.path = None;
-        // 2.4.1：同样清理索引缓存中的明文内容（含审计条目）
-        if let Some(mut idx) = self.cached_index.take() {
-            idx.files.clear();
-            idx.folders.clear();
-            idx.audit.clear();
-        }
-        // 3.0.0：LockedKey 的 Drop 自带解锁 + 清零，take 即完成清理
-        drop(self.enc_key.take());
-        drop(self.auth_key.take());
-        drop(self.sign_key.take());
-        drop(self.data_key.take());
-        self.format_version = 0;
-        self.yubikey_wrapped = false;
-        self.yk_challenge_salt = [0u8; 32];
+        self.clear_secrets();
     }
 }

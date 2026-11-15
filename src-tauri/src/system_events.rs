@@ -144,7 +144,8 @@ fn event_loop() {
         }
     }
 
-    let class_name = windows::core::PCWSTR(class_name.as_ptr());
+    let class_wide = class_name; // Vec<u16>（NUL 结尾），需活过整个重建循环
+    let class_name = windows::core::PCWSTR(class_wide.as_ptr());
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         lpszClassName: class_name,
@@ -154,49 +155,58 @@ fn event_loop() {
         log::warn!("系统事件窗口注册失败，锁屏/睡眠自动关闭未生效");
         return;
     }
-    let hwnd = unsafe {
-        CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
-            class_name,
-            windows::core::PCWSTR::null(),
-            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE::default(),
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            None,
-            None,
-            None,
-        )
-    };
-    // windows 0.57 的 CreateWindowExW 直接返回 HWND（失败为 0），而非 Result
-    if hwnd.0 == 0 {
-        log::warn!("系统事件窗口创建失败");
-        return;
-    }
-    if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }.is_err() {
-        log::warn!("WTS 注册失败（服务未运行？），锁屏/注销自动关闭未生效");
-    }
 
-    // 2.8.2（M4）：GetMessageW 三态 + 重建循环（与 clipboard_guard 同型）
+    // 3.1.1（审计修复）：重建循环必须**同时重建窗口**。
+    //
+    // 旧实现把 CreateWindowExW 放在循环之外，GetMessageW 始终使用同一个
+    // （可能已被销毁的）hwnd —— 窗口一旦异常退出，内层循环立刻返回 0/-1，
+    // 循环空转 60 次后放弃：锁屏 / 睡眠 / 注销自动关柜在整个会话内**静默
+    // 失效**，且只有一行 error 日志。clipboard_guard 的同型循环是正确的
+    // （窗口创建在循环内部），此处对齐该结构。
     let mut rebuilds = 0u32;
-    'rebuild: loop {
+    loop {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                class_name,
+                windows::core::PCWSTR::null(),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                None,
+                None,
+            )
+        };
+        // windows 0.57 的 CreateWindowExW 直接返回 HWND（失败为 0）
+        if hwnd.0 == 0 {
+            log::warn!("系统事件窗口创建失败");
+            return;
+        }
+        // WTS 通知绑定在窗口句柄上 —— 每次重建都必须重新注册
+        if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }.is_err() {
+            log::warn!("WTS 注册失败（服务未运行？），锁屏/注销自动关闭未生效");
+        }
+
         let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
         loop {
             let r = unsafe {
                 windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, hwnd, 0, 0)
             };
-            if r.0 == -1 {
-                break; // 错误 → 重建
-            }
-            if r.0 == 0 {
-                break; // 窗口被销毁 → 重建
+            if r.0 == -1 || r.0 == 0 {
+                break; // 错误 / WM_QUIT → 重建
             }
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
                 windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
             }
+        }
+
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
         }
         rebuilds += 1;
         if rebuilds > 60 {
@@ -207,9 +217,5 @@ fn event_loop() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
-        // 重新注册会话通知（窗口句柄未变；WTS 通知绑定在句柄上，重建窗口
-        // 的场景已在wnd_proc 拦截 WM_CLOSE 后大幅减少，此处尽力而为）
-        let _ = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
-        continue 'rebuild;
     }
 }

@@ -3,6 +3,10 @@
 //! 设计要点：
 //! - **配置文件不含任何敏感信息**（无密码、无路径、无保险柜历史），明文 JSON
 //!   存放不会造成抗取证死角；
+//! - 3.2.0 起改为 LYCFG 容器落盘（config_codec.rs）：防 `anti_screenshot: false`
+//!   / `autolock_minutes: 0` 这类**合法值域内**的危险篡改 —— 固定安装走 DPAPI
+//!   （加密 + 防伪造），便携模式走 HMAC（防篡改、跨机器可用）；
+//! - 旧版明文 settings.json 启动时自动迁移到容器格式（原路径原位转写）；
 //! - 位置二选一，由用户在设置界面显式启用：
 //!   - **便携模式**：exe 同目录（settings.json 跟随 exe，适配 U 盘）；
 //!   - **固定安装**：%APPDATA%\LynVault（适配 Program Files 等只读安装位置）；
@@ -11,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use crate::config_codec::{self, Decoded, Mode};
 
 pub const CONFIG_FILE_NAME: &str = "settings.json";
 
@@ -137,12 +143,66 @@ pub fn active_config_path() -> Option<PathBuf> {
     None
 }
 
-/// 读取当前生效配置；未启用或解析失败返回 None（调用方回退默认值）
+/// 3.2.0：写入模式选择 ——
+/// - 便携（exe 同目录）：HMAC。配置跟随 U 盘跨机器，DPAPI 密文换机即砖，
+///   便携文件只承诺防篡改（主题/窗口尺寸无保密价值）；
+/// - 固定安装 / 其他：Windows 走 DPAPI（用户域绑定，加密 + 防伪造一步到位，
+///   密钥由系统持有）；非 Windows 降级 HMAC。
+fn preferred_mode(path: &std::path::Path) -> Mode {
+    let is_portable = portable_config_path().map(|p| p == path).unwrap_or(false);
+    if is_portable {
+        return Mode::Hmac;
+    }
+    #[cfg(windows)]
+    {
+        Mode::Dpapi
+    }
+    #[cfg(not(windows))]
+    {
+        Mode::Hmac
+    }
+}
+
+/// 读取当前生效配置；未启用或解析失败返回 None（调用方回退默认值）。
+/// 3.2.0：走 LYCFG 容器 ——
+/// - 容器校验失败（篡改/损坏）→ 记日志 + None（回默认值，默认在安全侧）；
+/// - 旧版明文 → 解析成功后按**原路径**自动迁移为容器格式（迁移失败仅记
+///   日志，明文继续可用 —— 下次保存时自然转正）。
 pub fn load_active() -> Option<(PathBuf, Settings)> {
     let path = active_config_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    let settings: Settings = serde_json::from_str(&text).ok()?;
-    Some((path, settings.sanitized()))
+    let raw = std::fs::read(&path).ok()?;
+    match config_codec::decode(&raw) {
+        Err(e) => {
+            log::warn!(
+                "配置完整性校验失败，已忽略并回退默认值（疑似被篡改或损坏）: {}",
+                e
+            );
+            None
+        }
+        Ok(Decoded::Container(bytes)) => {
+            let text = String::from_utf8(bytes).ok()?;
+            let settings: Settings = serde_json::from_str(&text).ok()?;
+            Some((path, settings.sanitized()))
+        }
+        Ok(Decoded::LegacyPlaintext(bytes)) => {
+            let text = String::from_utf8(bytes).ok()?;
+            let settings: Settings = serde_json::from_str(&text).ok()?;
+            let settings = settings.sanitized();
+            // 旧明文 → 容器（best-effort：失败不阻塞本次读取）
+            let mode = preferred_mode(&path);
+            let blob = serde_json::to_string(&settings)
+                .ok()
+                .and_then(|s| config_codec::encode(s.as_bytes(), mode).ok());
+            if let Some(blob) = blob {
+                if let Err(e) = save_blob_at(&path, &blob) {
+                    log::warn!("配置迁移到 LYCFG 容器失败（明文继续可用）: {}", e);
+                } else {
+                    log::info!("配置已迁移到 LYCFG 容器格式");
+                }
+            }
+            Some((path, settings))
+        }
+    }
 }
 
 /// 把配置写入指定位置（目录不存在则创建）。返回写入路径。
@@ -227,7 +287,7 @@ fn open_tmp_secure_new(tmp: &std::path::Path) -> std::io::Result<std::fs::File> 
     Ok(f)
 }
 
-/// 把配置写到指定路径（save_settings 更新现有配置时使用）
+/// 把配置写到指定路径（save_settings 更新现有配置时使用）。
 /// 2.8.2：原子写入（临时文件 + rename）—— 旧实现 fs::write 非原子且无 fsync，
 /// 写入中途掉电/被杀会留下截断的 settings.json，load_active 解析失败静默回
 /// 默认值，用户设置无提示丢失。
@@ -235,11 +295,20 @@ fn open_tmp_secure_new(tmp: &std::path::Path) -> std::io::Result<std::fs::File> 
 /// `settings.json.tmp` 且不截断：并发保存（或上次崩溃残留）时旧内容更长会
 /// 混入新 JSON 尾部，损坏的 settings.json 静默重置全部设置；随机名同时消除
 /// 并发写者互踩。
+/// 3.2.0：序列化后先封入 LYCFG 容器（模式由 preferred_mode 按路径决定）。
 pub fn save_at(path: &std::path::Path, settings: &Settings) -> Result<(), String> {
-    use std::io::Write;
     let sanitized = settings.clone().sanitized();
     let json =
         serde_json::to_string_pretty(&sanitized).map_err(|e| format!("序列化配置失败: {}", e))?;
+    let mode = preferred_mode(path);
+    let blob = config_codec::encode(json.as_bytes(), mode)?;
+    save_blob_at(path, &blob)
+}
+
+/// 3.2.0：容器字节落盘（从 save_at 抽出 —— 旧明文迁移复用同一套
+/// 加固临时文件 + 原子 rename 机制）。
+fn save_blob_at(path: &std::path::Path, blob: &[u8]) -> Result<(), String> {
+    use std::io::Write;
     let tmp = {
         use rand::RngCore;
         let mut suffix = [0u8; 8];
@@ -259,7 +328,7 @@ pub fn save_at(path: &std::path::Path, settings: &Settings) -> Result<(), String
                 e
             )
         })?;
-        f.write_all(json.as_bytes())
+        f.write_all(blob)
             .map_err(|e| format!("配置写入失败: {}", e))?;
         f.sync_all().map_err(|e| format!("配置落盘失败: {}", e))?;
         drop(f);
